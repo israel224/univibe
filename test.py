@@ -1502,8 +1502,11 @@ async def main(page: ft.Page):
   
     voice_recorder = far.AudioRecorder(on_stream=handle_audio_stream)  
     voice_player = fta.Audio(src="", autoplay=False)  
-    page.overlay.append(voice_recorder)  
-    page.overlay.append(voice_player)  
+    # NOTE: NOT added to page.overlay here — adding media controls to the  
+    # overlay before the app's first page.update() causes Flet's  
+    # "Unknown control" registration-race bug (same issue we hit with  
+    # FilePicker earlier). They're registered later, right after the first  
+    # render, at the bottom of main().  
   
     def play_voice_note(url):  
         voice_player.src = url  
@@ -2190,22 +2193,34 @@ async def main(page: ft.Page):
     # These helpers detect which one exists on THIS install and use it, so the app  
     # doesn't break across Flet upgrades/downgrades.  
     async def storage_set(key, value):  
-        if hasattr(page, "shared_preferences"):  
-            await page.shared_preferences.set(key, value)  
-        else:  
-            page.client_storage.set(key, value)  
+        try:  
+            if hasattr(page, "shared_preferences"):  
+                await asyncio.wait_for(page.shared_preferences.set(key, value), timeout=4)  
+            else:  
+                page.client_storage.set(key, value)  
+        except Exception as ex:  
+            print(f"storage_set failed for {key}: {ex}")  
   
     async def storage_get(key):  
-        if hasattr(page, "shared_preferences"):  
-            return await page.shared_preferences.get(key)  
-        else:  
-            return page.client_storage.get(key)  
+        try:  
+            if hasattr(page, "shared_preferences"):  
+                return await asyncio.wait_for(page.shared_preferences.get(key), timeout=4)  
+            else:  
+                return page.client_storage.get(key)  
+        except Exception as ex:  
+            print(f"storage_get failed for {key}: {ex}")  
+            return None  
   
     async def storage_remove(key):  
-        if hasattr(page, "shared_preferences"):  
-            await page.shared_preferences.remove(key)  
-        else:  
-            page.client_storage.remove(key)  
+        try:  
+            if hasattr(page, "shared_preferences"):  
+                await asyncio.wait_for(page.shared_preferences.remove(key), timeout=4)  
+            else:  
+                page.client_storage.remove(key)  
+        except Exception as ex:  
+            print(f"storage_remove failed for {key}: {ex}")  
+            # Non-fatal: worst case a stale token lingers in storage, which  
+            # try_restore_session already handles gracefully on next launch.  
   
     async def save_session(session, user=None):  
         # Persists the Supabase session so the user stays logged in after restart  
@@ -2593,6 +2608,12 @@ We may update these terms; continued use of the app means you accept the changes
     if not await try_restore_session():  
         show_auth()  
   
+    # Register media controls AFTER the first render — adding them earlier  
+    # triggers Flet's "Unknown control" registration-race bug.  
+    page.overlay.append(voice_recorder)  
+    page.overlay.append(voice_player)  
+    page.update()  
+  
 if "--web" in sys.argv:  
     # Run as: python main.py --web  
     # Local testing: opens in a browser tab on port 8551.  
@@ -2602,4 +2623,4 @@ if "--web" in sys.argv:
     ft.app(target=main, view=ft.AppView.WEB_BROWSER, host="0.0.0.0", port=cloud_port)  
 else:  
     # Run as: python main.py  
-    ft.app(target=main) 
+    ft.app(target=main)  
