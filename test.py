@@ -1007,14 +1007,15 @@ async def main(page: ft.Page):
         page.update()  
   
     # --- NAVIGATION BAR (icon-based, Facebook-style) ---  
+    NAV_BTN_STYLE = ft.ButtonStyle(padding=6)  
     nav_buttons = {  
-        "feed":    ft.IconButton(icon=ft.Icons.HOME, icon_color=NAV_ACTIVE, tooltip="Feed"),  
-        "secrets": ft.IconButton(icon=ft.Icons.THEATER_COMEDY, icon_color=NAV_INACTIVE, tooltip="Secrets"),  
-        "people":  ft.IconButton(icon=ft.Icons.GROUPS, icon_color=NAV_INACTIVE, tooltip="Friends"),  
-        "chats":   ft.IconButton(icon=ft.Icons.CHAT_BUBBLE, icon_color=NAV_INACTIVE, tooltip="Chats"),  
-        "reels":   ft.IconButton(icon=ft.Icons.VIDEO_LIBRARY, icon_color=NAV_INACTIVE, tooltip="Reels"),  
-        "notifications": ft.IconButton(icon=ft.Icons.NOTIFICATIONS_NONE, icon_color=NAV_INACTIVE, tooltip="Notifications"),  
-        "profile": ft.IconButton(icon=ft.Icons.PERSON, icon_color=NAV_INACTIVE, tooltip="Profile"),  
+        "feed":    ft.IconButton(icon=ft.Icons.HOME, icon_color=NAV_ACTIVE, tooltip="Feed", icon_size=20, style=NAV_BTN_STYLE),  
+        "secrets": ft.IconButton(icon=ft.Icons.THEATER_COMEDY, icon_color=NAV_INACTIVE, tooltip="Secrets", icon_size=20, style=NAV_BTN_STYLE),  
+        "people":  ft.IconButton(icon=ft.Icons.GROUPS, icon_color=NAV_INACTIVE, tooltip="Friends", icon_size=20, style=NAV_BTN_STYLE),  
+        "chats":   ft.IconButton(icon=ft.Icons.CHAT_BUBBLE, icon_color=NAV_INACTIVE, tooltip="Chats", icon_size=20, style=NAV_BTN_STYLE),  
+        "reels":   ft.IconButton(icon=ft.Icons.VIDEO_LIBRARY, icon_color=NAV_INACTIVE, tooltip="Reels", icon_size=20, style=NAV_BTN_STYLE),  
+        "notifications": ft.IconButton(icon=ft.Icons.NOTIFICATIONS_NONE, icon_color=NAV_INACTIVE, tooltip="Notifications", icon_size=20, style=NAV_BTN_STYLE),  
+        "profile": ft.IconButton(icon=ft.Icons.PERSON, icon_color=NAV_INACTIVE, tooltip="Profile", icon_size=20, style=NAV_BTN_STYLE),  
     }  
     nav_buttons["feed"].on_click = nav_to_feed  
     nav_buttons["secrets"].on_click = nav_to_secrets  
@@ -1024,14 +1025,18 @@ async def main(page: ft.Page):
     nav_buttons["notifications"].on_click = nav_to_notifications  
     nav_buttons["profile"].on_click = nav_to_profile  
   
-    menu_button = ft.IconButton(icon=ft.Icons.MENU, icon_color=NAV_INACTIVE, tooltip="Menu", on_click=open_main_menu)  
+    menu_button = ft.IconButton(icon=ft.Icons.MENU, icon_color=NAV_INACTIVE, tooltip="Menu",  
+                                icon_size=20, style=NAV_BTN_STYLE, on_click=open_main_menu)  
   
+    # scroll=AUTO is a safety net — even on very narrow phones where icons  
+    # still don't all fit, every icon stays reachable by swiping sideways  
+    # instead of being invisibly pushed off-screen like before.  
     custom_nav_bar = ft.Container(  
         content=ft.Row([  
             nav_buttons["feed"], nav_buttons["secrets"], nav_buttons["people"],  
             nav_buttons["chats"], nav_buttons["reels"], nav_buttons["notifications"],  
             nav_buttons["profile"], menu_button  
-        ], alignment=ft.MainAxisAlignment.SPACE_EVENLY),  
+        ], alignment=ft.MainAxisAlignment.START, spacing=2, scroll=ft.ScrollMode.AUTO),  
         padding=ft.Padding.symmetric(vertical=6),  
         bgcolor="#1e293b"  
     )  
@@ -1554,6 +1559,44 @@ async def main(page: ft.Page):
         conversations_layout  
     ], visible=True, horizontal_alignment=ft.CrossAxisAlignment.CENTER)  
   
+    QUICK_EMOJIS = [  
+        "😀", "😂", "😍", "😘", "😊", "😉", "😢", "😭", "😡", "😱",  
+        "👍", "👎", "👏", "🙏", "🙌", "💪", "🤝", "✌️", "🤞", "👌",  
+        "❤️", "🔥", "💯", "🎉", "😴", "🤔", "😎", "🥺", "😅", "🙄",  
+        "💀", "👀", "🤣", "😩", "🥳", "😏", "🤗", "😬", "😤", "💔"  
+    ]  
+  
+    def open_emoji_picker(target_field):  
+        def insert_emoji(emoji):  
+            def handler(e):  
+                target_field.value = (target_field.value or "") + emoji  
+                close_dlg(dlg)  
+                page.update()  
+            return handler  
+  
+        def close_dlg(d):  
+            d.open = False  
+            page.update()  
+  
+        grid = ft.GridView(  
+            expand=False, runs_count=8, max_extent=40,  
+            spacing=4, run_spacing=4, height=220, width=320  
+        )  
+        for em in QUICK_EMOJIS:  
+            grid.controls.append(  
+                ft.TextButton(content=ft.Text(em, size=20), on_click=insert_emoji(em))  
+            )  
+  
+        dlg = ft.AlertDialog(  
+            title=ft.Text("Emoji", color="white", size=14),  
+            bgcolor="#1e293b",  
+            content=grid,  
+            actions=[ft.TextButton("Close", on_click=lambda e: close_dlg(dlg))]  
+        )  
+        page.overlay.append(dlg)  
+        dlg.open = True  
+        page.update()  
+  
     panel_chats_thread = ft.Column([  
         ft.Row([  
             ft.IconButton(icon=ft.Icons.ARROW_BACK, icon_color="#10b981", on_click=close_thread),  
@@ -1561,7 +1604,12 @@ async def main(page: ft.Page):
         ], alignment=ft.MainAxisAlignment.START),  
         thread_messages_layout,  
         thread_status,  
-        ft.Row([thread_input_box, ft.IconButton(icon=ft.Icons.SEND, icon_color="#10b981", on_click=handle_send_thread_message)], alignment=ft.MainAxisAlignment.CENTER)  
+        ft.Row([  
+            thread_input_box,  
+            ft.IconButton(icon=ft.Icons.EMOJI_EMOTIONS_OUTLINED, icon_color="#94a3b8",  
+                          tooltip="Emoji", on_click=lambda e: open_emoji_picker(thread_input_box)),  
+            ft.IconButton(icon=ft.Icons.SEND, icon_color="#10b981", on_click=handle_send_thread_message)  
+        ], alignment=ft.MainAxisAlignment.CENTER)  
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)  
   
     panel_messages = ft.Column([panel_chats_inbox, panel_chats_thread], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)  
@@ -1846,12 +1894,14 @@ async def main(page: ft.Page):
             uname = p.get("username", "U")  
             viewed_profile_state["user_id"] = p.get("user_id")  
             viewed_profile_state["username"] = uname  
-            view_profile_username.value = f"@{uname}"  
+            view_profile_username.value = f"@{uname}"
             avatar = p.get("avatar_url")
-            view_profile_avatar.src = avatar if avatar else f"https://ui-avatars.com/api/?background=6366f1&color=fff&size=80&name={uname}"
+            view_profile_avatar.src = avatar if avatar else (
+                f"https://ui-avatars.com/api/?background=6366f1&color=fff&size=80&name={uname}"
+            )
             view_profile_bio.value     = p.get("bio") or ""
-            view_profile_school.value  = f"\U0001F3EB  {p['school']}"  if p.get("school")           else ""  
-            view_profile_dept.value    = f"\U0001F4DA  {p['department']}" if p.get("department")     else ""  
+            view_profile_school.value  = f"\U0001F3EB  {p['school']}"  if p.get("school")           else ""
+            view_profile_dept.value    = f"\U0001F4DA  {p['department']}" if p.get("department")     else ""
             view_profile_country.value = f"\U0001F30D  {p['country']}"  if p.get("country")          else ""  
             view_profile_state.value   = f"\U0001F4CD  {p['state']}"    if p.get("state")            else ""  
             view_profile_lga.value     = f"\U0001F3D8  {p['local_government']}" if p.get("local_government") else ""  
