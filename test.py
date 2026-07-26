@@ -1,6 +1,6 @@
 from supabase import create_client, Client  
 import flet as ft  
-import flet_audio_recorder as far  
+from flet_audio_recorder import AudioRecorder
 import os  
 import sys  
 import uuid  
