@@ -1,4 +1,5 @@
 flet
+flet-audio-recorder
+flet-audio
 supabase
 Pillow
-flet-audio-recorder
