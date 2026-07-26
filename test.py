@@ -2047,8 +2047,10 @@ async def main(page: ft.Page):
             viewed_profile_state["username"] = uname  
             view_profile_username.value = f"@{uname}"  
             avatar = p.get("avatar_url")  
-            view_profile_avatar.src = avatar if avatar else \  
-                f"https://ui-avatars.com/api/?background=6366f1&color=fff&size=80&name={uname}"  
+            if avatar:  
+                view_profile_avatar.src = avatar  
+            else:  
+                view_profile_avatar.src = f"https://ui-avatars.com/api/?background=6366f1&color=fff&size=80&name={uname}"  
             view_profile_bio.value     = p.get("bio") or ""  
             view_profile_school.value  = f"\U0001F3EB  {p['school']}"  if p.get("school")           else ""  
             view_profile_dept.value    = f"\U0001F4DA  {p['department']}" if p.get("department")     else ""  
@@ -2600,4 +2602,4 @@ if "--web" in sys.argv:
     ft.app(target=main, view=ft.AppView.WEB_BROWSER, host="0.0.0.0", port=cloud_port)  
 else:  
     # Run as: python main.py  
-    ft.app(target=main)  
+    ft.app(target=main) 
