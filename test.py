@@ -1,15 +1,11 @@
 from supabase import create_client, Client  
 import flet as ft  
-import flet_audio_recorder as far  
-import flet_audio as fta  
 import os  
 import sys  
 import uuid  
 import mimetypes  
 import asyncio  
 import urllib.parse  
-import wave  
-import io  
   
 # --- LIVE DATABASE CONNECTION ---  
 SUPABASE_URL = "https://vjvynztrznvlhxqatcsi.supabase.co"  
@@ -1442,34 +1438,6 @@ async def main(page: ft.Page):
             print(f"Error sending message: {e}")  
             return False  
   
-    def send_voice_message(conversation_id, media_url):  
-        user_id = get_cached_user_id()  
-        if not user_id or not media_url:  
-            return False  
-        try:  
-            supabase.rpc("send_chat_media_message", {  
-                "p_conversation_id": conversation_id,  
-                "p_sender_id": user_id,  
-                "p_media_url": media_url,  
-                "p_media_type": "voice",  
-                "p_content": ""  
-            }).execute()  
-            try:  
-                parts = supabase.rpc("get_conversation_participant_ids", {  
-                    "p_conversation_id": conversation_id  
-                }).execute()  
-                for part in (parts.data or []):  
-                    other_id = part.get("user_id")  
-                    if other_id and other_id != user_id:  
-                        create_notification(other_id, "message",  
-                                            f"{user_cache.get('username','Someone')} sent you a voice note")  
-            except Exception as notif_ex:  
-                print(f"Voice note notification error: {notif_ex}")  
-            return True  
-        except Exception as e:  
-            print(f"Error sending voice note: {e}")  
-            return False  
-  
     chat_state = {"conversation_id": None, "other_username": None, "polling_active": False, "last_rendered_count": -1}  
   
     conversations_layout = ft.Column(spacing=8, scroll=ft.ScrollMode.ALWAYS, height=260)  
@@ -1480,117 +1448,6 @@ async def main(page: ft.Page):
     thread_input_box = ft.TextField(hint_text="Type a message...", width=220, dense=True, color="white")  
     thread_header_text = ft.Text("", size=16, weight=ft.FontWeight.BOLD, color="white")  
     thread_status = ft.Text("", size=11)  
-  
-    # --- VOICE NOTES ---  
-    # Uses Flet 0.85+'s AudioRecorder streaming (on_stream), buffered in  
-    # memory as raw PCM16, then wrapped into a proper WAV file using Python's  
-    # stdlib wave module before uploading — no server upload_dir needed.  
-    voice_state = {"recording": False, "buffer": bytearray(), "max_seconds": 120}  
-    VOICE_SAMPLE_RATE = 44100  
-  
-    def pcm_to_wav_bytes(pcm_bytes, sample_rate=VOICE_SAMPLE_RATE, channels=1, sample_width=2):  
-        buf = io.BytesIO()  
-        with wave.open(buf, "wb") as wav_file:  
-            wav_file.setnchannels(channels)  
-            wav_file.setsampwidth(sample_width)  
-            wav_file.setframerate(sample_rate)  
-            wav_file.writeframes(bytes(pcm_bytes))  
-        return buf.getvalue()  
-  
-    def handle_audio_stream(e: far.AudioRecorderStreamEvent):  
-        voice_state["buffer"].extend(e.chunk)  
-  
-    voice_recorder = far.AudioRecorder(on_stream=handle_audio_stream)  
-    voice_player = fta.Audio(src="", autoplay=False)  
-    # NOTE: NOT added to page.overlay here — adding media controls to the  
-    # overlay before the app's first page.update() causes Flet's  
-    # "Unknown control" registration-race bug (same issue we hit with  
-    # FilePicker earlier). They're registered later, right after the first  
-    # render, at the bottom of main().  
-  
-    def play_voice_note(url):  
-        voice_player.src = url  
-        voice_player.update()  
-        voice_player.play()  
-  
-    async def auto_stop_voice_recording():  
-        """Safety cap so a forgotten recording doesn't run forever / create a huge file."""  
-        await asyncio.sleep(voice_state["max_seconds"])  
-        if voice_state["recording"]:  
-            await handle_stop_voice_recording(None)  
-  
-    async def handle_start_voice_recording(e):  
-        if voice_state["recording"]:  
-            return  
-        voice_state["buffer"] = bytearray()  
-        try:  
-            await voice_recorder.start_recording(  
-                configuration=far.AudioRecorderConfiguration(  
-                    encoder=far.AudioEncoder.PCM16BITS,  
-                    sample_rate=VOICE_SAMPLE_RATE,  
-                    channels=1,  
-                ),  
-            )  
-            voice_state["recording"] = True  
-            mic_button.icon = ft.Icons.STOP_CIRCLE  
-            mic_button.icon_color = "#f43f5e"  
-            thread_status.value = "🔴 Recording... tap again to stop"  
-            thread_status.color = "#f43f5e"  
-            page.update()  
-            page.run_task(auto_stop_voice_recording)  
-        except Exception as ex:  
-            thread_status.value = f"Couldn't access microphone: {str(ex)}"  
-            thread_status.color = "red"  
-            page.update()  
-  
-    async def handle_stop_voice_recording(e):  
-        if not voice_state["recording"]:  
-            return  
-        voice_state["recording"] = False  
-        mic_button.icon = ft.Icons.MIC_NONE  
-        mic_button.icon_color = "#94a3b8"  
-        try:  
-            await voice_recorder.stop_recording()  
-        except Exception as ex:  
-            print(f"stop_recording error: {ex}")  
-  
-        if len(voice_state["buffer"]) < 1000:  
-            thread_status.value = "Recording too short — try again."  
-            thread_status.color = "red"  
-            page.update()  
-            return  
-  
-        thread_status.value = "Sending voice note..."  
-        thread_status.color = "#94a3b8"  
-        page.update()  
-  
-        try:  
-            wav_bytes = pcm_to_wav_bytes(voice_state["buffer"])  
-            user_id = get_cached_user_id()  
-            storage_path = f"voice/{user_id}/{uuid.uuid4()}.wav"  
-            upload_with_retry(MEDIA_BUCKET, storage_path, wav_bytes, "audio/wav")  
-            voice_url = supabase.storage.from_(MEDIA_BUCKET).get_public_url(storage_path)  
-  
-            if send_voice_message(chat_state["conversation_id"], voice_url):  
-                thread_status.value = ""  
-                render_thread_messages()  
-            else:  
-                thread_status.value = "Voice note failed to send."  
-                thread_status.color = "red"  
-            page.update()  
-        except Exception as ex:  
-            thread_status.value = f"Voice note upload failed: {str(ex)}"  
-            thread_status.color = "red"  
-            page.update()  
-  
-    def handle_mic_button(e):  
-        if voice_state["recording"]:  
-            page.run_task(handle_stop_voice_recording, None)  
-        else:  
-            page.run_task(handle_start_voice_recording, None)  
-  
-    mic_button = ft.IconButton(icon=ft.Icons.MIC_NONE, icon_color="#94a3b8",  
-                               tooltip="Record voice note", on_click=handle_mic_button)  
   
     def render_conversations_list():  
         conversations_layout.controls.clear()  
@@ -1643,24 +1500,14 @@ async def main(page: ft.Page):
             is_mine = m.get("sender_id") == my_id  
             bubble_color = "#6366f1" if is_mine else "#1e293b"  
             align = ft.MainAxisAlignment.END if is_mine else ft.MainAxisAlignment.START  
-  
-            if m.get("media_type") == "voice" and m.get("media_url"):  
-                bubble_content = ft.Row([  
-                    ft.Icon(ft.Icons.PLAY_CIRCLE_FILL, color="white", size=22),  
-                    ft.Text("Voice note", color="white", size=13)  
-                ], spacing=6)  
-                bubble = ft.Container(  
-                    content=bubble_content,  
-                    padding=10, bgcolor=bubble_color, border_radius=10, width=180,  
-                    on_click=lambda e, url=m["media_url"]: play_voice_note(url)  
-                )  
-            else:  
-                bubble = ft.Container(  
-                    content=ft.Text(m.get("content", ""), color="white", size=13),  
-                    padding=10, bgcolor=bubble_color, border_radius=10, width=220  
-                )  
-  
-            thread_messages_layout.controls.append(ft.Row([bubble], alignment=align))  
+            thread_messages_layout.controls.append(  
+                ft.Row([  
+                    ft.Container(  
+                        content=ft.Text(m.get("content", ""), color="white", size=13),  
+                        padding=10, bgcolor=bubble_color, border_radius=10, width=220  
+                    )  
+                ], alignment=align)  
+            )  
         page.update()  
   
     async def poll_messages_loop():  
@@ -1761,7 +1608,6 @@ async def main(page: ft.Page):
             thread_input_box,  
             ft.IconButton(icon=ft.Icons.EMOJI_EMOTIONS_OUTLINED, icon_color="#94a3b8",  
                           tooltip="Emoji", on_click=lambda e: open_emoji_picker(thread_input_box)),  
-            mic_button,  
             ft.IconButton(icon=ft.Icons.SEND, icon_color="#10b981", on_click=handle_send_thread_message)  
         ], alignment=ft.MainAxisAlignment.CENTER)  
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)  
@@ -2049,12 +1895,9 @@ async def main(page: ft.Page):
             viewed_profile_state["user_id"] = p.get("user_id")  
             viewed_profile_state["username"] = uname  
             view_profile_username.value = f"@{uname}"  
-            avatar = p.get("avatar_url")  
-            if avatar:  
-                view_profile_avatar.src = avatar  
-            else:  
-                view_profile_avatar.src = f"https://ui-avatars.com/api/?background=6366f1&color=fff&size=80&name={uname}"  
-            view_profile_bio.value     = p.get("bio") or ""  
+            avatar = p.get("avatar_url")
+            view_profile_avatar.src = avatar if avatar else f"https://ui-avatars.com/api/?background=6366f1&color=fff&size=80&name={uname}"
+            view_profile_bio.value     = p.get("bio") or ""
             view_profile_school.value  = f"\U0001F3EB  {p['school']}"  if p.get("school")           else ""  
             view_profile_dept.value    = f"\U0001F4DA  {p['department']}" if p.get("department")     else ""  
             view_profile_country.value = f"\U0001F30D  {p['country']}"  if p.get("country")          else ""  
@@ -2193,34 +2036,22 @@ async def main(page: ft.Page):
     # These helpers detect which one exists on THIS install and use it, so the app  
     # doesn't break across Flet upgrades/downgrades.  
     async def storage_set(key, value):  
-        try:  
-            if hasattr(page, "shared_preferences"):  
-                await asyncio.wait_for(page.shared_preferences.set(key, value), timeout=4)  
-            else:  
-                page.client_storage.set(key, value)  
-        except Exception as ex:  
-            print(f"storage_set failed for {key}: {ex}")  
+        if hasattr(page, "shared_preferences"):  
+            await page.shared_preferences.set(key, value)  
+        else:  
+            page.client_storage.set(key, value)  
   
     async def storage_get(key):  
-        try:  
-            if hasattr(page, "shared_preferences"):  
-                return await asyncio.wait_for(page.shared_preferences.get(key), timeout=4)  
-            else:  
-                return page.client_storage.get(key)  
-        except Exception as ex:  
-            print(f"storage_get failed for {key}: {ex}")  
-            return None  
+        if hasattr(page, "shared_preferences"):  
+            return await page.shared_preferences.get(key)  
+        else:  
+            return page.client_storage.get(key)  
   
     async def storage_remove(key):  
-        try:  
-            if hasattr(page, "shared_preferences"):  
-                await asyncio.wait_for(page.shared_preferences.remove(key), timeout=4)  
-            else:  
-                page.client_storage.remove(key)  
-        except Exception as ex:  
-            print(f"storage_remove failed for {key}: {ex}")  
-            # Non-fatal: worst case a stale token lingers in storage, which  
-            # try_restore_session already handles gracefully on next launch.  
+        if hasattr(page, "shared_preferences"):  
+            await page.shared_preferences.remove(key)  
+        else:  
+            page.client_storage.remove(key)  
   
     async def save_session(session, user=None):  
         # Persists the Supabase session so the user stays logged in after restart  
@@ -2607,12 +2438,6 @@ We may update these terms; continued use of the app means you accept the changes
   
     if not await try_restore_session():  
         show_auth()  
-  
-    # Register media controls AFTER the first render — adding them earlier  
-    # triggers Flet's "Unknown control" registration-race bug.  
-    page.overlay.append(voice_recorder)  
-    page.overlay.append(voice_player)  
-    page.update()  
   
 if "--web" in sys.argv:  
     # Run as: python main.py --web  
