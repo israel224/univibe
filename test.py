@@ -906,6 +906,10 @@ async def main(page: ft.Page):
     def open_settings_from_menu(dlg):  
         close_menu_dialog(dlg)  
         open_account_settings(None)  
+
+    def open_profile_from_menu(dlg):  
+        close_menu_dialog(dlg)  
+        nav_to_profile(None)  
   
     def handle_logout_from_menu(dlg):  
         close_menu_dialog(dlg)  
@@ -966,6 +970,12 @@ async def main(page: ft.Page):
             bgcolor="#1e293b",  
             content=ft.Column([  
                 ft.ListTile(  
+                    leading=ft.Icon(ft.Icons.PERSON, color="#6366f1"),  
+                    title=ft.Text("Profile", color="white"),  
+                    subtitle=ft.Text("Edit your bio, avatar & school", color="#94a3b8", size=11),  
+                    on_click=lambda ev: open_profile_from_menu(dlg)  
+                ),  
+                ft.ListTile(  
                     leading=ft.Icon(ft.Icons.SETTINGS, color="#6366f1"),  
                     title=ft.Text("Settings", color="white"),  
                     subtitle=ft.Text("Change password, email & more", color="#94a3b8", size=11),  
@@ -1015,7 +1025,6 @@ async def main(page: ft.Page):
         "chats":   ft.IconButton(icon=ft.Icons.CHAT_BUBBLE, icon_color=NAV_INACTIVE, tooltip="Chats", icon_size=20, style=NAV_BTN_STYLE),  
         "reels":   ft.IconButton(icon=ft.Icons.VIDEO_LIBRARY, icon_color=NAV_INACTIVE, tooltip="Reels", icon_size=20, style=NAV_BTN_STYLE),  
         "notifications": ft.IconButton(icon=ft.Icons.NOTIFICATIONS_NONE, icon_color=NAV_INACTIVE, tooltip="Notifications", icon_size=20, style=NAV_BTN_STYLE),  
-        "profile": ft.IconButton(icon=ft.Icons.PERSON, icon_color=NAV_INACTIVE, tooltip="Profile", icon_size=20, style=NAV_BTN_STYLE),  
     }  
     nav_buttons["feed"].on_click = nav_to_feed  
     nav_buttons["secrets"].on_click = nav_to_secrets  
@@ -1023,7 +1032,6 @@ async def main(page: ft.Page):
     nav_buttons["chats"].on_click = nav_to_chats  
     nav_buttons["reels"].on_click = nav_to_reels  
     nav_buttons["notifications"].on_click = nav_to_notifications  
-    nav_buttons["profile"].on_click = nav_to_profile  
   
     menu_button = ft.IconButton(icon=ft.Icons.MENU, icon_color=NAV_INACTIVE, tooltip="Menu",  
                                 icon_size=20, style=NAV_BTN_STYLE, on_click=open_main_menu)  
@@ -1035,7 +1043,7 @@ async def main(page: ft.Page):
         content=ft.Row([  
             nav_buttons["feed"], nav_buttons["secrets"], nav_buttons["people"],  
             nav_buttons["chats"], nav_buttons["reels"], nav_buttons["notifications"],  
-            nav_buttons["profile"], menu_button  
+            menu_button  
         ], alignment=ft.MainAxisAlignment.START, spacing=2, scroll=ft.ScrollMode.AUTO),  
         padding=ft.Padding.symmetric(vertical=6),  
         bgcolor="#1e293b"  
@@ -2448,4 +2456,4 @@ if "--web" in sys.argv:
     ft.app(target=main, view=ft.AppView.WEB_BROWSER, host="0.0.0.0", port=cloud_port)  
 else:  
     # Run as: python main.py  
-    ft.app(target=main)  
+    ft.app(target=main)
