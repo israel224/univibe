@@ -6,6 +6,7 @@ import uuid
 import mimetypes
 import asyncio
 import urllib.parse
+from datetime import datetime, timezone
 
 # --- LIVE DATABASE CONNECTION ---
 SUPABASE_URL = "https://vjvynztrznvlhxqatcsi.supabase.co"
@@ -867,7 +868,9 @@ async def main(page: ft.Page):
         panel_chats_thread.visible = False
         panel_chats_inbox.visible = True
         set_panel_visibility(chats=True)
-        render_conversations_list()
+        render_conversations_list(force=True)
+        chat_state["inbox_polling_active"] = True
+        page.run_task(poll_inbox_loop)
         highlight_nav("chats")
 
     def nav_to_people(e):
@@ -1006,6 +1009,7 @@ async def main(page: ft.Page):
     def set_panel_visibility(feed=False, secrets=False, chats=False, people=False, reels=False, notifications=False, profile=False):
         if not chats:
             chat_state["polling_active"] = False
+            chat_state["inbox_polling_active"] = False
         panel_home_feed.visible      = feed
         panel_whisper_wall.visible   = secrets
         panel_messages.visible       = chats
@@ -1241,6 +1245,7 @@ async def main(page: ft.Page):
     # Instead, we cache the user's ID and email when they log in, and use that
     # throughout the app. This avoids the "not logged in" false negatives.
     user_cache = {"id": None, "email": None, "username": None, "access_token": None}
+    session_state = {"refresh_loop_started": False}
 
     def cache_user(user_obj, access_token=None):
         """Store the user's info and force the PostgREST client to use
@@ -1446,7 +1451,44 @@ async def main(page: ft.Page):
             print(f"Error sending message: {e}")
             return False
 
-    chat_state = {"conversation_id": None, "other_username": None, "polling_active": False, "last_rendered_count": -1}
+    def format_relative_time(iso_str):
+        """Turns a Postgres timestamptz string into a short relative label
+        like 'now', '5m ago', '3h ago', '2d ago', or a date for older messages."""
+        if not iso_str:
+            return ""
+        try:
+            ts = datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            seconds = (now - ts).total_seconds()
+            if seconds < 0:
+                seconds = 0
+            if seconds < 60:
+                return "now"
+            elif seconds < 3600:
+                return f"{int(seconds // 60)}m ago"
+            elif seconds < 86400:
+                return f"{int(seconds // 3600)}h ago"
+            elif seconds < 604800:
+                return f"{int(seconds // 86400)}d ago"
+            else:
+                return ts.strftime("%b %d")
+        except Exception as ex:
+            print(f"Time format error: {ex}")
+            return ""
+
+    def conversations_signature(convs):
+        """Cheap fingerprint of the inbox list — lets the poller skip
+        re-rendering (and the visual flicker that comes with it) when
+        nothing has actually changed since the last check."""
+        return tuple(
+            (c.get("conversation_id"), c.get("last_message"), c.get("last_message_at"))
+            for c in convs
+        )
+
+    chat_state = {"conversation_id": None, "other_username": None, "polling_active": False, "last_rendered_count": -1,
+                  "inbox_polling_active": False, "last_inbox_signature": None}
 
     conversations_layout = ft.Column(spacing=8, scroll=ft.ScrollMode.ALWAYS, height=260)
     new_chat_input = ft.TextField(hint_text="Start a chat (enter username)", width=220, dense=True, color="white")
@@ -1457,26 +1499,43 @@ async def main(page: ft.Page):
     thread_header_text = ft.Text("", size=16, weight=ft.FontWeight.BOLD, color="white")
     thread_status = ft.Text("", size=11)
 
-    def render_conversations_list():
+    def render_conversations_list(force=False):
+        convs = get_conversations()  # already sorted newest-first by the DB function
+        sig = conversations_signature(convs)
+        if not force and sig == chat_state["last_inbox_signature"]:
+            return  # nothing changed since the last poll — skip the redraw
+        chat_state["last_inbox_signature"] = sig
+
         conversations_layout.controls.clear()
-        convs = get_conversations()
         if not convs:
             conversations_layout.controls.append(ft.Text("No chats yet. Start one below!", color="#94a3b8", size=12))
         for c in convs:
             def open_this(e, cid=c["conversation_id"], uname=c["other_username"]):
                 open_thread(cid, uname)
 
+            time_label = format_relative_time(c.get("last_message_at"))
+
             conversations_layout.controls.append(
                 ft.Container(
-                    content=ft.Column([
-                        ft.Text(c["other_username"], weight=ft.FontWeight.BOLD, color="#10b981", size=14),
-                        ft.Text(c["last_message"], color="#e2e8f0", size=12, max_lines=1)
-                    ]),
+                    content=ft.Row([
+                        ft.Column([
+                            ft.Text(c["other_username"], weight=ft.FontWeight.BOLD, color="#10b981", size=14),
+                            ft.Text(c["last_message"], color="#e2e8f0", size=12, max_lines=1)
+                        ], spacing=2, expand=True),
+                        ft.Text(time_label, color="#64748b", size=10)
+                    ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
                     padding=10, bgcolor="#1e293b", border_radius=8, width=320,
                     on_click=open_this
                 )
             )
         page.update()
+
+    async def poll_inbox_loop():
+        while chat_state["inbox_polling_active"]:
+            await asyncio.sleep(3)
+            if not chat_state["inbox_polling_active"]:
+                break
+            render_conversations_list()
 
     def handle_start_new_chat(e):
         target = (new_chat_input.value or "").strip()
@@ -1508,12 +1567,17 @@ async def main(page: ft.Page):
             is_mine = m.get("sender_id") == my_id
             bubble_color = "#6366f1" if is_mine else "#1e293b"
             align = ft.MainAxisAlignment.END if is_mine else ft.MainAxisAlignment.START
+            time_label = format_relative_time(m.get("created_at"))
             thread_messages_layout.controls.append(
                 ft.Row([
-                    ft.Container(
-                        content=ft.Text(m.get("content", ""), color="white", size=13),
-                        padding=10, bgcolor=bubble_color, border_radius=10, width=220
-                    )
+                    ft.Column([
+                        ft.Container(
+                            content=ft.Text(m.get("content", ""), color="white", size=13),
+                            padding=10, bgcolor=bubble_color, border_radius=10, width=220
+                        ),
+                        ft.Text(time_label, color="#64748b", size=9)
+                    ], spacing=2,
+                       horizontal_alignment=ft.CrossAxisAlignment.END if is_mine else ft.CrossAxisAlignment.START)
                 ], alignment=align)
             )
         page.update()
@@ -1526,6 +1590,7 @@ async def main(page: ft.Page):
             render_thread_messages()
 
     def open_thread(conversation_id, other_username):
+        chat_state["inbox_polling_active"] = False  # only one poller needs to run at a time
         chat_state["conversation_id"] = conversation_id
         chat_state["other_username"] = other_username
         chat_state["last_rendered_count"] = -1
@@ -1543,7 +1608,9 @@ async def main(page: ft.Page):
         chat_state["conversation_id"] = None
         panel_chats_thread.visible = False
         panel_chats_inbox.visible = True
-        render_conversations_list()
+        render_conversations_list(force=True)
+        chat_state["inbox_polling_active"] = True
+        page.run_task(poll_inbox_loop)
         page.update()
 
     def handle_send_thread_message(e):
@@ -1629,6 +1696,7 @@ async def main(page: ft.Page):
         except Exception as ex:
             print(f"Sign out error: {ex}")
         cache_user(None)
+        session_state["refresh_loop_started"] = False
         await clear_session()
         show_auth()
 
@@ -2076,6 +2144,45 @@ async def main(page: ft.Page):
         await storage_remove("univibe_user_id")
         await storage_remove("univibe_user_email")
 
+    async def refresh_session_tokens():
+        """Forces the Supabase auth client to mint a fresh access token from
+        the refresh token already handed to it via set_session(). Updates
+        postgrest's auth header, the in-memory cache, and persisted storage
+        so every subsequent call — this session and the next restore — uses
+        a live JWT instead of a stale one. Returns False if the refresh
+        itself fails (e.g. the refresh token has also expired or been
+        revoked) — callers should treat that as "logged out", not retry."""
+        try:
+            result = supabase.auth.refresh_session()
+            if result and result.session:
+                supabase.postgrest.auth(result.session.access_token)
+                user_cache["access_token"] = result.session.access_token
+                await save_session(result.session, result.user)
+                return True
+        except Exception as ex:
+            print(f"Session refresh failed: {ex}")
+        return False
+
+    async def periodic_token_refresh_loop():
+        """Runs quietly in the background for the whole time someone is
+        logged in, renewing the access token well before its ~1 hour
+        expiry. Without this, a person who stays on one screen (e.g. an
+        open chat) for over an hour would start hitting 'JWT expired'
+        (PGRST303) errors on every request once RLS is enforced."""
+        while user_cache.get("id"):
+            await asyncio.sleep(45 * 60)
+            if not user_cache.get("id"):
+                break
+            if not await refresh_session_tokens():
+                # The refresh token itself is dead — there is no way to
+                # recover a session from here, so log the user out cleanly
+                # instead of letting every following request fail.
+                cache_user(None)
+                session_state["refresh_loop_started"] = False
+                await clear_session()
+                show_auth()
+                break
+
     def show_dashboard():
         layout_auth_master.visible = False
         layout_dashboard_master.visible = True
@@ -2083,6 +2190,9 @@ async def main(page: ft.Page):
         render_public_feed()
         highlight_nav("feed")
         refresh_notification_badge()
+        if not session_state["refresh_loop_started"]:
+            session_state["refresh_loop_started"] = True
+            page.run_task(periodic_token_refresh_loop)
         page.update()
 
     def show_auth():
@@ -2442,18 +2552,32 @@ We may update these terms; continued use of the app means you accept the changes
             user_email    = await storage_get("univibe_user_email")
 
             if access_token and refresh_token and user_id:
-                # Restore the Supabase auth session
+                # Hand the stored tokens to the auth client...
                 try:
                     supabase.auth.set_session(access_token, refresh_token)
-                    supabase.postgrest.auth(access_token)
                 except Exception as ex:
                     print(f"set_session warning: {ex}")
 
+                # ...then immediately force a refresh rather than trusting
+                # the stored access_token is still valid. It can easily
+                # have expired while the app was closed (Supabase JWTs last
+                # ~1 hour) — sending an expired token straight to postgrest
+                # is exactly what produced "JWT expired" (PGRST303) once
+                # RLS started actually checking it. If the refresh itself
+                # fails, the refresh_token is also dead, so there's no
+                # valid session to restore — clear it and send the user
+                # back to login instead of leaving a half-dead session
+                # that fails on every request.
+                if not await refresh_session_tokens():
+                    print("Stored session couldn't be refreshed — clearing it.")
+                    await clear_session()
+                    cache_user(None)
+                    return False
+
                 # Rebuild the user cache directly from stored values —
                 # never call get_user() here, it fails on the sync client
-                user_cache["id"]           = user_id
-                user_cache["email"]        = user_email
-                user_cache["access_token"] = access_token
+                user_cache["id"]    = user_id
+                user_cache["email"] = user_email
                 refresh_cached_username(user_id)  # Get the REAL username, not email prefix
 
                 show_dashboard()
