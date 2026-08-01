@@ -337,7 +337,12 @@ async def main(page: ft.Page):
             msg = f"\U0001F4E4 Shared a post: {preview}"
             if post.get("media_url"):
                 msg += f"\n{post['media_url']}"
-            send_message(conv_id, msg)
+            sent_ok, send_err = send_message(conv_id, msg)
+            if not sent_ok:
+                share_status.value = send_err or "Couldn't share — try again."
+                share_status.color = "red"
+                page.update()
+                return
             share_status.value = "Shared! ✅"
             share_status.color = "#10b981"
             share_username_input.value = ""
@@ -639,14 +644,17 @@ async def main(page: ft.Page):
     def render_friends_section(search_query=""):
         friends_layout.controls.clear()
         users = get_real_users(search_query)
+        connections_map = get_my_connections_map()
         if not users:
             friends_layout.controls.append(
                 ft.Text("No students found. Try a different search!", color="#94a3b8", size=12)
             )
         for u in users:
             uname = u.get("username", "Unknown")
+            target_id = u.get("user_id")
             detail_parts = [x for x in [u.get("department"), u.get("country")] if x]
             detail_text = " · ".join(detail_parts) if detail_parts else "No details yet"
+            conn_info = connections_map.get(target_id)
 
             def view_this(e, name=uname):
                 load_other_profile(name)
@@ -657,6 +665,31 @@ async def main(page: ft.Page):
                     set_panel_visibility(chats=True)
                     open_thread(conv_id, name)
 
+            # Decide the + button's icon/color/behavior for this row from the
+            # bulk connections lookup — no per-row network call needed.
+            if conn_info and conn_info["status"] == "accepted":
+                add_icon, add_color, add_tip, add_disabled = ft.Icons.CHECK_CIRCLE, "#64748b", "Connected", True
+            elif conn_info and conn_info["status"] == "pending" and conn_info["is_requester"]:
+                add_icon, add_color, add_tip, add_disabled = ft.Icons.HOURGLASS_TOP, "#64748b", "Pending", True
+            elif conn_info and conn_info["status"] == "pending" and not conn_info["is_requester"]:
+                add_icon, add_color, add_tip, add_disabled = ft.Icons.PERSON_ADD_ALT_1, "#eab308", "Respond to request", False
+            else:
+                add_icon, add_color, add_tip, add_disabled = ft.Icons.PERSON_ADD_ALT_1, "#6366f1", "Add friend", False
+
+            def make_add_click(target_id=target_id, uname=uname, info=conn_info):
+                def handler(e):
+                    if info and info["status"] == "pending" and not info["is_requester"]:
+                        def handle_result(accept, error):
+                            render_friends_section(search_input.value)
+                            render_pending_requests_banner()
+                        open_respond_dialog(info["request_id"], uname, on_responded=handle_result)
+                        return
+                    if info and (info["status"] == "accepted" or (info["status"] == "pending" and info["is_requester"])):
+                        return  # already handled — button is disabled in these states
+                    send_connection_request(target_id)
+                    render_friends_section(search_input.value)
+                return handler
+
             friends_layout.controls.append(
                 ft.Container(
                     content=ft.Row([
@@ -665,6 +698,8 @@ async def main(page: ft.Page):
                             ft.Text(detail_text, color="#94a3b8", size=11)
                         ], spacing=2, expand=True),
                         ft.Row([
+                            ft.IconButton(icon=add_icon, icon_color=add_color, tooltip=add_tip,
+                                          disabled=add_disabled, on_click=make_add_click(), icon_size=20),
                             ft.IconButton(icon=ft.Icons.PERSON, icon_color="#6366f1",
                                           tooltip="View profile", on_click=view_this),
                             ft.IconButton(icon=ft.Icons.CHAT_BUBBLE_OUTLINE, icon_color="#10b981",
@@ -783,6 +818,8 @@ async def main(page: ft.Page):
         "like": (ft.Icons.FAVORITE, "#f43f5e"),
         "comment": (ft.Icons.CHAT_BUBBLE, "#6366f1"),
         "message": (ft.Icons.MAIL, "#10b981"),
+        "friend_request": (ft.Icons.PERSON_ADD_ALT_1, "#eab308"),
+        "friend_accept": (ft.Icons.CHECK_CIRCLE, "#10b981"),
     }
 
     def render_notifications_panel():
@@ -876,6 +913,7 @@ async def main(page: ft.Page):
     def nav_to_people(e):
         set_panel_visibility(people=True)
         render_friends_section()
+        render_pending_requests_banner()
         highlight_nav("people")
 
     def nav_to_reels(e):
@@ -1220,8 +1258,47 @@ async def main(page: ft.Page):
         public_feed_layout
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
+    # --- PENDING CONNECTION REQUESTS BANNER (top of Friends tab) ---
+    pending_requests_layout = ft.Column(spacing=6)
+    pending_requests_banner = ft.Container(
+        content=ft.Column([
+            ft.Text("Connection Requests", size=13, weight=ft.FontWeight.BOLD, color="#eab308"),
+            pending_requests_layout
+        ], spacing=6),
+        padding=10, bgcolor="#271c24", border_radius=8, width=340, visible=False
+    )
+
+    def render_pending_requests_banner():
+        reqs = get_pending_connection_requests()
+        pending_requests_layout.controls.clear()
+        if not reqs:
+            pending_requests_banner.visible = False
+            page.update()
+            return
+        pending_requests_banner.visible = True
+        for r in reqs:
+            def make_respond(request_id=r.get("request_id"), uname=r.get("requester_username", "Unknown")):
+                def handler(accept):
+                    def do_respond(e):
+                        respond_connection_request(request_id, accept)
+                        render_pending_requests_banner()
+                        render_friends_section(search_input.value)
+                    return do_respond
+                return handler
+            respond = make_respond()
+            pending_requests_layout.controls.append(
+                ft.Row([
+                    ft.Text(f"@{r.get('requester_username', 'Unknown')} wants to connect",
+                           color="white", size=12, expand=True),
+                    ft.TextButton("Decline", on_click=respond(False)),
+                    ft.TextButton("Accept", on_click=respond(True))
+                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
+            )
+        page.update()
+
     panel_people = ft.Column([
         ft.Text("Find Friends", size=18, weight=ft.FontWeight.BOLD, color="white"),
+        pending_requests_banner,
         ft.Row([search_input, ft.Icon(ft.Icons.SEARCH, color="#94a3b8")], alignment=ft.MainAxisAlignment.CENTER),
         friends_layout
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
@@ -1245,7 +1322,6 @@ async def main(page: ft.Page):
     # Instead, we cache the user's ID and email when they log in, and use that
     # throughout the app. This avoids the "not logged in" false negatives.
     user_cache = {"id": None, "email": None, "username": None, "access_token": None}
-    session_state = {"refresh_loop_started": False}
 
     def cache_user(user_obj, access_token=None):
         """Store the user's info and force the PostgREST client to use
@@ -1368,6 +1444,116 @@ async def main(page: ft.Page):
             print(f"Report user error: {ex}")
             return False
 
+    # --- CONNECTIONS (Add Friend / Accept / Pending) ---
+    def send_connection_request(target_user_id):
+        user_id = get_cached_user_id()
+        if not user_id or not target_user_id:
+            return None, "You must be logged in."
+        try:
+            resp = supabase.rpc("send_connection_request", {
+                "p_requester_id": user_id,
+                "p_recipient_id": target_user_id
+            }).execute()
+            return resp.data, None
+        except Exception as ex:
+            return None, f"Couldn't send request: {str(ex)}"
+
+    def respond_connection_request(request_id, accept):
+        user_id = get_cached_user_id()
+        if not user_id:
+            return None, "You must be logged in."
+        try:
+            resp = supabase.rpc("respond_connection_request", {
+                "p_request_id": request_id,
+                "p_user_id": user_id,
+                "p_accept": accept
+            }).execute()
+            return resp.data, None
+        except Exception as ex:
+            return None, f"Couldn't respond: {str(ex)}"
+
+    def get_connection_status(other_user_id):
+        """Returns (status, request_id, is_requester) or (None, None, None) if
+        no connection exists yet between the current user and other_user_id."""
+        user_id = get_cached_user_id()
+        if not user_id or not other_user_id:
+            return None, None, None
+        try:
+            resp = supabase.rpc("get_connection_status", {
+                "p_user_id": user_id,
+                "p_other_user_id": other_user_id
+            }).execute()
+            if resp.data:
+                row = resp.data[0]
+                return row.get("status"), row.get("request_id"), row.get("is_requester")
+        except Exception as ex:
+            print(f"get_connection_status error: {ex}")
+        return None, None, None
+
+    def get_pending_connection_requests():
+        user_id = get_cached_user_id()
+        if not user_id:
+            return []
+        try:
+            resp = supabase.rpc("get_pending_connection_requests", {"p_user_id": user_id}).execute()
+            return resp.data or []
+        except Exception as ex:
+            print(f"get_pending_connection_requests error: {ex}")
+            return []
+
+    def get_my_connections_map():
+        """One query for every connection row involving the current user,
+        keyed by the OTHER person's id. Used to label the + button on every
+        row in Find Friends in a single round trip instead of one RPC call
+        per user (RLS already lets us read our own rows directly)."""
+        user_id = get_cached_user_id()
+        if not user_id:
+            return {}
+        try:
+            resp = supabase.table("connections").select("id, requester_id, recipient_id, status") \
+                .or_(f"requester_id.eq.{user_id},recipient_id.eq.{user_id}").execute()
+            result = {}
+            for row in (resp.data or []):
+                other = row["recipient_id"] if row["requester_id"] == user_id else row["requester_id"]
+                result[other] = {
+                    "status": row["status"],
+                    "request_id": row["id"],
+                    "is_requester": row["requester_id"] == user_id
+                }
+            return result
+        except Exception as ex:
+            print(f"get_my_connections_map error: {ex}")
+            return {}
+
+    def open_respond_dialog(request_id, requester_username, on_responded=None):
+        """Shared Accept/Decline dialog — used from the profile page, the
+        Find Friends + button, and anywhere else a single incoming request
+        needs a quick response."""
+        def close_dlg(d):
+            d.open = False
+            page.update()
+
+        def do_respond(accept):
+            def handler(ev):
+                result, error = respond_connection_request(request_id, accept)
+                close_dlg(dlg)
+                if on_responded:
+                    on_responded(accept, error)
+            return handler
+
+        dlg = ft.AlertDialog(
+            title=ft.Text(f"@{requester_username} wants to connect", color="white", size=15),
+            bgcolor="#1e293b",
+            content=ft.Text("Accept to chat freely, or decline the request.", color="#94a3b8", size=13),
+            actions=[
+                ft.TextButton("Decline", on_click=do_respond(False)),
+                ft.ElevatedButton("Accept", bgcolor="#10b981", on_click=do_respond(True)),
+                ft.TextButton("Close", on_click=lambda ev: close_dlg(dlg))
+            ]
+        )
+        page.overlay.append(dlg)
+        dlg.open = True
+        page.update()
 
     def get_conversations():
         user_id = get_cached_user_id()
@@ -1387,10 +1573,18 @@ async def main(page: ft.Page):
         if not user_id:
             return None, "You must be logged in."
         try:
-            # Look up the target user's profile
-            profile_resp = supabase.table("profiles").select("user_id, username").eq("username", target_username).execute()
+            # Normalize what the person typed — they may add "@" out of habit,
+            # or type the username in different case than it was saved. The
+            # Friends tab never has this problem because it hands back the
+            # exact stored username, but typing it by hand needs to match
+            # loosely the same way any login/search field would.
+            cleaned_username = (target_username or "").strip().lstrip("@")
+
+            # Look up the target user's profile (case-insensitive, exact match —
+            # ilike with no % wildcards behaves like a case-insensitive eq)
+            profile_resp = supabase.table("profiles").select("user_id, username").ilike("username", cleaned_username).execute()
             if not profile_resp.data:
-                return None, f"No user found with username '{target_username}'."
+                return None, f"No user found with username '{cleaned_username}'."
             target_uid = profile_resp.data[0]["user_id"]
 
             if not target_uid:
@@ -1427,7 +1621,7 @@ async def main(page: ft.Page):
     def send_message(conversation_id, content):
         user_id = get_cached_user_id()
         if not user_id or not content.strip():
-            return False
+            return False, None
         try:
             supabase.rpc("send_chat_message", {
                 "p_conversation_id": conversation_id,
@@ -1446,10 +1640,13 @@ async def main(page: ft.Page):
                                             f"{user_cache.get('username','Someone')} sent you a message")
             except Exception as notif_ex:
                 print(f"Message notification error: {notif_ex}")
-            return True
+            return True, None
         except Exception as e:
+            msg = str(e)
+            if "CONNECTION_REQUIRED" in msg:
+                return False, "You've sent your one message — you can chat freely once they accept your connection request."
             print(f"Error sending message: {e}")
-            return False
+            return False, None
 
     def format_relative_time(iso_str):
         """Turns a Postgres timestamptz string into a short relative label
@@ -1617,13 +1814,15 @@ async def main(page: ft.Page):
         content = thread_input_box.value or ""
         if not content.strip():
             return
-        if send_message(chat_state["conversation_id"], content):
+        sent_ok, send_err = send_message(chat_state["conversation_id"], content)
+        if sent_ok:
             thread_input_box.value = ""
+            thread_status.value = ""
             page.update()
             render_thread_messages()
         else:
-            thread_status.value = "Message failed to send."
-            thread_status.color = "red"
+            thread_status.value = send_err or "Message failed to send."
+            thread_status.color = "#eab308" if send_err else "red"
             page.update()
 
     panel_chats_inbox = ft.Column([
@@ -1696,7 +1895,6 @@ async def main(page: ft.Page):
         except Exception as ex:
             print(f"Sign out error: {ex}")
         cache_user(None)
-        session_state["refresh_loop_started"] = False
         await clear_session()
         show_auth()
 
@@ -1979,6 +2177,7 @@ async def main(page: ft.Page):
             view_profile_country.value = f"\U0001F30D  {p['country']}"  if p.get("country")          else ""
             view_profile_state.value   = f"\U0001F4CD  {p['state']}"    if p.get("state")            else ""
             view_profile_lga.value     = f"\U0001F3D8  {p['local_government']}" if p.get("local_government") else ""
+            profile_view_status.value = ""
             panel_view_profile.visible = True
             panel_settings.visible     = False
             panel_home_feed.visible    = False
@@ -1988,6 +2187,7 @@ async def main(page: ft.Page):
             panel_reels.visible        = False
             panel_notifications.visible = False
             page.update()
+            refresh_friend_button()
         except Exception as ex:
             print(f"Error loading other profile: {ex}")
 
@@ -1995,6 +2195,101 @@ async def main(page: ft.Page):
         panel_view_profile.visible = False
         set_panel_visibility(feed=True)
         render_public_feed()
+
+    # --- ADD FRIEND / CONNECTION STATUS BUTTON ---
+    friend_btn_text = ft.Text("Add Friend", color="white", size=13)
+    friend_btn_icon = ft.Icon(ft.Icons.PERSON_ADD_ALT_1, color="white", size=16)
+    friend_action_state = {"status": None, "request_id": None, "is_requester": None}
+
+    def refresh_friend_button():
+        target_id = viewed_profile_state["user_id"]
+        my_id = get_cached_user_id()
+        if not target_id or not my_id or target_id == my_id:
+            friend_button.visible = False
+            page.update()
+            return
+
+        friend_button.visible = True
+        status, request_id, is_requester = get_connection_status(target_id)
+        friend_action_state["status"] = status
+        friend_action_state["request_id"] = request_id
+        friend_action_state["is_requester"] = is_requester
+
+        if status == "accepted":
+            friend_btn_icon.name = ft.Icons.CHECK_CIRCLE
+            friend_btn_text.value = "Connected"
+            friend_button.bgcolor = "#334155"
+            friend_button.disabled = True
+        elif status == "pending" and is_requester:
+            friend_btn_icon.name = ft.Icons.HOURGLASS_TOP
+            friend_btn_text.value = "Pending"
+            friend_button.bgcolor = "#334155"
+            friend_button.disabled = True
+        elif status == "pending" and not is_requester:
+            friend_btn_icon.name = ft.Icons.PERSON_ADD_ALT_1
+            friend_btn_text.value = "Respond to Request"
+            friend_button.bgcolor = "#eab308"
+            friend_button.disabled = False
+        else:
+            # None, or 'declined' (declined is treated as re-requestable)
+            friend_btn_icon.name = ft.Icons.PERSON_ADD_ALT_1
+            friend_btn_text.value = "Add Friend"
+            friend_button.bgcolor = "#6366f1"
+            friend_button.disabled = False
+        page.update()
+
+    def open_respond_to_request_dialog():
+        target_name = viewed_profile_state["username"]
+
+        def handle_result(accept, error):
+            if error:
+                profile_view_status.value = error
+                profile_view_status.color = "red"
+            else:
+                profile_view_status.value = (
+                    f"You're now connected with @{target_name}!" if accept
+                    else f"Declined @{target_name}'s request."
+                )
+                profile_view_status.color = "#10b981" if accept else "#94a3b8"
+            refresh_friend_button()
+            page.update()
+
+        open_respond_dialog(friend_action_state["request_id"], target_name, on_responded=handle_result)
+
+    def handle_friend_button_click(e):
+        status = friend_action_state["status"]
+        is_requester = friend_action_state["is_requester"]
+
+        if status == "pending" and not is_requester:
+            open_respond_to_request_dialog()
+            return
+
+        if status in ("accepted",) or (status == "pending" and is_requester):
+            return  # button is disabled in these states already
+
+        target_id = viewed_profile_state["user_id"]
+        target_name = viewed_profile_state["username"]
+        result, error = send_connection_request(target_id)
+        if error:
+            profile_view_status.value = error
+            profile_view_status.color = "red"
+        elif result == "accepted":
+            profile_view_status.value = f"You're now connected with @{target_name}!"
+            profile_view_status.color = "#10b981"
+        elif result == "already_connected":
+            profile_view_status.value = f"You're already connected with @{target_name}."
+            profile_view_status.color = "#94a3b8"
+        else:
+            profile_view_status.value = f"Request sent to @{target_name}."
+            profile_view_status.color = "#10b981"
+        refresh_friend_button()
+        page.update()
+
+    friend_button = ft.ElevatedButton(
+        content=ft.Row([friend_btn_icon, friend_btn_text], spacing=6,
+                       alignment=ft.MainAxisAlignment.CENTER),
+        bgcolor="#6366f1", width=280, on_click=handle_friend_button_click, visible=False
+    )
 
     def handle_block_from_profile(e):
         target_id = viewed_profile_state["user_id"]
@@ -2064,6 +2359,7 @@ async def main(page: ft.Page):
         view_profile_country,
         view_profile_state,
         view_profile_lga,
+        friend_button,
         ft.ElevatedButton(
             content=ft.Text("Send Message", color="white"),
             bgcolor="#10b981", width=280,
@@ -2144,45 +2440,6 @@ async def main(page: ft.Page):
         await storage_remove("univibe_user_id")
         await storage_remove("univibe_user_email")
 
-    async def refresh_session_tokens():
-        """Forces the Supabase auth client to mint a fresh access token from
-        the refresh token already handed to it via set_session(). Updates
-        postgrest's auth header, the in-memory cache, and persisted storage
-        so every subsequent call — this session and the next restore — uses
-        a live JWT instead of a stale one. Returns False if the refresh
-        itself fails (e.g. the refresh token has also expired or been
-        revoked) — callers should treat that as "logged out", not retry."""
-        try:
-            result = supabase.auth.refresh_session()
-            if result and result.session:
-                supabase.postgrest.auth(result.session.access_token)
-                user_cache["access_token"] = result.session.access_token
-                await save_session(result.session, result.user)
-                return True
-        except Exception as ex:
-            print(f"Session refresh failed: {ex}")
-        return False
-
-    async def periodic_token_refresh_loop():
-        """Runs quietly in the background for the whole time someone is
-        logged in, renewing the access token well before its ~1 hour
-        expiry. Without this, a person who stays on one screen (e.g. an
-        open chat) for over an hour would start hitting 'JWT expired'
-        (PGRST303) errors on every request once RLS is enforced."""
-        while user_cache.get("id"):
-            await asyncio.sleep(45 * 60)
-            if not user_cache.get("id"):
-                break
-            if not await refresh_session_tokens():
-                # The refresh token itself is dead — there is no way to
-                # recover a session from here, so log the user out cleanly
-                # instead of letting every following request fail.
-                cache_user(None)
-                session_state["refresh_loop_started"] = False
-                await clear_session()
-                show_auth()
-                break
-
     def show_dashboard():
         layout_auth_master.visible = False
         layout_dashboard_master.visible = True
@@ -2190,9 +2447,6 @@ async def main(page: ft.Page):
         render_public_feed()
         highlight_nav("feed")
         refresh_notification_badge()
-        if not session_state["refresh_loop_started"]:
-            session_state["refresh_loop_started"] = True
-            page.run_task(periodic_token_refresh_loop)
         page.update()
 
     def show_auth():
@@ -2552,33 +2806,44 @@ We may update these terms; continued use of the app means you accept the changes
             user_email    = await storage_get("univibe_user_email")
 
             if access_token and refresh_token and user_id:
-                # Hand the stored tokens to the auth client...
+                # Restore the Supabase auth session — same as before
                 try:
                     supabase.auth.set_session(access_token, refresh_token)
+                    supabase.postgrest.auth(access_token)
                 except Exception as ex:
                     print(f"set_session warning: {ex}")
 
-                # ...then immediately force a refresh rather than trusting
-                # the stored access_token is still valid. It can easily
-                # have expired while the app was closed (Supabase JWTs last
-                # ~1 hour) — sending an expired token straight to postgrest
-                # is exactly what produced "JWT expired" (PGRST303) once
-                # RLS started actually checking it. If the refresh itself
-                # fails, the refresh_token is also dead, so there's no
-                # valid session to restore — clear it and send the user
-                # back to login instead of leaving a half-dead session
-                # that fails on every request.
-                if not await refresh_session_tokens():
-                    print("Stored session couldn't be refreshed — clearing it.")
-                    await clear_session()
-                    cache_user(None)
-                    return False
+                # Validate the restored token with one real query before
+                # committing to it. A stored access_token can be expired
+                # if the app was closed for a while (Supabase JWTs last
+                # ~1 hour) — sending an expired token to a table that now
+                # has RLS enforced comes back as "JWT expired" (PGRST303).
+                # If that happens here, clear the dead session and drop
+                # back to login instead of continuing into a dashboard
+                # where every request would fail the same way.
+                username_check = None
+                try:
+                    username_check = supabase.table("profiles").select("username").eq("user_id", user_id).execute()
+                except Exception as ex:
+                    msg = str(ex).lower()
+                    if "jwt" in msg or "expired" in msg or "pgrst303" in msg:
+                        print(f"Stored session is no longer valid — clearing it: {ex}")
+                        await clear_session()
+                        cache_user(None)
+                        return False
+                    # Some other (likely transient/network) error — fall
+                    # through and let the app proceed; individual screens
+                    # already handle their own fetch failures gracefully.
 
                 # Rebuild the user cache directly from stored values —
                 # never call get_user() here, it fails on the sync client
-                user_cache["id"]    = user_id
-                user_cache["email"] = user_email
-                refresh_cached_username(user_id)  # Get the REAL username, not email prefix
+                user_cache["id"]           = user_id
+                user_cache["email"]        = user_email
+                user_cache["access_token"] = access_token
+                if username_check and username_check.data and username_check.data[0].get("username"):
+                    user_cache["username"] = username_check.data[0]["username"]
+                else:
+                    refresh_cached_username(user_id)  # Get the REAL username, not email prefix
 
                 show_dashboard()
                 return True
