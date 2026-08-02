@@ -246,10 +246,12 @@ async def main(page: ft.Page):
 
     def open_comments_dialog(post_id, post_username, post_owner_id=None):
         comment_input = ft.TextField(
-            hint_text="Write a comment…", width=260, dense=True, color="white"
+            hint_text="Write a comment…", expand=True, dense=True, color="white",
+            border_color="#334155", content_padding=10
         )
-        comments_col = ft.Column(spacing=6, scroll=ft.ScrollMode.ALWAYS, height=200)
+        comments_col = ft.Column(spacing=6, scroll=ft.ScrollMode.ALWAYS, height=220, width=300)
         status = ft.Text("", size=11)
+        send_btn = ft.IconButton(icon=ft.Icons.SEND, icon_color="#6366f1")
 
         def load_comments():
             comments_col.controls.clear()
@@ -263,7 +265,7 @@ async def main(page: ft.Page):
                                         color="#6366f1", size=12),
                                 ft.Text(c["content"], color="#e2e8f0", size=13)
                             ], spacing=2),
-                            padding=8, bgcolor="#1e293b", border_radius=6
+                            padding=8, bgcolor="#0f172a", border_radius=6
                         )
                     )
                 if not resp.data:
@@ -272,12 +274,21 @@ async def main(page: ft.Page):
                     )
             except Exception as ex:
                 print(f"Comments load error: {ex}")
+                comments_col.controls.append(
+                    ft.Text("Couldn't load comments — try closing and reopening.", color="#f43f5e", size=12)
+                )
             page.update()
 
         def submit_comment(e):
             content = (comment_input.value or "").strip()
             if not content:
+                status.value = "Write something first."
+                status.color = "#94a3b8"
+                page.update()
                 return
+            send_btn.disabled = True
+            status.value = ""
+            page.update()
             try:
                 supabase.rpc("add_post_comment", {
                     "p_post_id": post_id,
@@ -286,24 +297,31 @@ async def main(page: ft.Page):
                     "p_content": content
                 }).execute()
                 comment_input.value = ""
-                load_comments()
+                send_btn.disabled = False
+                load_comments()  # already calls page.update()
                 create_notification(post_owner_id, "comment",
                                     f"{user_cache.get('username','Someone')} commented on your post", post_id)
             except Exception as ex:
-                status.value = f"Failed: {str(ex)}"
-                status.color = "red"
+                send_btn.disabled = False
+                status.value = f"Couldn't post comment: {str(ex)}"
+                status.color = "#f43f5e"
                 page.update()
+
+        send_btn.on_click = submit_comment
 
         dlg = ft.AlertDialog(
             title=ft.Text(f"Comments on {post_username}'s post", color="white", size=14),
-            bgcolor="#0f172a",
-            content=ft.Column([
-                comments_col,
-                ft.Row([comment_input,
-                        ft.IconButton(icon=ft.Icons.SEND, icon_color="#6366f1",
-                                      on_click=submit_comment)]),
-                status
-            ], tight=True),
+            bgcolor="#1e293b",
+            content=ft.Container(
+                content=ft.Column([
+                    comments_col,
+                    ft.Divider(height=8, color="#334155"),
+                    ft.Row([comment_input, send_btn], spacing=4,
+                           vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    status
+                ], spacing=8, tight=True),
+                width=300
+            ),
             actions=[ft.TextButton("Close", on_click=lambda e: close_dlg(dlg))]
         )
 
