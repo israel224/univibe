@@ -202,6 +202,44 @@ async def main(page: ft.Page):
     page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
     page.bgcolor = "#0f172a"
 
+    # ============================================================
+    # --- DESIGN SYSTEM ------------------------------------------
+    # Single source of truth for color, spacing, and shape. Every new
+    # screen or fix should pull from here instead of hand-typing hex
+    # codes and magic numbers — that's what let six different border
+    # radii (6, 8, 10, 12...) and four different dialog widths creep
+    # into the app over time. Nothing below changes what's on screen
+    # today; it just gives the existing palette real names so the next
+    # change converges toward one visual language instead of drifting
+    # further apart.
+    # ============================================================
+    COLOR_BG        = "#0f172a"  # page background + "inset" surfaces nested inside a card
+    COLOR_CARD      = "#1e293b"  # cards, dialogs, the bottom nav bar
+    COLOR_BORDER    = "#334155"  # dividers, input outlines, subtle separators
+    COLOR_PRIMARY   = "#6366f1"  # brand indigo — primary actions, active nav, links
+    COLOR_SUCCESS   = "#10b981"  # confirmations, "accept", positive status text
+    COLOR_DANGER    = "#f43f5e"  # destructive actions, errors, unread-alert red
+    COLOR_WARNING   = "#eab308"  # pending states, anonymous/secret content accents
+    COLOR_TEXT_MUTED = "#94a3b8"  # secondary text, placeholders, inactive nav
+    COLOR_TEXT_FAINT = "#64748b"  # tertiary text, disabled icons, timestamps
+    COLOR_TEXT_BODY  = "#e2e8f0"  # primary body copy on dark surfaces (post text, bios, bubbles)
+
+    COLOR_UNREAD   = "#27314a"  # unread notification row highlight
+    COLOR_WHISPER  = "#271c24"  # Whisper Wall's anonymous-post accent surface
+    COLOR_WHATSAPP = "#25D366"  # WhatsApp brand green, for the "share via WhatsApp" button only
+
+    SPACE_XS = 4   # tight gaps: icon-to-label, chip padding
+    SPACE_SM = 6   # compact rows, action bars
+    SPACE_MD = 10  # standard card padding, list-item spacing
+    SPACE_LG = 16  # section spacing, generous card padding
+
+    RADIUS_SM = 8    # inset elements sitting inside a card (e.g. comment bubbles)
+    RADIUS_MD = 12   # standard cards: posts, friend rows, notifications, list items
+    RADIUS_LG = 16   # chat bubbles and other rounder, "pill-like" surfaces
+    DIALOG_WIDTH = 300  # every AlertDialog content column standardizes on this
+
+
+
     # --- DATABASE FETCHING FUNCTION ---
     def get_posts():
         try:
@@ -235,8 +273,8 @@ async def main(page: ft.Page):
             like_count_text.value = str(new_count)
             # Toggle heart colour
             current_color = like_btn.icon_color
-            now_liked = current_color != "#f43f5e"
-            like_btn.icon_color = "#f43f5e" if now_liked else "#64748b"
+            now_liked = current_color != COLOR_DANGER
+            like_btn.icon_color = COLOR_DANGER if now_liked else COLOR_TEXT_FAINT
             page.update()
             if now_liked:
                 create_notification(post_owner_id, "like",
@@ -247,11 +285,11 @@ async def main(page: ft.Page):
     def open_comments_dialog(post_id, post_username, post_owner_id=None):
         comment_input = ft.TextField(
             hint_text="Write a comment…", expand=True, dense=True, color="white",
-            border_color="#334155", content_padding=10
+            border_color=COLOR_BORDER, content_padding=10
         )
         comments_col = ft.Column(spacing=6, scroll=ft.ScrollMode.ALWAYS, height=220, width=300)
         status = ft.Text("", size=11)
-        send_btn = ft.IconButton(icon=ft.Icons.SEND, icon_color="#6366f1")
+        send_btn = ft.IconButton(icon=ft.Icons.SEND_ROUNDED, icon_color=COLOR_PRIMARY)
 
         def load_comments():
             comments_col.controls.clear()
@@ -262,20 +300,20 @@ async def main(page: ft.Page):
                         ft.Container(
                             content=ft.Column([
                                 ft.Text(c["username"], weight=ft.FontWeight.BOLD,
-                                        color="#6366f1", size=12),
-                                ft.Text(c["content"], color="#e2e8f0", size=13)
+                                        color=COLOR_PRIMARY, size=12),
+                                ft.Text(c["content"], color=COLOR_TEXT_BODY, size=13)
                             ], spacing=2),
-                            padding=8, bgcolor="#0f172a", border_radius=6
+                            padding=SPACE_MD, bgcolor=COLOR_BG, border_radius=RADIUS_SM
                         )
                     )
                 if not resp.data:
                     comments_col.controls.append(
-                        ft.Text("No comments yet. Be first!", color="#94a3b8", size=12)
+                        ft.Text("No comments yet. Be first!", color=COLOR_TEXT_MUTED, size=12)
                     )
             except Exception as ex:
                 print(f"Comments load error: {ex}")
                 comments_col.controls.append(
-                    ft.Text("Couldn't load comments — try closing and reopening.", color="#f43f5e", size=12)
+                    ft.Text("Couldn't load comments — try closing and reopening.", color=COLOR_DANGER, size=12)
                 )
             page.update()
 
@@ -283,7 +321,7 @@ async def main(page: ft.Page):
             content = (comment_input.value or "").strip()
             if not content:
                 status.value = "Write something first."
-                status.color = "#94a3b8"
+                status.color = COLOR_TEXT_MUTED
                 page.update()
                 return
             send_btn.disabled = True
@@ -304,23 +342,23 @@ async def main(page: ft.Page):
             except Exception as ex:
                 send_btn.disabled = False
                 status.value = f"Couldn't post comment: {str(ex)}"
-                status.color = "#f43f5e"
+                status.color = COLOR_DANGER
                 page.update()
 
         send_btn.on_click = submit_comment
 
         dlg = ft.AlertDialog(
             title=ft.Text(f"Comments on {post_username}'s post", color="white", size=14),
-            bgcolor="#1e293b",
+            bgcolor=COLOR_CARD,
             content=ft.Container(
                 content=ft.Column([
                     comments_col,
-                    ft.Divider(height=8, color="#334155"),
+                    ft.Divider(height=8, color=COLOR_BORDER),
                     ft.Row([comment_input, send_btn], spacing=4,
                            vertical_alignment=ft.CrossAxisAlignment.CENTER),
                     status
                 ], spacing=8, tight=True),
-                width=300
+                width=DIALOG_WIDTH
             ),
             actions=[ft.TextButton("Close", on_click=lambda e: close_dlg(dlg))]
         )
@@ -342,13 +380,13 @@ async def main(page: ft.Page):
             target = (share_username_input.value or "").strip()
             if not target:
                 share_status.value = "Enter a username first."
-                share_status.color = "red"
+                share_status.color = COLOR_DANGER
                 page.update()
                 return
             conv_id, error = get_or_create_conversation(target)
             if error:
                 share_status.value = error
-                share_status.color = "red"
+                share_status.color = COLOR_DANGER
                 page.update()
                 return
             preview = (post.get("content") or "")[:100]
@@ -358,11 +396,11 @@ async def main(page: ft.Page):
             sent_ok, send_err = send_message(conv_id, msg)
             if not sent_ok:
                 share_status.value = send_err or "Couldn't share — try again."
-                share_status.color = "red"
+                share_status.color = COLOR_DANGER
                 page.update()
                 return
             share_status.value = "Shared! ✅"
-            share_status.color = "#10b981"
+            share_status.color = COLOR_SUCCESS
             share_username_input.value = ""
             page.update()
 
@@ -379,19 +417,19 @@ async def main(page: ft.Page):
 
         dlg = ft.AlertDialog(
             title=ft.Text("Share Post", color="white", size=14),
-            bgcolor="#1e293b",
+            bgcolor=COLOR_CARD,
             content=ft.Column([
-                ft.Text("Share to a friend's chat:", color="#94a3b8", size=12),
+                ft.Text("Share to a friend's chat:", color=COLOR_TEXT_MUTED, size=12),
                 ft.Row([share_username_input,
-                        ft.IconButton(icon=ft.Icons.SEND, icon_color="#6366f1", on_click=share_to_chat)]),
+                        ft.IconButton(icon=ft.Icons.SEND_ROUNDED, icon_color=COLOR_PRIMARY, on_click=share_to_chat)]),
                 share_status,
-                ft.Divider(color="#334155"),
+                ft.Divider(color=COLOR_BORDER),
                 ft.ElevatedButton(
-                    content=ft.Row([ft.Icon(ft.Icons.SHARE, color="white", size=16),
+                    content=ft.Row([ft.Icon(ft.Icons.SHARE_ROUNDED, color="white", size=16),
                                     ft.Text("Share via WhatsApp", color="white")], spacing=6),
-                    bgcolor="#25D366", on_click=share_whatsapp
+                    bgcolor=COLOR_WHATSAPP, on_click=share_whatsapp
                 )
-            ], tight=True, spacing=10),
+            ], tight=True, spacing=10, width=DIALOG_WIDTH),
             actions=[ft.TextButton("Close", on_click=lambda e: close_dlg(dlg))]
         )
         page.overlay.append(dlg)
@@ -464,7 +502,7 @@ async def main(page: ft.Page):
 
     def open_report_post_dialog(post_id):
         reason_dd = ft.Dropdown(
-            label="Reason", width=260, color="white",
+            label="Reason", width=DIALOG_WIDTH, color="white",
             options=[ft.dropdown.Option(r) for r in REPORT_REASONS]
         )
         status = ft.Text("", size=11)
@@ -476,21 +514,21 @@ async def main(page: ft.Page):
         def submit_report(e):
             if not reason_dd.value:
                 status.value = "Please choose a reason."
-                status.color = "red"
+                status.color = COLOR_DANGER
                 page.update()
                 return
             if report_post_action(post_id, reason_dd.value):
                 status.value = "Reported. Our team will review it."
-                status.color = "#10b981"
+                status.color = COLOR_SUCCESS
                 page.update()
             else:
                 status.value = "Couldn't submit report — try again."
-                status.color = "red"
+                status.color = COLOR_DANGER
                 page.update()
 
         dlg = ft.AlertDialog(
             title=ft.Text("Report Post", color="white", size=16),
-            bgcolor="#1e293b",
+            bgcolor=COLOR_CARD,
             content=ft.Column([reason_dd, status], tight=True, spacing=10),
             actions=[
                 ft.TextButton("Submit", on_click=submit_report),
@@ -553,9 +591,9 @@ async def main(page: ft.Page):
         for p in posts:
             is_anon = p.get("is_anonymous", False)
             display_name = "Anonymous Ghost \U0001F47B" if is_anon else p.get("username", "Unknown")
-            name_color = "#f43f5e" if is_anon else "#6366f1"
-            name_icon = ft.Icons.SECURITY_OUTLINED if is_anon else ft.Icons.ACCOUNT_CIRCLE
-            icon_color = "#f43f5e" if is_anon else "#6366f1"
+            name_color = COLOR_DANGER if is_anon else COLOR_PRIMARY
+            name_icon = ft.Icons.SECURITY_ROUNDED if is_anon else ft.Icons.ACCOUNT_CIRCLE_ROUNDED
+            icon_color = COLOR_DANGER if is_anon else COLOR_PRIMARY
 
             def make_name_tap(uname=p.get("username")):
                 def on_tap(e):
@@ -575,19 +613,19 @@ async def main(page: ft.Page):
                 ft.Row([ft.Icon(name_icon, color=icon_color, size=18), name_widget])
             ]
             if p.get("content"):
-                post_body.append(ft.Text(p["content"], color="#e2e8f0", size=14))
+                post_body.append(ft.Text(p["content"], color=COLOR_TEXT_BODY, size=14))
 
             media_url = p.get("media_url")
             if media_url and p.get("media_type") == "image":
                 post_body.append(
-                    ft.Image(src=media_url, width=300, height=180, fit=ft.BoxFit.COVER, border_radius=8)
+                    ft.Image(src=media_url, width=300, height=180, fit=ft.BoxFit.COVER, border_radius=RADIUS_MD)
                 )
             elif media_url and p.get("media_type") == "video":
                 post_body.append(
                     ft.Container(
-                        content=ft.Row([ft.Icon(ft.Icons.PLAY_CIRCLE_OUTLINE, color="white"),
+                        content=ft.Row([ft.Icon(ft.Icons.PLAY_CIRCLE_ROUNDED, color="white"),
                                         ft.Text("Video attached — tap to view", color="white", size=12)]),
-                        padding=8, bgcolor="#334155", border_radius=6,
+                        padding=SPACE_MD, bgcolor=COLOR_BORDER, border_radius=RADIUS_SM,
                         on_click=lambda e, url=media_url: page.launch_url(url)
                     )
                 )
@@ -597,11 +635,11 @@ async def main(page: ft.Page):
             like_info = likes_map.get(post_id, {})
             like_count = like_info.get("like_count", 0)
             user_liked = like_info.get("user_liked", False)
-            like_icon_color = "#f43f5e" if user_liked else "#64748b"
+            like_icon_color = COLOR_DANGER if user_liked else COLOR_TEXT_FAINT
 
-            like_count_text = ft.Text(str(like_count), color="#94a3b8", size=12)
+            like_count_text = ft.Text(str(like_count), color=COLOR_TEXT_MUTED, size=12)
             like_btn = ft.IconButton(
-                icon=ft.Icons.FAVORITE,
+                icon=ft.Icons.FAVORITE_ROUNDED,
                 icon_color=like_icon_color,
                 icon_size=18
             )
@@ -611,21 +649,21 @@ async def main(page: ft.Page):
             make_like_handler()
 
             comment_btn = ft.IconButton(
-                icon=ft.Icons.CHAT_BUBBLE_OUTLINE,
-                icon_color="#64748b", icon_size=18,
+                icon=ft.Icons.CHAT_BUBBLE_OUTLINE_ROUNDED,
+                icon_color=COLOR_TEXT_FAINT, icon_size=18,
                 on_click=lambda e, pid=post_id, uname=p.get("username","Unknown"), owner=p.get("user_id"): open_comments_dialog(pid, uname, owner)
             )
 
             share_btn = ft.IconButton(
-                icon=ft.Icons.SHARE_OUTLINED,
-                icon_color="#64748b", icon_size=18,
+                icon=ft.Icons.SHARE_ROUNDED,
+                icon_color=COLOR_TEXT_FAINT, icon_size=18,
                 tooltip="Share",
                 on_click=lambda e, post=p: open_share_dialog(post)
             )
 
             repost_btn = ft.IconButton(
-                icon=ft.Icons.REPEAT,
-                icon_color="#64748b", icon_size=18,
+                icon=ft.Icons.REPEAT_ROUNDED,
+                icon_color=COLOR_TEXT_FAINT, icon_size=18,
                 tooltip="Repost",
                 on_click=lambda e, post=p: handle_repost(post)
             )
@@ -634,16 +672,16 @@ async def main(page: ft.Page):
 
             if p.get("user_id") == get_cached_user_id():
                 delete_btn = ft.IconButton(
-                    icon=ft.Icons.DELETE_OUTLINE,
-                    icon_color="#64748b", icon_size=18,
+                    icon=ft.Icons.DELETE_OUTLINE_ROUNDED,
+                    icon_color=COLOR_TEXT_FAINT, icon_size=18,
                     tooltip="Delete post",
                     on_click=lambda e, post=p: handle_delete_post(post)
                 )
                 action_row_controls.append(delete_btn)
             else:
                 report_btn = ft.IconButton(
-                    icon=ft.Icons.FLAG_OUTLINED,
-                    icon_color="#64748b", icon_size=18,
+                    icon=ft.Icons.FLAG_ROUNDED,
+                    icon_color=COLOR_TEXT_FAINT, icon_size=18,
                     tooltip="Report post",
                     on_click=lambda e, pid=post_id: open_report_post_dialog(pid)
                 )
@@ -654,7 +692,7 @@ async def main(page: ft.Page):
             public_feed_layout.controls.append(
                 ft.Container(
                     content=ft.Column(post_body, spacing=6),
-                    padding=10, bgcolor="#1e293b", border_radius=8, width=340
+                    padding=SPACE_LG, bgcolor=COLOR_CARD, border_radius=RADIUS_MD, width=340
                 )
             )
         page.update()
@@ -665,7 +703,7 @@ async def main(page: ft.Page):
         connections_map = get_my_connections_map()
         if not users:
             friends_layout.controls.append(
-                ft.Text("No students found. Try a different search!", color="#94a3b8", size=12)
+                ft.Text("No students found. Try a different search!", color=COLOR_TEXT_MUTED, size=12)
             )
         for u in users:
             uname = u.get("username", "Unknown")
@@ -686,13 +724,13 @@ async def main(page: ft.Page):
             # Decide the + button's icon/color/behavior for this row from the
             # bulk connections lookup — no per-row network call needed.
             if conn_info and conn_info["status"] == "accepted":
-                add_icon, add_color, add_tip, add_disabled = ft.Icons.CHECK_CIRCLE, "#64748b", "Connected", True
+                add_icon, add_color, add_tip, add_disabled = ft.Icons.CHECK_CIRCLE_ROUNDED, COLOR_TEXT_FAINT, "Connected", True
             elif conn_info and conn_info["status"] == "pending" and conn_info["is_requester"]:
-                add_icon, add_color, add_tip, add_disabled = ft.Icons.HOURGLASS_TOP, "#64748b", "Pending", True
+                add_icon, add_color, add_tip, add_disabled = ft.Icons.HOURGLASS_TOP_ROUNDED, COLOR_TEXT_FAINT, "Pending", True
             elif conn_info and conn_info["status"] == "pending" and not conn_info["is_requester"]:
-                add_icon, add_color, add_tip, add_disabled = ft.Icons.PERSON_ADD_ALT_1, "#eab308", "Respond to request", False
+                add_icon, add_color, add_tip, add_disabled = ft.Icons.PERSON_ADD_ALT_1_ROUNDED, COLOR_WARNING, "Respond to request", False
             else:
-                add_icon, add_color, add_tip, add_disabled = ft.Icons.PERSON_ADD_ALT_1, "#6366f1", "Add friend", False
+                add_icon, add_color, add_tip, add_disabled = ft.Icons.PERSON_ADD_ALT_1_ROUNDED, COLOR_PRIMARY, "Add friend", False
 
             def make_add_click(target_id=target_id, uname=uname, info=conn_info):
                 def handler(e):
@@ -713,18 +751,18 @@ async def main(page: ft.Page):
                     content=ft.Row([
                         ft.Column([
                             ft.Text(uname, color="white", weight="bold", size=13),
-                            ft.Text(detail_text, color="#94a3b8", size=11)
+                            ft.Text(detail_text, color=COLOR_TEXT_MUTED, size=11)
                         ], spacing=2, expand=True),
                         ft.Row([
                             ft.IconButton(icon=add_icon, icon_color=add_color, tooltip=add_tip,
                                           disabled=add_disabled, on_click=make_add_click(), icon_size=20),
-                            ft.IconButton(icon=ft.Icons.PERSON, icon_color="#6366f1",
+                            ft.IconButton(icon=ft.Icons.PERSON_ROUNDED, icon_color=COLOR_PRIMARY,
                                           tooltip="View profile", on_click=view_this),
-                            ft.IconButton(icon=ft.Icons.CHAT_BUBBLE_OUTLINE, icon_color="#10b981",
+                            ft.IconButton(icon=ft.Icons.CHAT_BUBBLE_OUTLINE_ROUNDED, icon_color=COLOR_SUCCESS,
                                           tooltip="Message", on_click=chat_this),
                         ], spacing=0)
                     ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-                    padding=8, bgcolor="#1e293b", border_radius=6, width=340
+                    padding=SPACE_MD, bgcolor=COLOR_CARD, border_radius=RADIUS_MD, width=340
                 )
             )
         page.update()
@@ -735,18 +773,18 @@ async def main(page: ft.Page):
         posts = [w for w in get_whisper_posts() if w.get("user_id") not in blocked]
         if not posts:
             whisper_feed_layout.controls.append(
-                ft.Text("No secrets yet. Be the first to share one!", color="#94a3b8", size=12)
+                ft.Text("No secrets yet. Be the first to share one!", color=COLOR_TEXT_MUTED, size=12)
             )
         for w in posts:
             real_name = w.get("username", "Unknown")
             display_tag = f"Anonymous Ghost [Real: {real_name}]" if reveal_names else "Anonymous Ghost \U0001F47B"
-            header_color = "#eab308" if reveal_names else "#f43f5e"
+            header_color = COLOR_WARNING if reveal_names else COLOR_DANGER
             whisper_feed_layout.controls.append(
                 ft.Container(
                     content=ft.Column([
-                        ft.Row([ft.Icon(ft.Icons.SECURITY_OUTLINED, color=header_color), ft.Text(display_tag, weight=ft.FontWeight.BOLD, color=header_color)]),
-                        ft.Text(w.get("content", ""), color="#e2e8f0")
-                    ]), padding=12, bgcolor="#271c24", border_radius=10, width=340
+                        ft.Row([ft.Icon(ft.Icons.SECURITY_ROUNDED, color=header_color), ft.Text(display_tag, weight=ft.FontWeight.BOLD, color=header_color)]),
+                        ft.Text(w.get("content", ""), color=COLOR_TEXT_BODY)
+                    ]), padding=SPACE_LG, bgcolor=COLOR_WHISPER, border_radius=RADIUS_MD, width=340
                 )
             )
         page.update()
@@ -755,7 +793,7 @@ async def main(page: ft.Page):
         content = (whisper_text_box.value or "").strip()
         if not content:
             whisper_status_text.value = "Write a secret first!"
-            whisper_status_text.color = "red"
+            whisper_status_text.color = COLOR_DANGER
             page.update()
             return
         try:
@@ -771,12 +809,12 @@ async def main(page: ft.Page):
             }).execute()
             whisper_text_box.value = ""
             whisper_status_text.value = "Secret posted! 🤫"
-            whisper_status_text.color = "#10b981"
+            whisper_status_text.color = COLOR_SUCCESS
             page.update()
             render_whisper_feed(reveal_names=creator_admin_switch.value)
         except Exception as ex:
             whisper_status_text.value = f"Failed to post: {str(ex)}"
-            whisper_status_text.color = "red"
+            whisper_status_text.color = COLOR_DANGER
             page.update()
 
     # --- TAB: REELS (short video feed) ---
@@ -791,7 +829,7 @@ async def main(page: ft.Page):
             reels_layout.controls.append(
                 ft.Container(
                     content=ft.Text("No reels yet. Post a video from Feed to start!",
-                                    color="#94a3b8", size=13),
+                                    color=COLOR_TEXT_MUTED, size=13),
                     padding=20, alignment=ft.Alignment.CENTER
                 )
             )
@@ -803,21 +841,21 @@ async def main(page: ft.Page):
                     content=ft.Column([
                         ft.Container(
                             content=ft.Column([
-                                ft.Icon(ft.Icons.PLAY_CIRCLE_FILL, color="white", size=48),
+                                ft.Icon(ft.Icons.PLAY_CIRCLE_ROUNDED, color="white", size=48),
                                 ft.Text("Tap to play", color="white", size=12)
                             ], alignment=ft.MainAxisAlignment.CENTER,
                                horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-                            width=340, height=420, bgcolor="#1e293b", border_radius=12,
+                            width=340, height=420, bgcolor=COLOR_CARD, border_radius=RADIUS_MD,
                             alignment=ft.Alignment.CENTER,
                             on_click=lambda e, url=p["media_url"]: page.launch_url(url)
                         ),
                         ft.Row([
-                            ft.Icon(ft.Icons.SECURITY_OUTLINED if is_anon else ft.Icons.ACCOUNT_CIRCLE,
-                                    color="#f43f5e" if is_anon else "#6366f1", size=16),
+                            ft.Icon(ft.Icons.SECURITY_ROUNDED if is_anon else ft.Icons.ACCOUNT_CIRCLE_ROUNDED,
+                                    color=COLOR_DANGER if is_anon else COLOR_PRIMARY, size=16),
                             ft.Text(display_name, weight=ft.FontWeight.BOLD,
-                                    color="#f43f5e" if is_anon else "#6366f1", size=13)
+                                    color=COLOR_DANGER if is_anon else COLOR_PRIMARY, size=13)
                         ]),
-                        ft.Text(p.get("content") or "", color="#e2e8f0", size=12)
+                        ft.Text(p.get("content") or "", color=COLOR_TEXT_BODY, size=12)
                     ], spacing=6),
                     padding=8
                 )
@@ -833,11 +871,11 @@ async def main(page: ft.Page):
     notifications_layout = ft.Column(spacing=8)
 
     NOTIF_ICONS = {
-        "like": (ft.Icons.FAVORITE, "#f43f5e"),
-        "comment": (ft.Icons.CHAT_BUBBLE, "#6366f1"),
-        "message": (ft.Icons.MAIL, "#10b981"),
-        "friend_request": (ft.Icons.PERSON_ADD_ALT_1, "#eab308"),
-        "friend_accept": (ft.Icons.CHECK_CIRCLE, "#10b981"),
+        "like": (ft.Icons.FAVORITE_ROUNDED, COLOR_DANGER),
+        "comment": (ft.Icons.CHAT_BUBBLE_ROUNDED, COLOR_PRIMARY),
+        "message": (ft.Icons.MAIL, COLOR_SUCCESS),
+        "friend_request": (ft.Icons.PERSON_ADD_ALT_1_ROUNDED, COLOR_WARNING),
+        "friend_accept": (ft.Icons.CHECK_CIRCLE_ROUNDED, COLOR_SUCCESS),
     }
 
     def render_notifications_panel():
@@ -854,20 +892,20 @@ async def main(page: ft.Page):
 
         if not notifs:
             notifications_layout.controls.append(
-                ft.Text("No notifications yet.", color="#94a3b8", size=13)
+                ft.Text("No notifications yet.", color=COLOR_TEXT_MUTED, size=13)
             )
         for n in notifs:
-            icon, color = NOTIF_ICONS.get(n.get("type"), (ft.Icons.NOTIFICATIONS, "#94a3b8"))
+            icon, color = NOTIF_ICONS.get(n.get("type"), (ft.Icons.NOTIFICATIONS, COLOR_TEXT_MUTED))
             is_unread = not n.get("is_read", True)
             notifications_layout.controls.append(
                 ft.Container(
                     content=ft.Row([
                         ft.Icon(icon, color=color, size=20),
-                        ft.Text(n.get("message", ""), color="white" if is_unread else "#94a3b8", size=13, expand=True)
+                        ft.Text(n.get("message", ""), color="white" if is_unread else COLOR_TEXT_MUTED, size=13, expand=True)
                     ], spacing=10),
-                    padding=10,
-                    bgcolor="#27314a" if is_unread else "#1e293b",
-                    border_radius=8, width=340
+                    padding=SPACE_LG,
+                    bgcolor=COLOR_UNREAD if is_unread else COLOR_CARD,
+                    border_radius=RADIUS_MD, width=340
                 )
             )
         page.update()
@@ -880,10 +918,10 @@ async def main(page: ft.Page):
             resp = supabase.rpc("get_unread_notification_count", {"p_user_id": user_id}).execute()
             count = resp.data or 0
             if count and count > 0:
-                nav_buttons["notifications"].icon = ft.Icons.NOTIFICATIONS_ACTIVE
-                nav_buttons["notifications"].icon_color = "#f43f5e"
+                nav_buttons["notifications"].icon = ft.Icons.NOTIFICATIONS_ACTIVE_ROUNDED
+                nav_buttons["notifications"].icon_color = COLOR_DANGER
             else:
-                nav_buttons["notifications"].icon = ft.Icons.NOTIFICATIONS_NONE
+                nav_buttons["notifications"].icon = ft.Icons.NOTIFICATIONS_NONE_ROUNDED
                 if active_nav_key["value"] != "notifications":
                     nav_buttons["notifications"].icon_color = NAV_INACTIVE
             page.update()
@@ -896,14 +934,14 @@ async def main(page: ft.Page):
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
     # --- CUSTOM NAVIGATION ACTIONS ---
-    NAV_ACTIVE = "#6366f1"
-    NAV_INACTIVE = "#94a3b8"
+    NAV_ACTIVE = COLOR_PRIMARY
+    NAV_INACTIVE = COLOR_TEXT_MUTED
     active_nav_key = {"value": "feed"}
 
     def highlight_nav(active_key):
         active_nav_key["value"] = active_key
         for key, btn in nav_buttons.items():
-            if key == "notifications" and btn.icon == ft.Icons.NOTIFICATIONS_ACTIVE:
+            if key == "notifications" and btn.icon == ft.Icons.NOTIFICATIONS_ACTIVE_ROUNDED:
                 continue  # keep the red "unread" color even if this tab isn't active
             btn.icon_color = NAV_ACTIVE if key == active_key else NAV_INACTIVE
         page.update()
@@ -943,7 +981,7 @@ async def main(page: ft.Page):
         set_panel_visibility(notifications=True)
         render_notifications_panel()
         highlight_nav("notifications")
-        nav_buttons["notifications"].icon = ft.Icons.NOTIFICATIONS_NONE
+        nav_buttons["notifications"].icon = ft.Icons.NOTIFICATIONS_NONE_ROUNDED
         nav_buttons["notifications"].icon_color = NAV_ACTIVE
         page.update()
         user_id = get_cached_user_id()
@@ -978,7 +1016,7 @@ async def main(page: ft.Page):
         if menu_dlg:
             close_menu_dialog(menu_dlg)
 
-        blocked_list_col = ft.Column(spacing=8, scroll=ft.ScrollMode.AUTO, height=280)
+        blocked_list_col = ft.Column(spacing=8, scroll=ft.ScrollMode.AUTO, height=280, width=DIALOG_WIDTH)
 
         def load_blocked_list():
             blocked_list_col.controls.clear()
@@ -986,7 +1024,7 @@ async def main(page: ft.Page):
             ids = list(get_blocked_ids(force_refresh=True))
             if not ids:
                 blocked_list_col.controls.append(
-                    ft.Text("You haven't blocked anyone.", color="#94a3b8", size=12)
+                    ft.Text("You haven't blocked anyone.", color=COLOR_TEXT_MUTED, size=12)
                 )
                 page.update()
                 return
@@ -1014,7 +1052,7 @@ async def main(page: ft.Page):
 
         dlg = ft.AlertDialog(
             title=ft.Text("Blocked Users", color="white", size=16),
-            bgcolor="#1e293b",
+            bgcolor=COLOR_CARD,
             content=blocked_list_col,
             actions=[ft.TextButton("Close", on_click=lambda ev: close_dlg(dlg))]
         )
@@ -1026,36 +1064,36 @@ async def main(page: ft.Page):
     def open_main_menu(e):
         dlg = ft.AlertDialog(
             title=ft.Text("Menu", color="white", size=16),
-            bgcolor="#1e293b",
+            bgcolor=COLOR_CARD,
             content=ft.Column([
                 ft.ListTile(
-                    leading=ft.Icon(ft.Icons.PERSON, color="#6366f1"),
+                    leading=ft.Icon(ft.Icons.PERSON_ROUNDED, color=COLOR_PRIMARY),
                     title=ft.Text("Profile", color="white"),
-                    subtitle=ft.Text("Edit your bio, avatar & school", color="#94a3b8", size=11),
+                    subtitle=ft.Text("Edit your bio, avatar & school", color=COLOR_TEXT_MUTED, size=11),
                     on_click=lambda ev: open_profile_from_menu(dlg)
                 ),
                 ft.ListTile(
-                    leading=ft.Icon(ft.Icons.SETTINGS, color="#6366f1"),
+                    leading=ft.Icon(ft.Icons.SETTINGS_ROUNDED, color=COLOR_PRIMARY),
                     title=ft.Text("Settings", color="white"),
-                    subtitle=ft.Text("Change password, email & more", color="#94a3b8", size=11),
+                    subtitle=ft.Text("Change password, email & more", color=COLOR_TEXT_MUTED, size=11),
                     on_click=lambda ev: open_settings_from_menu(dlg)
                 ),
                 ft.ListTile(
-                    leading=ft.Icon(ft.Icons.BLOCK, color="#f43f5e"),
+                    leading=ft.Icon(ft.Icons.BLOCK_ROUNDED, color=COLOR_DANGER),
                     title=ft.Text("Blocked Users", color="white"),
                     on_click=lambda ev: open_blocked_users_dialog(dlg)
                 ),
                 ft.ListTile(
-                    leading=ft.Icon(ft.Icons.DESCRIPTION_OUTLINED, color="#94a3b8"),
+                    leading=ft.Icon(ft.Icons.DESCRIPTION_ROUNDED, color=COLOR_TEXT_MUTED),
                     title=ft.Text("Terms & Privacy Policy", color="white"),
                     on_click=lambda ev: open_terms_dialog()
                 ),
                 ft.ListTile(
-                    leading=ft.Icon(ft.Icons.LOGOUT, color="#f43f5e"),
-                    title=ft.Text("Log Out", color="#f43f5e"),
+                    leading=ft.Icon(ft.Icons.LOGOUT_ROUNDED, color=COLOR_DANGER),
+                    title=ft.Text("Log Out", color=COLOR_DANGER),
                     on_click=lambda ev: handle_logout_from_menu(dlg)
                 ),
-            ], tight=True),
+            ], tight=True, width=DIALOG_WIDTH),
             actions=[ft.TextButton("Close", on_click=lambda ev: close_menu_dialog(dlg))]
         )
         page.overlay.append(dlg)
@@ -1079,12 +1117,12 @@ async def main(page: ft.Page):
     # --- NAVIGATION BAR (icon-based, Facebook-style) ---
     NAV_BTN_STYLE = ft.ButtonStyle(padding=6)
     nav_buttons = {
-        "feed":    ft.IconButton(icon=ft.Icons.HOME, icon_color=NAV_ACTIVE, tooltip="Feed", icon_size=20, style=NAV_BTN_STYLE),
-        "secrets": ft.IconButton(icon=ft.Icons.THEATER_COMEDY, icon_color=NAV_INACTIVE, tooltip="Secrets", icon_size=20, style=NAV_BTN_STYLE),
-        "people":  ft.IconButton(icon=ft.Icons.GROUPS, icon_color=NAV_INACTIVE, tooltip="Friends", icon_size=20, style=NAV_BTN_STYLE),
-        "chats":   ft.IconButton(icon=ft.Icons.CHAT_BUBBLE, icon_color=NAV_INACTIVE, tooltip="Chats", icon_size=20, style=NAV_BTN_STYLE),
-        "reels":   ft.IconButton(icon=ft.Icons.VIDEO_LIBRARY, icon_color=NAV_INACTIVE, tooltip="Reels", icon_size=20, style=NAV_BTN_STYLE),
-        "notifications": ft.IconButton(icon=ft.Icons.NOTIFICATIONS_NONE, icon_color=NAV_INACTIVE, tooltip="Notifications", icon_size=20, style=NAV_BTN_STYLE),
+        "feed":    ft.IconButton(icon=ft.Icons.HOME_ROUNDED, icon_color=NAV_ACTIVE, tooltip="Feed", icon_size=20, style=NAV_BTN_STYLE),
+        "secrets": ft.IconButton(icon=ft.Icons.THEATER_COMEDY_ROUNDED, icon_color=NAV_INACTIVE, tooltip="Secrets", icon_size=20, style=NAV_BTN_STYLE),
+        "people":  ft.IconButton(icon=ft.Icons.GROUPS_ROUNDED, icon_color=NAV_INACTIVE, tooltip="Friends", icon_size=20, style=NAV_BTN_STYLE),
+        "chats":   ft.IconButton(icon=ft.Icons.CHAT_BUBBLE_ROUNDED, icon_color=NAV_INACTIVE, tooltip="Chats", icon_size=20, style=NAV_BTN_STYLE),
+        "reels":   ft.IconButton(icon=ft.Icons.VIDEO_LIBRARY_ROUNDED, icon_color=NAV_INACTIVE, tooltip="Reels", icon_size=20, style=NAV_BTN_STYLE),
+        "notifications": ft.IconButton(icon=ft.Icons.NOTIFICATIONS_NONE_ROUNDED, icon_color=NAV_INACTIVE, tooltip="Notifications", icon_size=20, style=NAV_BTN_STYLE),
     }
     nav_buttons["feed"].on_click = nav_to_feed
     nav_buttons["secrets"].on_click = nav_to_secrets
@@ -1093,7 +1131,7 @@ async def main(page: ft.Page):
     nav_buttons["reels"].on_click = nav_to_reels
     nav_buttons["notifications"].on_click = nav_to_notifications
 
-    menu_button = ft.IconButton(icon=ft.Icons.MENU, icon_color=NAV_INACTIVE, tooltip="Menu",
+    menu_button = ft.IconButton(icon=ft.Icons.MENU_ROUNDED, icon_color=NAV_INACTIVE, tooltip="Menu",
                                 icon_size=20, style=NAV_BTN_STYLE, on_click=open_main_menu)
 
     # scroll=AUTO is a safety net — even on very narrow phones where icons
@@ -1106,7 +1144,7 @@ async def main(page: ft.Page):
             menu_button
         ], alignment=ft.MainAxisAlignment.START, spacing=2, scroll=ft.ScrollMode.AUTO),
         padding=ft.Padding.symmetric(vertical=6),
-        bgcolor="#1e293b"
+        bgcolor=COLOR_CARD
     )
 
     # --- TAB 1: FEED & SEARCH ---
@@ -1132,21 +1170,21 @@ async def main(page: ft.Page):
                 import base64
                 b64 = base64.b64encode(selected_media["bytes"]).decode("utf-8")
                 preview_content = ft.Image(src_base64=b64, width=160, height=160,
-                                           fit=ft.BoxFit.COVER, border_radius=10)
+                                           fit=ft.BoxFit.COVER, border_radius=RADIUS_MD)
             except Exception as ex:
                 print(f"Preview render failed: {ex}")
-                preview_content = ft.Icon(ft.Icons.IMAGE, size=60, color="#6366f1")
+                preview_content = ft.Icon(ft.Icons.IMAGE_ROUNDED, size=60, color=COLOR_PRIMARY)
         else:
             preview_content = ft.Column([
-                ft.Icon(ft.Icons.PLAY_CIRCLE_FILL, size=48, color="white"),
+                ft.Icon(ft.Icons.PLAY_CIRCLE_ROUNDED, size=48, color="white"),
                 ft.Text(selected_media["name"] or "video", color="white", size=11)
             ], alignment=ft.MainAxisAlignment.CENTER, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
         media_preview_container.content = ft.Stack([
             ft.Container(content=preview_content, width=160, height=160,
-                        bgcolor="#1e293b", border_radius=10, alignment=ft.Alignment.CENTER),
+                        bgcolor=COLOR_CARD, border_radius=RADIUS_MD, alignment=ft.Alignment.CENTER),
             ft.Container(
-                content=ft.IconButton(icon=ft.Icons.CANCEL, icon_color="#f43f5e",
+                content=ft.IconButton(icon=ft.Icons.CANCEL_ROUNDED, icon_color=COLOR_DANGER,
                                       icon_size=22, on_click=clear_media_preview),
                 alignment=ft.Alignment.TOP_RIGHT
             )
@@ -1176,13 +1214,13 @@ async def main(page: ft.Page):
             selected_media["type"] = "video"
         else:
             media_status_text.value = "Unsupported file type."
-            media_status_text.color = "red"
+            media_status_text.color = COLOR_DANGER
             page.update()
             return
 
         if not f.bytes:
             media_status_text.value = "Couldn't read that file — try again."
-            media_status_text.color = "red"
+            media_status_text.color = COLOR_DANGER
             page.update()
             return
 
@@ -1212,13 +1250,13 @@ async def main(page: ft.Page):
         text_content = (public_text_box.value or "").strip()
         if not text_content and not selected_media["bytes"]:
             media_status_text.value = "Write something or attach a photo/video first."
-            media_status_text.color = "red"
+            media_status_text.color = COLOR_DANGER
             page.update()
             return
 
         set_composer_busy(True)
         media_status_text.value = "Posting..."
-        media_status_text.color = "#94a3b8"
+        media_status_text.color = COLOR_TEXT_MUTED
         page.update()
 
         media_url = None
@@ -1258,11 +1296,11 @@ async def main(page: ft.Page):
         except Exception as ex:
             set_composer_busy(False)
             media_status_text.value = f"Post failed: {str(ex)}"
-            media_status_text.color = "red"
+            media_status_text.color = COLOR_DANGER
             page.update()
 
-    send_button = ft.IconButton(icon=ft.Icons.SEND, icon_color="#6366f1", on_click=handle_create_post)
-    photo_button = ft.IconButton(icon=ft.Icons.PHOTO_LIBRARY_OUTLINED, icon_color="#6366f1", tooltip="Add photo or video", on_click=open_media_picker)
+    send_button = ft.IconButton(icon=ft.Icons.SEND_ROUNDED, icon_color=COLOR_PRIMARY, on_click=handle_create_post)
+    photo_button = ft.IconButton(icon=ft.Icons.PHOTO_LIBRARY_ROUNDED, icon_color=COLOR_PRIMARY, tooltip="Add photo or video", on_click=open_media_picker)
 
     panel_home_feed = ft.Column([
         ft.Row([
@@ -1280,10 +1318,10 @@ async def main(page: ft.Page):
     pending_requests_layout = ft.Column(spacing=6)
     pending_requests_banner = ft.Container(
         content=ft.Column([
-            ft.Text("Connection Requests", size=13, weight=ft.FontWeight.BOLD, color="#eab308"),
+            ft.Text("Connection Requests", size=13, weight=ft.FontWeight.BOLD, color=COLOR_WARNING),
             pending_requests_layout
         ], spacing=6),
-        padding=10, bgcolor="#271c24", border_radius=8, width=340, visible=False
+        padding=SPACE_LG, bgcolor=COLOR_WHISPER, border_radius=RADIUS_MD, width=340, visible=False
     )
 
     def render_pending_requests_banner():
@@ -1317,7 +1355,7 @@ async def main(page: ft.Page):
     panel_people = ft.Column([
         ft.Text("Find Friends", size=18, weight=ft.FontWeight.BOLD, color="white"),
         pending_requests_banner,
-        ft.Row([search_input, ft.Icon(ft.Icons.SEARCH, color="#94a3b8")], alignment=ft.MainAxisAlignment.CENTER),
+        ft.Row([search_input, ft.Icon(ft.Icons.SEARCH_ROUNDED, color=COLOR_TEXT_MUTED)], alignment=ft.MainAxisAlignment.CENTER),
         friends_layout
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
@@ -1327,11 +1365,11 @@ async def main(page: ft.Page):
     creator_admin_switch = ft.Switch(value=False, on_change=lambda e: render_whisper_feed(reveal_names=creator_admin_switch.value))
 
     panel_whisper_wall = ft.Column([
-        ft.Text("The Whisper Wall \U0001F92B", size=18, weight=ft.FontWeight.BOLD, color="#f43f5e"),
+        ft.Text("The Whisper Wall \U0001F92B", size=18, weight=ft.FontWeight.BOLD, color=COLOR_DANGER),
         ft.Row([ft.Text("Creator Key (Reveal Identity)", color="white"), creator_admin_switch], alignment=ft.MainAxisAlignment.CENTER),
-        ft.Row([whisper_text_box, ft.IconButton(icon=ft.Icons.SEND, icon_color="#f43f5e", on_click=handle_post_whisper)], alignment=ft.MainAxisAlignment.CENTER),
+        ft.Row([whisper_text_box, ft.IconButton(icon=ft.Icons.SEND_ROUNDED, icon_color=COLOR_DANGER, on_click=handle_post_whisper)], alignment=ft.MainAxisAlignment.CENTER),
         whisper_status_text,
-        ft.Divider(height=10, color="#CBD3DD"),
+        ft.Divider(height=10, color=COLOR_BORDER),
         whisper_feed_layout
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
@@ -1561,11 +1599,11 @@ async def main(page: ft.Page):
 
         dlg = ft.AlertDialog(
             title=ft.Text(f"@{requester_username} wants to connect", color="white", size=15),
-            bgcolor="#1e293b",
-            content=ft.Text("Accept to chat freely, or decline the request.", color="#94a3b8", size=13),
+            bgcolor=COLOR_CARD,
+            content=ft.Text("Accept to chat freely, or decline the request.", color=COLOR_TEXT_MUTED, size=13),
             actions=[
                 ft.TextButton("Decline", on_click=do_respond(False)),
-                ft.ElevatedButton("Accept", bgcolor="#10b981", on_click=do_respond(True)),
+                ft.ElevatedButton("Accept", bgcolor=COLOR_SUCCESS, on_click=do_respond(True)),
                 ft.TextButton("Close", on_click=lambda ev: close_dlg(dlg))
             ]
         )
@@ -1723,7 +1761,7 @@ async def main(page: ft.Page):
 
         conversations_layout.controls.clear()
         if not convs:
-            conversations_layout.controls.append(ft.Text("No chats yet. Start one below!", color="#94a3b8", size=12))
+            conversations_layout.controls.append(ft.Text("No chats yet. Start one below!", color=COLOR_TEXT_MUTED, size=12))
         for c in convs:
             def open_this(e, cid=c["conversation_id"], uname=c["other_username"]):
                 open_thread(cid, uname)
@@ -1734,12 +1772,12 @@ async def main(page: ft.Page):
                 ft.Container(
                     content=ft.Row([
                         ft.Column([
-                            ft.Text(c["other_username"], weight=ft.FontWeight.BOLD, color="#10b981", size=14),
-                            ft.Text(c["last_message"], color="#e2e8f0", size=12, max_lines=1)
+                            ft.Text(c["other_username"], weight=ft.FontWeight.BOLD, color=COLOR_SUCCESS, size=14),
+                            ft.Text(c["last_message"], color=COLOR_TEXT_BODY, size=12, max_lines=1)
                         ], spacing=2, expand=True),
-                        ft.Text(time_label, color="#64748b", size=10)
+                        ft.Text(time_label, color=COLOR_TEXT_FAINT, size=10)
                     ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-                    padding=10, bgcolor="#1e293b", border_radius=8, width=320,
+                    padding=SPACE_LG, bgcolor=COLOR_CARD, border_radius=RADIUS_MD, width=320,
                     on_click=open_this
                 )
             )
@@ -1756,13 +1794,13 @@ async def main(page: ft.Page):
         target = (new_chat_input.value or "").strip()
         if not target:
             chat_inbox_status.value = "Enter a username first."
-            chat_inbox_status.color = "red"
+            chat_inbox_status.color = COLOR_DANGER
             page.update()
             return
         conv_id, error = get_or_create_conversation(target)
         if error:
             chat_inbox_status.value = error
-            chat_inbox_status.color = "red"
+            chat_inbox_status.color = COLOR_DANGER
             page.update()
             return
         new_chat_input.value = ""
@@ -1780,7 +1818,7 @@ async def main(page: ft.Page):
         my_id = get_cached_user_id()
         for m in messages:
             is_mine = m.get("sender_id") == my_id
-            bubble_color = "#6366f1" if is_mine else "#1e293b"
+            bubble_color = COLOR_PRIMARY if is_mine else COLOR_CARD
             align = ft.MainAxisAlignment.END if is_mine else ft.MainAxisAlignment.START
             time_label = format_relative_time(m.get("created_at"))
             thread_messages_layout.controls.append(
@@ -1788,9 +1826,9 @@ async def main(page: ft.Page):
                     ft.Column([
                         ft.Container(
                             content=ft.Text(m.get("content", ""), color="white", size=13),
-                            padding=10, bgcolor=bubble_color, border_radius=10, width=220
+                            padding=SPACE_MD, bgcolor=bubble_color, border_radius=RADIUS_LG, width=220
                         ),
-                        ft.Text(time_label, color="#64748b", size=9)
+                        ft.Text(time_label, color=COLOR_TEXT_FAINT, size=9)
                     ], spacing=2,
                        horizontal_alignment=ft.CrossAxisAlignment.END if is_mine else ft.CrossAxisAlignment.START)
                 ], alignment=align)
@@ -1840,14 +1878,14 @@ async def main(page: ft.Page):
             render_thread_messages()
         else:
             thread_status.value = send_err or "Message failed to send."
-            thread_status.color = "#eab308" if send_err else "red"
+            thread_status.color = COLOR_WARNING if send_err else COLOR_DANGER
             page.update()
 
     panel_chats_inbox = ft.Column([
-        ft.Text("Direct Messages \U0001F4AC", size=18, weight=ft.FontWeight.BOLD, color="#10b981"),
-        ft.Row([new_chat_input, ft.IconButton(icon=ft.Icons.SEND, icon_color="#10b981", on_click=handle_start_new_chat)], alignment=ft.MainAxisAlignment.CENTER),
+        ft.Text("Direct Messages \U0001F4AC", size=18, weight=ft.FontWeight.BOLD, color=COLOR_SUCCESS),
+        ft.Row([new_chat_input, ft.IconButton(icon=ft.Icons.SEND_ROUNDED, icon_color=COLOR_SUCCESS, on_click=handle_start_new_chat)], alignment=ft.MainAxisAlignment.CENTER),
         chat_inbox_status,
-        ft.Divider(height=10, color="#E6F0FF"),
+        ft.Divider(height=10, color=COLOR_BORDER),
         conversations_layout
     ], visible=True, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
@@ -1872,7 +1910,7 @@ async def main(page: ft.Page):
 
         grid = ft.GridView(
             expand=False, runs_count=8, max_extent=40,
-            spacing=4, run_spacing=4, height=220, width=320
+            spacing=4, run_spacing=4, height=220, width=DIALOG_WIDTH
         )
         for em in QUICK_EMOJIS:
             grid.controls.append(
@@ -1881,7 +1919,7 @@ async def main(page: ft.Page):
 
         dlg = ft.AlertDialog(
             title=ft.Text("Emoji", color="white", size=14),
-            bgcolor="#1e293b",
+            bgcolor=COLOR_CARD,
             content=grid,
             actions=[ft.TextButton("Close", on_click=lambda e: close_dlg(dlg))]
         )
@@ -1891,16 +1929,16 @@ async def main(page: ft.Page):
 
     panel_chats_thread = ft.Column([
         ft.Row([
-            ft.IconButton(icon=ft.Icons.ARROW_BACK, icon_color="#10b981", on_click=close_thread),
+            ft.IconButton(icon=ft.Icons.ARROW_BACK_ROUNDED, icon_color=COLOR_SUCCESS, on_click=close_thread),
             thread_header_text
         ], alignment=ft.MainAxisAlignment.START),
         thread_messages_layout,
         thread_status,
         ft.Row([
             thread_input_box,
-            ft.IconButton(icon=ft.Icons.EMOJI_EMOTIONS_OUTLINED, icon_color="#94a3b8",
+            ft.IconButton(icon=ft.Icons.EMOJI_EMOTIONS_ROUNDED, icon_color=COLOR_TEXT_MUTED,
                           tooltip="Emoji", on_click=lambda e: open_emoji_picker(thread_input_box)),
-            ft.IconButton(icon=ft.Icons.SEND, icon_color="#10b981", on_click=handle_send_thread_message)
+            ft.IconButton(icon=ft.Icons.SEND_ROUNDED, icon_color=COLOR_SUCCESS, on_click=handle_send_thread_message)
         ], alignment=ft.MainAxisAlignment.CENTER)
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
@@ -1936,13 +1974,13 @@ async def main(page: ft.Page):
         src="https://ui-avatars.com/api/?background=6366f1&color=fff&size=80&name=U",
         width=80, height=80, fit=ft.BoxFit.COVER, border_radius=40
     )
-    profile_username_label = ft.Text("", size=15, weight=ft.FontWeight.BOLD, color="#6366f1")
+    profile_username_label = ft.Text("", size=15, weight=ft.FontWeight.BOLD, color=COLOR_PRIMARY)
     profile_bio = ft.TextField(label="Bio (optional)", width=300, color="white",
-                               multiline=True, max_lines=3, border_color="#6366f1")
+                               multiline=True, max_lines=3, border_color=COLOR_PRIMARY)
     profile_school = ft.TextField(label="School / University", width=300,
-                                  color="white", border_color="#6366f1")
+                                  color="white", border_color=COLOR_PRIMARY)
     profile_password = ft.TextField(label="New Password (leave blank to keep)", password=True,
-                                    width=300, color="white", border_color="#6366f1")
+                                    width=300, color="white", border_color=COLOR_PRIMARY)
 
     dept_dd = make_editable_dd("Department", DEPARTMENTS)
     country_dd = make_editable_dd("Country", COUNTRIES)
@@ -1959,9 +1997,9 @@ async def main(page: ft.Page):
 
     # --- ACCOUNT SETTINGS (email/password) — separate from main profile ---
     profile_password = ft.TextField(label="Change Password", password=True,
-                                    width=280, color="white", border_color="#6366f1")
+                                    width=280, color="white", border_color=COLOR_PRIMARY)
     settings_email = ft.TextField(label="Change Email", width=280,
-                                  color="white", border_color="#6366f1")
+                                  color="white", border_color=COLOR_PRIMARY)
     settings_status = ft.Text("", size=12)
 
     def handle_save_account_settings(e):
@@ -1983,14 +2021,14 @@ async def main(page: ft.Page):
                     user_cache["email"] = new_email
                 profile_password.value = ""
                 settings_status.value = "Account updated! ✅"
-                settings_status.color = "#10b981"
+                settings_status.color = COLOR_SUCCESS
             else:
                 settings_status.value = "Nothing to update."
-                settings_status.color = "#94a3b8"
+                settings_status.color = COLOR_TEXT_MUTED
             page.update()
         except Exception as ex:
             settings_status.value = f"Update failed: {str(ex)}"
-            settings_status.color = "red"
+            settings_status.color = COLOR_DANGER
             page.update()
 
     def close_settings_dialog(d):
@@ -2002,12 +2040,12 @@ async def main(page: ft.Page):
         settings_status.value = ""
         dlg = ft.AlertDialog(
             title=ft.Text("Account Settings", color="white", size=16),
-            bgcolor="#1e293b",
+            bgcolor=COLOR_CARD,
             content=ft.Column([
                 settings_email,
                 profile_password,
                 settings_status
-            ], tight=True, spacing=12),
+            ], tight=True, spacing=12, width=DIALOG_WIDTH),
             actions=[
                 ft.TextButton("Save", on_click=handle_save_account_settings),
                 ft.TextButton("Close", on_click=lambda ev: close_settings_dialog(dlg))
@@ -2092,7 +2130,7 @@ async def main(page: ft.Page):
         f = files[0]
         if not f.bytes:
             profile_status_text.value = "Couldn't read that file — try again."
-            profile_status_text.color = "red"
+            profile_status_text.color = COLOR_DANGER
             page.update()
             return
         try:
@@ -2109,11 +2147,11 @@ async def main(page: ft.Page):
             supabase.table("profiles").update({"avatar_url": avatar_url}).eq("user_id", user_id).execute()
             profile_avatar_img.src = avatar_url
             profile_status_text.value = "Profile picture updated! ✅"
-            profile_status_text.color = "#10b981"
+            profile_status_text.color = COLOR_SUCCESS
             page.update()
         except Exception as ex:
             profile_status_text.value = f"Avatar upload failed: {str(ex)}"
-            profile_status_text.color = "red"
+            profile_status_text.color = COLOR_DANGER
             page.update()
 
     def handle_save_profile(e):
@@ -2131,11 +2169,11 @@ async def main(page: ft.Page):
         try:
             supabase.table("profiles").update(updates).eq("user_id", user_id).execute()
             profile_status_text.value = "Profile saved! ✅"
-            profile_status_text.color = "#10b981"
+            profile_status_text.color = COLOR_SUCCESS
             page.update()
         except Exception as ex:
             profile_status_text.value = f"Save failed: {str(ex)}"
-            profile_status_text.color = "red"
+            profile_status_text.color = COLOR_DANGER
             page.update()
 
     profile_edit_content = ft.Column([
@@ -2145,7 +2183,7 @@ async def main(page: ft.Page):
                 profile_username_label,
                 ft.ElevatedButton(
                     content=ft.Text("Change Photo", size=11, color="white"),
-                    bgcolor="#6366f1", on_click=handle_upload_avatar, height=32
+                    bgcolor=COLOR_PRIMARY, on_click=handle_upload_avatar, height=32
                 )
             ], spacing=6)
         ], alignment=ft.MainAxisAlignment.CENTER, spacing=16),
@@ -2157,7 +2195,7 @@ async def main(page: ft.Page):
         lga_dd,
         ft.ElevatedButton(
             content=ft.Text("Save Profile", color="white"),
-            bgcolor="#6366f1", width=300, on_click=handle_save_profile
+            bgcolor=COLOR_PRIMARY, width=300, on_click=handle_save_profile
         ),
         profile_status_text
     ], spacing=12, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
@@ -2167,13 +2205,13 @@ async def main(page: ft.Page):
         src="https://ui-avatars.com/api/?background=6366f1&color=fff&size=80&name=U",
         width=80, height=80, fit=ft.BoxFit.COVER, border_radius=40
     )
-    view_profile_username = ft.Text("", size=18, weight=ft.FontWeight.BOLD, color="#6366f1")
-    view_profile_bio      = ft.Text("", color="#e2e8f0", size=13, italic=True)
-    view_profile_school   = ft.Text("", color="#e2e8f0", size=13)
-    view_profile_dept     = ft.Text("", color="#e2e8f0", size=13)
-    view_profile_country  = ft.Text("", color="#e2e8f0", size=13)
-    view_profile_state    = ft.Text("", color="#e2e8f0", size=13)
-    view_profile_lga      = ft.Text("", color="#e2e8f0", size=13)
+    view_profile_username = ft.Text("", size=18, weight=ft.FontWeight.BOLD, color=COLOR_PRIMARY)
+    view_profile_bio      = ft.Text("", color=COLOR_TEXT_BODY, size=13, italic=True)
+    view_profile_school   = ft.Text("", color=COLOR_TEXT_BODY, size=13)
+    view_profile_dept     = ft.Text("", color=COLOR_TEXT_BODY, size=13)
+    view_profile_country  = ft.Text("", color=COLOR_TEXT_BODY, size=13)
+    view_profile_state    = ft.Text("", color=COLOR_TEXT_BODY, size=13)
+    view_profile_lga      = ft.Text("", color=COLOR_TEXT_BODY, size=13)
 
     viewed_profile_state = {"user_id": None, "username": None}
 
@@ -2216,7 +2254,7 @@ async def main(page: ft.Page):
 
     # --- ADD FRIEND / CONNECTION STATUS BUTTON ---
     friend_btn_text = ft.Text("Add Friend", color="white", size=13)
-    friend_btn_icon = ft.Icon(ft.Icons.PERSON_ADD_ALT_1, color="white", size=16)
+    friend_btn_icon = ft.Icon(ft.Icons.PERSON_ADD_ALT_1_ROUNDED, color="white", size=16)
     friend_action_state = {"status": None, "request_id": None, "is_requester": None}
 
     def refresh_friend_button():
@@ -2234,25 +2272,25 @@ async def main(page: ft.Page):
         friend_action_state["is_requester"] = is_requester
 
         if status == "accepted":
-            friend_btn_icon.name = ft.Icons.CHECK_CIRCLE
+            friend_btn_icon.name = ft.Icons.CHECK_CIRCLE_ROUNDED
             friend_btn_text.value = "Connected"
-            friend_button.bgcolor = "#334155"
+            friend_button.bgcolor = COLOR_BORDER
             friend_button.disabled = True
         elif status == "pending" and is_requester:
-            friend_btn_icon.name = ft.Icons.HOURGLASS_TOP
+            friend_btn_icon.name = ft.Icons.HOURGLASS_TOP_ROUNDED
             friend_btn_text.value = "Pending"
-            friend_button.bgcolor = "#334155"
+            friend_button.bgcolor = COLOR_BORDER
             friend_button.disabled = True
         elif status == "pending" and not is_requester:
-            friend_btn_icon.name = ft.Icons.PERSON_ADD_ALT_1
+            friend_btn_icon.name = ft.Icons.PERSON_ADD_ALT_1_ROUNDED
             friend_btn_text.value = "Respond to Request"
-            friend_button.bgcolor = "#eab308"
+            friend_button.bgcolor = COLOR_WARNING
             friend_button.disabled = False
         else:
             # None, or 'declined' (declined is treated as re-requestable)
-            friend_btn_icon.name = ft.Icons.PERSON_ADD_ALT_1
+            friend_btn_icon.name = ft.Icons.PERSON_ADD_ALT_1_ROUNDED
             friend_btn_text.value = "Add Friend"
-            friend_button.bgcolor = "#6366f1"
+            friend_button.bgcolor = COLOR_PRIMARY
             friend_button.disabled = False
         page.update()
 
@@ -2262,13 +2300,13 @@ async def main(page: ft.Page):
         def handle_result(accept, error):
             if error:
                 profile_view_status.value = error
-                profile_view_status.color = "red"
+                profile_view_status.color = COLOR_DANGER
             else:
                 profile_view_status.value = (
                     f"You're now connected with @{target_name}!" if accept
                     else f"Declined @{target_name}'s request."
                 )
-                profile_view_status.color = "#10b981" if accept else "#94a3b8"
+                profile_view_status.color = COLOR_SUCCESS if accept else COLOR_TEXT_MUTED
             refresh_friend_button()
             page.update()
 
@@ -2290,23 +2328,23 @@ async def main(page: ft.Page):
         result, error = send_connection_request(target_id)
         if error:
             profile_view_status.value = error
-            profile_view_status.color = "red"
+            profile_view_status.color = COLOR_DANGER
         elif result == "accepted":
             profile_view_status.value = f"You're now connected with @{target_name}!"
-            profile_view_status.color = "#10b981"
+            profile_view_status.color = COLOR_SUCCESS
         elif result == "already_connected":
             profile_view_status.value = f"You're already connected with @{target_name}."
-            profile_view_status.color = "#94a3b8"
+            profile_view_status.color = COLOR_TEXT_MUTED
         else:
             profile_view_status.value = f"Request sent to @{target_name}."
-            profile_view_status.color = "#10b981"
+            profile_view_status.color = COLOR_SUCCESS
         refresh_friend_button()
         page.update()
 
     friend_button = ft.ElevatedButton(
         content=ft.Row([friend_btn_icon, friend_btn_text], spacing=6,
                        alignment=ft.MainAxisAlignment.CENTER),
-        bgcolor="#6366f1", width=280, on_click=handle_friend_button_click, visible=False
+        bgcolor=COLOR_PRIMARY, width=280, on_click=handle_friend_button_click, visible=False
     )
 
     def handle_block_from_profile(e):
@@ -2316,15 +2354,15 @@ async def main(page: ft.Page):
             return
         if block_user_action(target_id):
             profile_view_status.value = f"@{target_name} has been blocked."
-            profile_view_status.color = "#10b981"
+            profile_view_status.color = COLOR_SUCCESS
         else:
             profile_view_status.value = "Couldn't block — try again."
-            profile_view_status.color = "red"
+            profile_view_status.color = COLOR_DANGER
         page.update()
 
     def open_report_user_dialog(e):
         reason_dd = ft.Dropdown(
-            label="Reason", width=260, color="white",
+            label="Reason", width=DIALOG_WIDTH, color="white",
             options=[ft.dropdown.Option(r) for r in REPORT_REASONS]
         )
         status = ft.Text("", size=11)
@@ -2336,21 +2374,21 @@ async def main(page: ft.Page):
         def submit_report(ev):
             if not reason_dd.value:
                 status.value = "Please choose a reason."
-                status.color = "red"
+                status.color = COLOR_DANGER
                 page.update()
                 return
             if report_user_action(viewed_profile_state["user_id"], reason_dd.value):
                 status.value = "Reported. Our team will review it."
-                status.color = "#10b981"
+                status.color = COLOR_SUCCESS
                 page.update()
             else:
                 status.value = "Couldn't submit report — try again."
-                status.color = "red"
+                status.color = COLOR_DANGER
                 page.update()
 
         dlg = ft.AlertDialog(
             title=ft.Text(f"Report @{viewed_profile_state['username']}", color="white", size=15),
-            bgcolor="#1e293b",
+            bgcolor=COLOR_CARD,
             content=ft.Column([reason_dd, status], tight=True, spacing=10),
             actions=[
                 ft.TextButton("Submit", on_click=submit_report),
@@ -2365,13 +2403,13 @@ async def main(page: ft.Page):
 
     panel_view_profile = ft.Column([
         ft.Row([
-            ft.IconButton(icon=ft.Icons.ARROW_BACK, icon_color="#6366f1", on_click=close_profile_view),
+            ft.IconButton(icon=ft.Icons.ARROW_BACK_ROUNDED, icon_color=COLOR_PRIMARY, on_click=close_profile_view),
             ft.Text("Profile", size=16, weight=ft.FontWeight.BOLD, color="white")
         ]),
         view_profile_avatar,
         view_profile_username,
         view_profile_bio,
-        ft.Divider(color="#334155"),
+        ft.Divider(color=COLOR_BORDER),
         view_profile_school,
         view_profile_dept,
         view_profile_country,
@@ -2380,18 +2418,18 @@ async def main(page: ft.Page):
         friend_button,
         ft.ElevatedButton(
             content=ft.Text("Send Message", color="white"),
-            bgcolor="#10b981", width=280,
+            bgcolor=COLOR_SUCCESS, width=280,
             on_click=lambda e: handle_start_chat_from_profile()
         ),
         ft.Row([
             ft.TextButton(
-                content=ft.Row([ft.Icon(ft.Icons.BLOCK, color="#f43f5e", size=16),
-                                ft.Text("Block", color="#f43f5e", size=12)], spacing=4),
+                content=ft.Row([ft.Icon(ft.Icons.BLOCK_ROUNDED, color=COLOR_DANGER, size=16),
+                                ft.Text("Block", color=COLOR_DANGER, size=12)], spacing=4),
                 on_click=handle_block_from_profile
             ),
             ft.TextButton(
-                content=ft.Row([ft.Icon(ft.Icons.FLAG_OUTLINED, color="#94a3b8", size=16),
-                                ft.Text("Report", color="#94a3b8", size=12)], spacing=4),
+                content=ft.Row([ft.Icon(ft.Icons.FLAG_ROUNDED, color=COLOR_TEXT_MUTED, size=16),
+                                ft.Text("Report", color=COLOR_TEXT_MUTED, size=12)], spacing=4),
                 on_click=open_report_user_dialog
             ),
         ], alignment=ft.MainAxisAlignment.CENTER),
@@ -2495,7 +2533,7 @@ async def main(page: ft.Page):
     async def handle_login(e):
         if not input_login_email.value or not input_login_password.value:
             ui_message.value = "Please enter your email/username and password."
-            ui_message.color = "red"
+            ui_message.color = COLOR_DANGER
             page.update()
             return
         try:
@@ -2507,7 +2545,7 @@ async def main(page: ft.Page):
                 lookup = supabase.table("profiles").select("email").eq("username", login_input).execute()
                 if not lookup.data or not lookup.data[0].get("email"):
                     ui_message.value = "No account found for that username."
-                    ui_message.color = "red"
+                    ui_message.color = COLOR_DANGER
                     page.update()
                     return
                 login_email = lookup.data[0]["email"]
@@ -2525,23 +2563,23 @@ async def main(page: ft.Page):
                 ui_message.value = "Please confirm your email first. Didn't get it? Tap Resend below."
             else:
                 ui_message.value = f"Login failed: {str(ex)}"
-            ui_message.color = "red"
+            ui_message.color = COLOR_DANGER
             page.update()
 
     def handle_resend_confirmation(e):
         if not input_login_email.value or "@" not in input_login_email.value:
             ui_message.value = "Enter your email address above first, then tap Resend."
-            ui_message.color = "red"
+            ui_message.color = COLOR_DANGER
             page.update()
             return
         try:
             supabase.auth.resend({"type": "signup", "email": input_login_email.value})
             ui_message.value = "Confirmation email resent — check your inbox."
-            ui_message.color = "green"
+            ui_message.color = COLOR_SUCCESS
             page.update()
         except Exception as ex:
             ui_message.value = f"Couldn't resend: {str(ex)}"
-            ui_message.color = "red"
+            ui_message.color = COLOR_DANGER
             page.update()
 
     # ============================================================
@@ -2602,10 +2640,10 @@ We may update these terms; continued use of the app means you accept the changes
 
         dlg = ft.AlertDialog(
             title=ft.Text("Terms of Service & Privacy Policy", color="white", size=15),
-            bgcolor="#1e293b",
+            bgcolor=COLOR_CARD,
             content=ft.Column(
-                [ft.Text(TERMS_TEXT, color="#e2e8f0", size=12)],
-                scroll=ft.ScrollMode.AUTO, height=400, width=320
+                [ft.Text(TERMS_TEXT, color=COLOR_TEXT_BODY, size=12)],
+                scroll=ft.ScrollMode.AUTO, height=400, width=DIALOG_WIDTH
             ),
             actions=[ft.TextButton("Close", on_click=lambda ev: close_dlg(dlg))]
         )
@@ -2620,12 +2658,12 @@ We may update these terms; continued use of the app means you accept the changes
         email = (input_reg_email.value or "").strip()
         if not username or not email:
             reg_step1_status.value = "Please fill in both fields."
-            reg_step1_status.color = "red"
+            reg_step1_status.color = COLOR_DANGER
             page.update()
             return
         if not agree_terms_checkbox.value:
             reg_step1_status.value = "You must agree to the Terms of Service & Privacy Policy to continue."
-            reg_step1_status.color = "red"
+            reg_step1_status.color = COLOR_DANGER
             page.update()
             return
         try:
@@ -2642,11 +2680,11 @@ We may update these terms; continued use of the app means you accept the changes
             reg_step1.visible = False
             reg_step2.visible = True
             reg_step2_status.value = f"Code sent to {email}. Check your inbox."
-            reg_step2_status.color = "#94a3b8"
+            reg_step2_status.color = COLOR_TEXT_MUTED
             page.update()
         except Exception as ex:
             reg_step1_status.value = f"Couldn't send code: {str(ex)}"
-            reg_step1_status.color = "red"
+            reg_step1_status.color = COLOR_DANGER
             page.update()
 
     def handle_resend_reg_otp(e):
@@ -2658,18 +2696,18 @@ We may update these terms; continued use of the app means you accept the changes
                 "options": {"should_create_user": True}
             })
             reg_step2_status.value = "Code resent — check your inbox."
-            reg_step2_status.color = "#10b981"
+            reg_step2_status.color = COLOR_SUCCESS
             page.update()
         except Exception as ex:
             reg_step2_status.value = f"Couldn't resend: {str(ex)}"
-            reg_step2_status.color = "red"
+            reg_step2_status.color = COLOR_DANGER
             page.update()
 
     def handle_verify_reg_otp(e):
         code = (input_reg_otp.value or "").strip()
         if not code:
             reg_step2_status.value = "Enter the 6-digit code."
-            reg_step2_status.color = "red"
+            reg_step2_status.color = COLOR_DANGER
             page.update()
             return
         try:
@@ -2680,7 +2718,7 @@ We may update these terms; continued use of the app means you accept the changes
             })
             if not result.session or not result.user:
                 reg_step2_status.value = "Verification failed — check the code and try again."
-                reg_step2_status.color = "red"
+                reg_step2_status.color = COLOR_DANGER
                 page.update()
                 return
 
@@ -2715,18 +2753,18 @@ We may update these terms; continued use of the app means you accept the changes
                 reg_step2_status.value = "That code is invalid or expired. Tap Resend for a new one."
             else:
                 reg_step2_status.value = f"Verification failed: {str(ex)}"
-            reg_step2_status.color = "red"
+            reg_step2_status.color = COLOR_DANGER
             page.update()
 
     async def handle_finalize_registration(e):
         if not input_reg_password.value or not input_reg_confirm.value:
             reg_step3_status.value = "Please fill in both password fields."
-            reg_step3_status.color = "red"
+            reg_step3_status.color = COLOR_DANGER
             page.update()
             return
         if input_reg_password.value != input_reg_confirm.value:
             reg_step3_status.value = "Passwords do not match."
-            reg_step3_status.color = "red"
+            reg_step3_status.color = COLOR_DANGER
             page.update()
             return
         try:
@@ -2754,7 +2792,7 @@ We may update these terms; continued use of the app means you accept the changes
             show_dashboard()
         except Exception as ex:
             reg_step3_status.value = f"Couldn't set password: {str(ex)}"
-            reg_step3_status.color = "red"
+            reg_step3_status.color = COLOR_DANGER
             page.update()
 
     reg_step1 = ft.Column([
@@ -2763,40 +2801,40 @@ We may update these terms; continued use of the app means you accept the changes
         input_reg_email,
         ft.Row([
             agree_terms_checkbox,
-            ft.Text("I agree to the", color="#94a3b8", size=12),
-            ft.TextButton(content=ft.Text("Terms & Privacy Policy", color="#6366f1", size=12), on_click=open_terms_dialog)
+            ft.Text("I agree to the", color=COLOR_TEXT_MUTED, size=12),
+            ft.TextButton(content=ft.Text("Terms & Privacy Policy", color=COLOR_PRIMARY, size=12), on_click=open_terms_dialog)
         ], spacing=0),
-        ft.ElevatedButton(content=ft.Text("Next", color="white"), on_click=handle_reg_step1_next, width=300, bgcolor="#10b981"),
+        ft.ElevatedButton(content=ft.Text("Next", color="white"), on_click=handle_reg_step1_next, width=300, bgcolor=COLOR_SUCCESS),
         reg_step1_status,
-        ft.TextButton(content=ft.Text("Already have an account? Log in", color="#94a3b8"), on_click=switch_to_login)
+        ft.TextButton(content=ft.Text("Already have an account? Log in", color=COLOR_TEXT_MUTED), on_click=switch_to_login)
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
     reg_step2 = ft.Column([
         ft.Text("Verify Your Email", size=18, weight=ft.FontWeight.BOLD, color="white"),
         input_reg_otp,
-        ft.ElevatedButton(content=ft.Text("Next", color="white"), on_click=handle_verify_reg_otp, width=300, bgcolor="#10b981"),
+        ft.ElevatedButton(content=ft.Text("Next", color="white"), on_click=handle_verify_reg_otp, width=300, bgcolor=COLOR_SUCCESS),
         reg_step2_status,
-        ft.TextButton(content=ft.Text("Resend code", color="#94a3b8", size=12), on_click=handle_resend_reg_otp)
+        ft.TextButton(content=ft.Text("Resend code", color=COLOR_TEXT_MUTED, size=12), on_click=handle_resend_reg_otp)
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
     reg_step3 = ft.Column([
         ft.Text("Set Your Password", size=18, weight=ft.FontWeight.BOLD, color="white"),
         input_reg_password,
         input_reg_confirm,
-        ft.ElevatedButton(content=ft.Text("Create Account", color="white"), on_click=handle_finalize_registration, width=300, bgcolor="#10b981"),
+        ft.ElevatedButton(content=ft.Text("Create Account", color="white"), on_click=handle_finalize_registration, width=300, bgcolor=COLOR_SUCCESS),
         reg_step3_status
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
     layout_login_form = ft.Column([
         input_login_email,
         input_login_password,
-        ft.ElevatedButton(content=ft.Text("Log In", color="white"), on_click=handle_login, width=300, bgcolor="#6366f1"),
-        ft.TextButton(content=ft.Text("New here? Create an account", color="#94a3b8"), on_click=switch_to_register),
-        ft.TextButton(content=ft.Text("Resend confirmation email", color="#94a3b8", size=12), on_click=handle_resend_confirmation)
+        ft.ElevatedButton(content=ft.Text("Log In", color="white"), on_click=handle_login, width=300, bgcolor=COLOR_PRIMARY),
+        ft.TextButton(content=ft.Text("New here? Create an account", color=COLOR_TEXT_MUTED), on_click=switch_to_register),
+        ft.TextButton(content=ft.Text("Resend confirmation email", color=COLOR_TEXT_MUTED, size=12), on_click=handle_resend_confirmation)
     ], horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
     layout_auth_master = ft.Column([
-        ft.Text("UniVibe", size=36, weight=ft.FontWeight.BOLD, color="#6366f1"),
+        ft.Text("UniVibe", size=36, weight=ft.FontWeight.BOLD, color=COLOR_PRIMARY),
         layout_login_form,
         reg_step1,
         reg_step2,
