@@ -2056,6 +2056,180 @@ async def main(page: ft.Page):
         page.update()
 
 
+    # --- PROFILE STATS ROW (Posts / Followers / Following / Total Likes) ---
+    def format_count(n):
+        try:
+            n = int(n)
+        except Exception:
+            return "0"
+        if n >= 1_000_000:
+            return f"{n / 1_000_000:.1f}".rstrip("0").rstrip(".") + "M"
+        if n >= 1_000:
+            return f"{n / 1_000:.1f}".rstrip("0").rstrip(".") + "K"
+        return str(n)
+
+    profile_stat_posts = ft.Text("0", size=20, weight=ft.FontWeight.BOLD, color="white")
+    profile_stat_followers = ft.Text("0", size=20, weight=ft.FontWeight.BOLD, color="white")
+    profile_stat_following = ft.Text("0", size=20, weight=ft.FontWeight.BOLD, color="white")
+    profile_stat_likes = ft.Text("0", size=20, weight=ft.FontWeight.BOLD, color="white")
+
+    def make_stat_column(value_text, label):
+        return ft.Column(
+            [value_text, ft.Text(label, color=COLOR_TEXT_MUTED, size=11)],
+            spacing=2, horizontal_alignment=ft.CrossAxisAlignment.CENTER
+        )
+
+    profile_stats_row = ft.Container(
+        content=ft.Row([
+            make_stat_column(profile_stat_posts, "Posts"),
+            make_stat_column(profile_stat_followers, "Followers"),
+            make_stat_column(profile_stat_following, "Following"),
+            make_stat_column(profile_stat_likes, "Total Likes"),
+        ], alignment=ft.MainAxisAlignment.SPACE_EVENLY),
+        padding=SPACE_LG, bgcolor=COLOR_CARD, border_radius=RADIUS_MD, width=340
+    )
+
+    def get_my_stats():
+        user_id = get_cached_user_id()
+        stats = {"posts": 0, "followers": 0, "following": 0, "likes": 0}
+        if not user_id:
+            return stats
+        try:
+            posts_resp = supabase.table("posts").select("id", count="exact").eq("user_id", user_id).execute()
+            stats["posts"] = posts_resp.count or 0
+        except Exception as ex:
+            print(f"stats posts error: {ex}")
+        try:
+            conns_resp = supabase.table("connections").select("id").eq("status", "accepted") \
+                .or_(f"requester_id.eq.{user_id},recipient_id.eq.{user_id}").execute()
+            conn_count = len(conns_resp.data or [])
+            stats["followers"] = conn_count
+            stats["following"] = conn_count
+        except Exception as ex:
+            print(f"stats connections error: {ex}")
+        try:
+            my_ids_resp = supabase.table("posts").select("id").eq("user_id", user_id).execute()
+            ids = [r["id"] for r in (my_ids_resp.data or [])]
+            likes_map = get_likes_map(ids)
+            stats["likes"] = sum(v.get("like_count", 0) for v in likes_map.values())
+        except Exception as ex:
+            print(f"stats likes error: {ex}")
+        return stats
+
+    # --- MY POSTS SECTION (tab nav + content grid) ---
+    CARD_ACCENT_COLORS = [COLOR_WARNING, COLOR_PRIMARY, COLOR_SUCCESS]
+
+    my_posts_grid = ft.GridView(expand=False, runs_count=3, max_extent=110,
+                                spacing=6, run_spacing=6, height=360)
+    my_posts_status = ft.Text("", color=COLOR_TEXT_MUTED, size=12)
+    my_posts_tab_state = {"active": "grid"}
+
+    def get_my_posts():
+        user_id = get_cached_user_id()
+        if not user_id:
+            return []
+        try:
+            resp = supabase.table("posts").select("*").eq("user_id", user_id).order("created_at", desc=True).limit(30).execute()
+            return resp.data or []
+        except Exception as ex:
+            print(f"get_my_posts error: {ex}")
+            return []
+
+    def render_my_posts_grid():
+        my_posts_grid.controls.clear()
+
+        if my_posts_tab_state["active"] == "saved":
+            my_posts_status.value = "Saved posts aren't available yet."
+            my_posts_status.color = COLOR_TEXT_MUTED
+            page.update()
+            return
+
+        posts = get_my_posts()
+        if my_posts_tab_state["active"] == "reels":
+            posts = [p for p in posts if p.get("media_type") == "video"]
+
+        my_posts_status.value = "" if posts else "No posts yet."
+        my_posts_status.color = COLOR_TEXT_MUTED
+
+        post_ids = [p["id"] for p in posts if p.get("id")]
+        likes_map = get_likes_map(post_ids)
+
+        for idx, p in enumerate(posts):
+            like_count = likes_map.get(p.get("id"), {}).get("like_count", 0)
+            media_url = p.get("media_url")
+            media_type = p.get("media_type")
+
+            if media_url and media_type == "image":
+                tile_content = ft.Image(src=media_url, fit=ft.BoxFit.COVER, width=110, height=110)
+                tile_bg = COLOR_CARD
+            elif media_url and media_type == "video":
+                tile_content = ft.Container(
+                    content=ft.Icon(ft.Icons.PLAY_CIRCLE_ROUNDED, color="white", size=32),
+                    alignment=ft.Alignment.CENTER
+                )
+                tile_bg = COLOR_CARD
+            else:
+                accent = CARD_ACCENT_COLORS[idx % len(CARD_ACCENT_COLORS)]
+                preview_text = (p.get("content") or "")[:60]
+                text_color = "#1e1b12" if accent == COLOR_WARNING else "white"
+                tile_content = ft.Container(
+                    content=ft.Text(preview_text, color=text_color, weight=ft.FontWeight.BOLD,
+                                    size=12, max_lines=3),
+                    padding=8, alignment=ft.Alignment.CENTER
+                )
+                tile_bg = accent
+
+            count_badge = ft.Row([
+                ft.Icon(ft.Icons.PLAY_ARROW_ROUNDED, color="white", size=12),
+                ft.Text(str(like_count), color="white", size=11)
+            ], spacing=2)
+
+            my_posts_grid.controls.append(
+                ft.Container(
+                    content=ft.Stack([
+                        ft.Container(content=tile_content, width=110, height=110, bgcolor=tile_bg,
+                                    border_radius=RADIUS_SM, alignment=ft.Alignment.CENTER),
+                        ft.Container(content=ft.Icon(ft.Icons.MORE_VERT_ROUNDED, color="white", size=14),
+                                    alignment=ft.Alignment.TOP_RIGHT, padding=4),
+                        ft.Container(content=count_badge, alignment=ft.Alignment.BOTTOM_LEFT, padding=6)
+                    ], width=110, height=110),
+                    width=110, height=110
+                )
+            )
+        page.update()
+
+    def switch_posts_tab(tab_key):
+        def handler(e):
+            my_posts_tab_state["active"] = tab_key
+            for key, btn in my_posts_tab_buttons.items():
+                btn.icon_color = COLOR_PRIMARY if key == tab_key else COLOR_TEXT_MUTED
+            render_my_posts_grid()
+            page.update()
+        return handler
+
+    my_posts_tab_buttons = {
+        "grid": ft.IconButton(icon=ft.Icons.GRID_VIEW_ROUNDED, icon_color=COLOR_PRIMARY, icon_size=20, tooltip="Posts"),
+        "reels": ft.IconButton(icon=ft.Icons.SMART_DISPLAY_OUTLINED, icon_color=COLOR_TEXT_MUTED, icon_size=20, tooltip="Videos"),
+        "saved": ft.IconButton(icon=ft.Icons.BOOKMARK_BORDER_ROUNDED, icon_color=COLOR_TEXT_MUTED, icon_size=20, tooltip="Saved"),
+    }
+    my_posts_tab_buttons["grid"].on_click = switch_posts_tab("grid")
+    my_posts_tab_buttons["reels"].on_click = switch_posts_tab("reels")
+    my_posts_tab_buttons["saved"].on_click = switch_posts_tab("saved")
+
+    my_posts_section = ft.Column([
+        ft.Row([
+            ft.Text("My Posts", size=16, weight=ft.FontWeight.BOLD, color="white"),
+            ft.TextButton(content=ft.Text("See All", color=COLOR_PRIMARY, size=12), on_click=nav_to_feed)
+        ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN, width=300),
+        ft.Row(
+            [my_posts_tab_buttons["grid"], my_posts_tab_buttons["reels"], my_posts_tab_buttons["saved"]],
+            alignment=ft.MainAxisAlignment.CENTER, spacing=30
+        ),
+        ft.Divider(height=1, color=COLOR_BORDER),
+        my_posts_status,
+        my_posts_grid
+    ], spacing=10, width=340, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+
     def load_own_profile():
         user_id = get_cached_user_id()
         if not user_id:
@@ -2081,6 +2255,20 @@ async def main(page: ft.Page):
             # Populate LGA options for the saved state, then set the saved LGA
             lga_dd.options = [ft.dropdown.Option(o) for o in NIGERIA_LGAS_BY_STATE.get(saved_state, [])]
             set_dd_value(lga_dd, p.get("local_government"))
+
+            # Stats row (Posts / Followers / Following / Total Likes)
+            stats = get_my_stats()
+            profile_stat_posts.value = format_count(stats["posts"])
+            profile_stat_followers.value = format_count(stats["followers"])
+            profile_stat_following.value = format_count(stats["following"])
+            profile_stat_likes.value = format_count(stats["likes"])
+
+            # My Posts grid (below the form fields)
+            my_posts_tab_state["active"] = "grid"
+            for key, btn in my_posts_tab_buttons.items():
+                btn.icon_color = COLOR_PRIMARY if key == "grid" else COLOR_TEXT_MUTED
+            render_my_posts_grid()
+
             page.update()
         except Exception as ex:
             print(f"Error loading profile: {ex}")
@@ -2177,6 +2365,7 @@ async def main(page: ft.Page):
             page.update()
 
     profile_edit_content = ft.Column([
+        # --- Header: avatar + username + change photo (unchanged position) ---
         ft.Row([
             profile_avatar_img,
             ft.Column([
@@ -2187,12 +2376,18 @@ async def main(page: ft.Page):
                 )
             ], spacing=6)
         ], alignment=ft.MainAxisAlignment.CENTER, spacing=16),
+        # --- Stats row: Posts / Followers / Following / Total Likes ---
+        profile_stats_row,
+        # --- Input / dropdown fields (unchanged order) ---
         profile_bio,
         profile_school,
         dept_dd,
         country_dd,
         state_dd,
         lga_dd,
+        # --- My Posts: tab nav + content grid, directly below the fields ---
+        my_posts_section,
+        # --- Save button, at the very bottom beneath the post grid ---
         ft.ElevatedButton(
             content=ft.Text("Save Profile", color="white"),
             bgcolor=COLOR_PRIMARY, width=300, on_click=handle_save_profile
