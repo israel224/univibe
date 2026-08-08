@@ -1400,6 +1400,14 @@ async def main(page: ft.Page):
             user_cache["username"] = None
             user_cache["access_token"] = None
 
+        # The active user just changed (logged in, logged out, or switched
+        # accounts on the same device/session) — any per-user cache must be
+        # thrown away here, or the next account can inherit stale data from
+        # whoever was logged in before (e.g. blocked-user list bleeding into
+        # a different account's Followers/Following view).
+        blocked_ids_cache["ids"] = set()
+        blocked_ids_cache["loaded"] = False
+
     def refresh_cached_username(user_id):
         try:
             resp = supabase.table("profiles").select("username").eq("user_id", user_id).execute()
@@ -2136,6 +2144,32 @@ async def main(page: ft.Page):
             d.open = False
             page.update()
 
+        def confirm_action(prompt, on_confirm):
+            """Small yes/no guard shown before any destructive action
+            (unfollow/block) actually runs — prevents a stray tap in the
+            list from silently removing a real connection."""
+            def do_confirm(ev):
+                confirm_dlg.open = False
+                page.update()
+                on_confirm()
+
+            def do_cancel(ev):
+                confirm_dlg.open = False
+                page.update()
+
+            confirm_dlg = ft.AlertDialog(
+                title=ft.Text("Are you sure?", color="white", size=15),
+                bgcolor=COLOR_CARD,
+                content=ft.Text(prompt, color=COLOR_TEXT_BODY, size=13),
+                actions=[
+                    ft.TextButton("Cancel", on_click=do_cancel),
+                    ft.TextButton("Confirm", on_click=do_confirm),
+                ]
+            )
+            page.overlay.append(confirm_dlg)
+            confirm_dlg.open = True
+            page.update()
+
         def load_list():
             list_col.controls.clear()
             users = get_my_connection_users()
@@ -2151,7 +2185,7 @@ async def main(page: ft.Page):
                     return handler
 
                 def make_unfollow(req_id=u["request_id"], uname=u["username"]):
-                    def handler(e):
+                    def do_remove():
                         if remove_connection_action(req_id):
                             status.value = f"Removed @{uname}."
                             status.color = COLOR_SUCCESS
@@ -2163,10 +2197,13 @@ async def main(page: ft.Page):
                             status.color = COLOR_DANGER
                         load_list()
                         page.update()
+
+                    def handler(e):
+                        confirm_action(f"Remove @{uname} from your connections?", do_remove)
                     return handler
 
                 def make_block(target_id=u["user_id"], uname=u["username"]):
-                    def handler(e):
+                    def do_block():
                         if block_user_action(target_id):
                             status.value = f"Blocked @{uname}."
                             status.color = COLOR_SUCCESS
@@ -2178,6 +2215,9 @@ async def main(page: ft.Page):
                             status.color = COLOR_DANGER
                         load_list()
                         page.update()
+
+                    def handler(e):
+                        confirm_action(f"Block @{uname}? They won't be able to see or message you.", do_block)
                     return handler
 
                 list_col.controls.append(
@@ -2203,6 +2243,7 @@ async def main(page: ft.Page):
         dlg.open = True
         load_list()
         page.update()
+
 
     profile_stats_row = ft.Container(
         content=ft.Row([
