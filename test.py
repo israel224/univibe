@@ -2073,17 +2073,144 @@ async def main(page: ft.Page):
     profile_stat_following = ft.Text("0", size=20, weight=ft.FontWeight.BOLD, color="white")
     profile_stat_likes = ft.Text("0", size=20, weight=ft.FontWeight.BOLD, color="white")
 
-    def make_stat_column(value_text, label):
-        return ft.Column(
+    def make_stat_column(value_text, label, on_click=None):
+        col = ft.Column(
             [value_text, ft.Text(label, color=COLOR_TEXT_MUTED, size=11)],
             spacing=2, horizontal_alignment=ft.CrossAxisAlignment.CENTER
         )
+        if on_click:
+            return ft.Container(content=col, on_click=on_click, ink=True,
+                               border_radius=RADIUS_SM, padding=4)
+        return col
+
+    # --- FOLLOWERS / FOLLOWING LIST (backed by accepted connections) ---
+    def get_my_connection_users():
+        """Returns [{user_id, username, avatar_url, request_id}, ...] for every
+        user the current user has an accepted connection with, minus anyone blocked."""
+        user_id = get_cached_user_id()
+        if not user_id:
+            return []
+        try:
+            resp = supabase.table("connections").select("id, requester_id, recipient_id, status") \
+                .eq("status", "accepted") \
+                .or_(f"requester_id.eq.{user_id},recipient_id.eq.{user_id}").execute()
+            rows = resp.data or []
+            blocked = get_blocked_ids()
+            id_to_request = {}
+            other_ids = []
+            for r in rows:
+                other = r["recipient_id"] if r["requester_id"] == user_id else r["requester_id"]
+                if other in blocked:
+                    continue
+                id_to_request[other] = r["id"]
+                other_ids.append(other)
+            if not other_ids:
+                return []
+            profiles_resp = supabase.table("profiles").select("user_id, username, avatar_url").in_("user_id", other_ids).execute()
+            results = []
+            for pr in (profiles_resp.data or []):
+                results.append({
+                    "user_id": pr["user_id"],
+                    "username": pr.get("username", "Unknown"),
+                    "avatar_url": pr.get("avatar_url"),
+                    "request_id": id_to_request.get(pr["user_id"])
+                })
+            return results
+        except Exception as ex:
+            print(f"get_my_connection_users error: {ex}")
+            return []
+
+    def remove_connection_action(request_id):
+        try:
+            supabase.table("connections").delete().eq("id", request_id).execute()
+            return True
+        except Exception as ex:
+            print(f"remove_connection_action error: {ex}")
+            return False
+
+    def open_connections_list_dialog(title="Connections"):
+        list_col = ft.Column(spacing=8, scroll=ft.ScrollMode.AUTO, height=320, width=DIALOG_WIDTH)
+        status = ft.Text("", size=11)
+
+        def close_dlg(d):
+            d.open = False
+            page.update()
+
+        def load_list():
+            list_col.controls.clear()
+            users = get_my_connection_users()
+            if not users:
+                list_col.controls.append(ft.Text("No connections yet.", color=COLOR_TEXT_MUTED, size=12))
+                page.update()
+                return
+            for u in users:
+                def make_view(name=u["username"]):
+                    def handler(e):
+                        close_dlg(dlg)
+                        load_other_profile(name)
+                    return handler
+
+                def make_unfollow(req_id=u["request_id"], uname=u["username"]):
+                    def handler(e):
+                        if remove_connection_action(req_id):
+                            status.value = f"Removed @{uname}."
+                            status.color = COLOR_SUCCESS
+                            stats = get_my_stats()
+                            profile_stat_followers.value = format_count(stats["followers"])
+                            profile_stat_following.value = format_count(stats["following"])
+                        else:
+                            status.value = "Couldn't remove — try again."
+                            status.color = COLOR_DANGER
+                        load_list()
+                        page.update()
+                    return handler
+
+                def make_block(target_id=u["user_id"], uname=u["username"]):
+                    def handler(e):
+                        if block_user_action(target_id):
+                            status.value = f"Blocked @{uname}."
+                            status.color = COLOR_SUCCESS
+                            stats = get_my_stats()
+                            profile_stat_followers.value = format_count(stats["followers"])
+                            profile_stat_following.value = format_count(stats["following"])
+                        else:
+                            status.value = "Couldn't block — try again."
+                            status.color = COLOR_DANGER
+                        load_list()
+                        page.update()
+                    return handler
+
+                list_col.controls.append(
+                    ft.Row([
+                        ft.Text(f"@{u['username']}", color="white", size=13, expand=True),
+                        ft.IconButton(icon=ft.Icons.PERSON_ROUNDED, icon_color=COLOR_PRIMARY,
+                                     tooltip="View profile", icon_size=18, on_click=make_view()),
+                        ft.IconButton(icon=ft.Icons.PERSON_REMOVE_ROUNDED, icon_color=COLOR_WARNING,
+                                     tooltip="Unfollow", icon_size=18, on_click=make_unfollow()),
+                        ft.IconButton(icon=ft.Icons.BLOCK_ROUNDED, icon_color=COLOR_DANGER,
+                                     tooltip="Block", icon_size=18, on_click=make_block()),
+                    ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
+                )
+            page.update()
+
+        dlg = ft.AlertDialog(
+            title=ft.Text(title, color="white", size=16),
+            bgcolor=COLOR_CARD,
+            content=ft.Column([list_col, status], tight=True, spacing=8),
+            actions=[ft.TextButton("Close", on_click=lambda ev: close_dlg(dlg))]
+        )
+        page.overlay.append(dlg)
+        dlg.open = True
+        load_list()
+        page.update()
 
     profile_stats_row = ft.Container(
         content=ft.Row([
             make_stat_column(profile_stat_posts, "Posts"),
-            make_stat_column(profile_stat_followers, "Followers"),
-            make_stat_column(profile_stat_following, "Following"),
+            make_stat_column(profile_stat_followers, "Followers",
+                            on_click=lambda e: open_connections_list_dialog("Followers")),
+            make_stat_column(profile_stat_following, "Following",
+                            on_click=lambda e: open_connections_list_dialog("Following")),
             make_stat_column(profile_stat_likes, "Total Likes"),
         ], alignment=ft.MainAxisAlignment.SPACE_EVENLY),
         padding=SPACE_LG, bgcolor=COLOR_CARD, border_radius=RADIUS_MD, width=340
@@ -2135,6 +2262,225 @@ async def main(page: ft.Page):
             print(f"get_my_posts error: {ex}")
             return []
 
+    # --- EDIT POST DIALOG (from the 3-dot menu on a post tile) ---
+    def open_edit_post_dialog(post):
+        edit_field = ft.TextField(
+            value=post.get("content") or "", label="Post text", multiline=True, max_lines=5,
+            width=DIALOG_WIDTH, color="white", border_color=COLOR_PRIMARY
+        )
+        status = ft.Text("", size=11)
+
+        def close_dlg(d):
+            d.open = False
+            page.update()
+
+        def save_edit(e):
+            new_text = (edit_field.value or "").strip()
+            try:
+                supabase.table("posts").update({"content": new_text}).eq("id", post["id"]).execute()
+                post["content"] = new_text
+                status.value = "Post updated! ✅"
+                status.color = COLOR_SUCCESS
+                page.update()
+                render_my_posts_grid()
+                render_public_feed()
+            except Exception as ex:
+                status.value = f"Couldn't update: {str(ex)}"
+                status.color = COLOR_DANGER
+                page.update()
+
+        dlg = ft.AlertDialog(
+            title=ft.Text("Edit Post", color="white", size=16),
+            bgcolor=COLOR_CARD,
+            content=ft.Column([edit_field, status], tight=True, spacing=10, width=DIALOG_WIDTH),
+            actions=[
+                ft.TextButton("Save", on_click=save_edit),
+                ft.TextButton("Close", on_click=lambda ev: close_dlg(dlg))
+            ]
+        )
+        page.overlay.append(dlg)
+        dlg.open = True
+        page.update()
+
+    def handle_delete_from_grid(post):
+        handle_delete_post(post)  # cleans up media + deletes row + refreshes public feed
+        render_my_posts_grid()
+        stats = get_my_stats()
+        profile_stat_posts.value = format_count(stats["posts"])
+        profile_stat_likes.value = format_count(stats["likes"])
+        page.update()
+
+    def get_share_count(post):
+        """Best-effort share count. UniVibe doesn't have a dedicated shares
+        table — reposts (see handle_repost) reuse the original media_url,
+        so counting other posts pointing at the same media file is the
+        closest real signal we have. Text-only posts fall back to matching
+        on a slice of the original content."""
+        try:
+            post_id = post.get("id")
+            media_url = post.get("media_url")
+            if media_url:
+                resp = supabase.table("posts").select("id", count="exact") \
+                    .eq("media_url", media_url).neq("id", post_id).execute()
+                return resp.count or 0
+            content_snip = (post.get("content") or "")[:40].strip()
+            if not content_snip:
+                return 0
+            resp = supabase.table("posts").select("id", count="exact") \
+                .ilike("content", f"%{content_snip}%").neq("id", post_id).execute()
+            return resp.count or 0
+        except Exception as ex:
+            print(f"get_share_count error: {ex}")
+            return 0
+
+    # --- IMMERSIVE FULL-SCREEN POST VIEWER (TikTok-style) ---
+    post_viewer_state = {"post": None}
+    post_viewer_username = ft.Text("", weight=ft.FontWeight.BOLD, color=COLOR_PRIMARY, size=15)
+    post_viewer_media_area = ft.Container(alignment=ft.Alignment.CENTER)
+    post_viewer_content_text = ft.Text("", color=COLOR_TEXT_BODY, size=14)
+    post_viewer_like_btn = ft.IconButton(icon=ft.Icons.FAVORITE_ROUNDED, icon_color=COLOR_TEXT_FAINT, icon_size=26)
+    post_viewer_like_count = ft.Text("0", color="white", size=13)
+    post_viewer_comment_count = ft.Text("0 comments", color=COLOR_TEXT_MUTED, size=12)
+    post_viewer_share_count = ft.Text("0 shares", color=COLOR_TEXT_MUTED, size=12)
+    post_viewer_comments_col = ft.Column(spacing=6, scroll=ft.ScrollMode.AUTO, height=160)
+    post_viewer_comment_input = ft.TextField(hint_text="Add a comment...", expand=True, dense=True,
+                                             color="white", border_color=COLOR_BORDER, content_padding=10)
+
+    def close_post_viewer(e=None):
+        post_viewer_overlay.visible = False
+        page.update()
+
+    def load_post_viewer_comments(post_id):
+        post_viewer_comments_col.controls.clear()
+        try:
+            resp = supabase.rpc("get_post_comments", {"p_post_id": post_id}).execute()
+            comments = resp.data or []
+            post_viewer_comment_count.value = f"{len(comments)} comment{'s' if len(comments) != 1 else ''}"
+            for c in comments:
+                post_viewer_comments_col.controls.append(
+                    ft.Container(
+                        content=ft.Column([
+                            ft.Text(c["username"], weight=ft.FontWeight.BOLD, color=COLOR_PRIMARY, size=12),
+                            ft.Text(c["content"], color=COLOR_TEXT_BODY, size=13)
+                        ], spacing=2),
+                        padding=SPACE_MD, bgcolor=COLOR_CARD, border_radius=RADIUS_SM
+                    )
+                )
+            if not comments:
+                post_viewer_comments_col.controls.append(
+                    ft.Text("No comments yet. Be first!", color=COLOR_TEXT_MUTED, size=12)
+                )
+        except Exception as ex:
+            print(f"post viewer comments error: {ex}")
+        page.update()
+
+    def submit_post_viewer_comment(e):
+        post = post_viewer_state["post"]
+        if not post:
+            return
+        content = (post_viewer_comment_input.value or "").strip()
+        if not content:
+            return
+        try:
+            supabase.rpc("add_post_comment", {
+                "p_post_id": post["id"],
+                "p_user_id": get_cached_user_id(),
+                "p_username": user_cache.get("username", "Unknown"),
+                "p_content": content
+            }).execute()
+            post_viewer_comment_input.value = ""
+            load_post_viewer_comments(post["id"])
+            create_notification(post.get("user_id"), "comment",
+                                f"{user_cache.get('username','Someone')} commented on your post", post["id"])
+        except Exception as ex:
+            print(f"post viewer submit comment error: {ex}")
+
+    def toggle_post_viewer_like(e):
+        post = post_viewer_state["post"]
+        if not post:
+            return
+        handle_toggle_like(post["id"], post_viewer_like_btn, post_viewer_like_count, post.get("user_id"))
+
+    post_viewer_like_btn.on_click = toggle_post_viewer_like
+
+    def open_post_viewer(post):
+        post_viewer_state["post"] = post
+        is_anon = post.get("is_anonymous", False)
+        post_viewer_username.value = "Anonymous Ghost \U0001F47B" if is_anon else f"@{post.get('username','Unknown')}"
+        post_viewer_content_text.value = post.get("content") or ""
+
+        media_url = post.get("media_url")
+        media_type = post.get("media_type")
+        if media_url and media_type == "image":
+            post_viewer_media_area.content = ft.Image(
+                src=media_url, width=340, height=380, fit=ft.BoxFit.CONTAIN, border_radius=RADIUS_MD
+            )
+        elif media_url and media_type == "video":
+            post_viewer_media_area.content = ft.Container(
+                content=ft.Column([
+                    ft.Icon(ft.Icons.PLAY_CIRCLE_ROUNDED, color="white", size=64),
+                    ft.Text("Tap to play video", color="white", size=12)
+                ], alignment=ft.MainAxisAlignment.CENTER, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                width=340, height=380, bgcolor=COLOR_CARD, border_radius=RADIUS_MD,
+                alignment=ft.Alignment.CENTER,
+                on_click=lambda e: page.launch_url(media_url)
+            )
+        else:
+            post_viewer_media_area.content = ft.Container(
+                content=ft.Text(post.get("content") or "", color="white", size=18,
+                                weight=ft.FontWeight.BOLD, text_align=ft.TextAlign.CENTER),
+                width=340, height=380, bgcolor=COLOR_PRIMARY, border_radius=RADIUS_MD,
+                alignment=ft.Alignment.CENTER, padding=20
+            )
+
+        post_id = post.get("id")
+        likes_map = get_likes_map([post_id] if post_id else [])
+        like_info = likes_map.get(post_id, {})
+        post_viewer_like_btn.icon_color = COLOR_DANGER if like_info.get("user_liked") else COLOR_TEXT_FAINT
+        post_viewer_like_count.value = str(like_info.get("like_count", 0))
+
+        load_post_viewer_comments(post_id)
+
+        share_count = get_share_count(post)
+        post_viewer_share_count.value = f"{share_count} share{'s' if share_count != 1 else ''}"
+
+        post_viewer_overlay.visible = True
+        page.update()
+
+    post_viewer_overlay = ft.Container(
+        visible=False,
+        bgcolor=COLOR_BG,
+        padding=SPACE_LG,
+        width=400,
+        height=780,
+        content=ft.Column([
+            ft.Row([
+                ft.IconButton(icon=ft.Icons.CLOSE_ROUNDED, icon_color="white", on_click=close_post_viewer),
+                post_viewer_username,
+            ], alignment=ft.MainAxisAlignment.START),
+            post_viewer_media_area,
+            post_viewer_content_text,
+            ft.Row([
+                post_viewer_like_btn, post_viewer_like_count,
+                ft.Icon(ft.Icons.CHAT_BUBBLE_OUTLINE_ROUNDED, color=COLOR_TEXT_FAINT, size=20),
+                post_viewer_comment_count,
+                ft.IconButton(
+                    icon=ft.Icons.SHARE_ROUNDED, icon_color=COLOR_TEXT_FAINT, icon_size=22, tooltip="Share",
+                    on_click=lambda e: open_share_dialog(post_viewer_state["post"]) if post_viewer_state["post"] else None
+                ),
+                post_viewer_share_count
+            ], spacing=6),
+            ft.Divider(color=COLOR_BORDER),
+            ft.Text("Comments", color="white", weight=ft.FontWeight.BOLD, size=13),
+            post_viewer_comments_col,
+            ft.Row([
+                post_viewer_comment_input,
+                ft.IconButton(icon=ft.Icons.SEND_ROUNDED, icon_color=COLOR_PRIMARY, on_click=submit_post_viewer_comment)
+            ])
+        ], spacing=10, scroll=ft.ScrollMode.AUTO),
+    )
+    page.overlay.append(post_viewer_overlay)
+
     def render_my_posts_grid():
         my_posts_grid.controls.clear()
 
@@ -2184,16 +2530,54 @@ async def main(page: ft.Page):
                 ft.Text(str(like_count), color="white", size=11)
             ], spacing=2)
 
+            def make_edit_handler(post=p):
+                def handler(e):
+                    open_edit_post_dialog(post)
+                return handler
+
+            def make_delete_handler(post=p):
+                def handler(e):
+                    handle_delete_from_grid(post)
+                return handler
+
+            def make_view_handler(post=p):
+                def handler(e):
+                    open_post_viewer(post)
+                return handler
+
+            post_menu_btn = ft.PopupMenuButton(
+                icon=ft.Icons.MORE_VERT_ROUNDED,
+                icon_color="white",
+                icon_size=16,
+                tooltip="Post options",
+                items=[
+                    ft.PopupMenuItem(
+                        content=ft.Row([
+                            ft.Icon(ft.Icons.EDIT_ROUNDED, size=16, color=COLOR_PRIMARY),
+                            ft.Text("Edit", color="white", size=13)
+                        ], spacing=8),
+                        on_click=make_edit_handler()
+                    ),
+                    ft.PopupMenuItem(
+                        content=ft.Row([
+                            ft.Icon(ft.Icons.DELETE_OUTLINE_ROUNDED, size=16, color=COLOR_DANGER),
+                            ft.Text("Delete", color="white", size=13)
+                        ], spacing=8),
+                        on_click=make_delete_handler()
+                    ),
+                ]
+            )
+
             my_posts_grid.controls.append(
                 ft.Container(
                     content=ft.Stack([
                         ft.Container(content=tile_content, width=110, height=110, bgcolor=tile_bg,
                                     border_radius=RADIUS_SM, alignment=ft.Alignment.CENTER),
-                        ft.Container(content=ft.Icon(ft.Icons.MORE_VERT_ROUNDED, color="white", size=14),
-                                    alignment=ft.Alignment.TOP_RIGHT, padding=4),
+                        ft.Container(content=post_menu_btn, alignment=ft.Alignment.TOP_RIGHT),
                         ft.Container(content=count_badge, alignment=ft.Alignment.BOTTOM_LEFT, padding=6)
                     ], width=110, height=110),
-                    width=110, height=110
+                    width=110, height=110,
+                    on_click=make_view_handler()
                 )
             )
         page.update()
@@ -2262,12 +2646,18 @@ async def main(page: ft.Page):
             profile_stat_followers.value = format_count(stats["followers"])
             profile_stat_following.value = format_count(stats["following"])
             profile_stat_likes.value = format_count(stats["likes"])
+            page.update()  # push fields + stats now, independent of the grid below
 
             # My Posts grid (below the form fields)
             my_posts_tab_state["active"] = "grid"
             for key, btn in my_posts_tab_buttons.items():
                 btn.icon_color = COLOR_PRIMARY if key == "grid" else COLOR_TEXT_MUTED
-            render_my_posts_grid()
+            try:
+                render_my_posts_grid()
+            except Exception as grid_ex:
+                print(f"Error rendering My Posts grid: {grid_ex}")
+                my_posts_status.value = "Couldn't load your posts — try again."
+                my_posts_status.color = COLOR_DANGER
 
             page.update()
         except Exception as ex:
