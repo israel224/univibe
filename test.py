@@ -1565,29 +1565,117 @@ async def main(page: ft.Page):
             print(f"get_pending_connection_requests error: {ex}")
             return []
 
-    def get_my_connections_map():
-        """One query for every connection row involving the current user,
-        keyed by the OTHER person's id. Used to label the + button on every
-        row in Find Friends in a single round trip instead of one RPC call
-        per user (RLS already lets us read our own rows directly)."""
+    # ============================================================
+    # --- CONNECTIONS DATA LAYER --------------------------------
+    # Single source of truth for reading the `connections` table. Every
+    # feature that needs connection rows (Find Friends badges, Followers/
+    # Following counts, the Followers/Following list) goes through
+    # fetch_my_connection_rows() below instead of writing its own query.
+    # That gives us one place to get the direction-handling and
+    # deduplication right, instead of N slightly-different queries that
+    # can silently drift out of sync with each other.
+    # ============================================================
+    def fetch_my_connection_rows(user_id, status=None):
+        """Returns every connection row involving user_id, as a list of
+        {id, requester_id, recipient_id, status} dicts — or None if the
+        fetch itself failed (as opposed to succeeding with zero rows).
+        That distinction matters: a caller must never treat a network/DB
+        error as "this user has no connections".
+
+        Symmetric by construction: a `connections` row can have the user
+        on EITHER side (requester_id or recipient_id), so this issues two
+        explicit, independently-filtered queries — one per side — rather
+        than a single combined OR filter, then merges the results. This
+        makes each half of the relationship individually verifiable and
+        keeps the status filter (when given) applied identically on both
+        sides, instead of leaning on `.or_()` string-filter composition.
+
+        Deduplicates by row id, so a row can never be counted twice even
+        if both queries somehow returned it (e.g. malformed data where
+        requester_id == recipient_id).
+        """
+        if not user_id:
+            return []
+        try:
+            requester_query = supabase.table("connections") \
+                .select("id, requester_id, recipient_id, status") \
+                .eq("requester_id", user_id)
+            recipient_query = supabase.table("connections") \
+                .select("id, requester_id, recipient_id, status") \
+                .eq("recipient_id", user_id)
+            if status:
+                requester_query = requester_query.eq("status", status)
+                recipient_query = recipient_query.eq("status", status)
+
+            as_requester = requester_query.execute()
+            as_recipient = recipient_query.execute()
+            rows = (as_requester.data or []) + (as_recipient.data or [])
+
+            deduped_by_row_id = {}
+            for r in rows:
+                rid = r.get("id")
+                if rid is None:
+                    continue  # malformed row — skip rather than crash
+                deduped_by_row_id[rid] = r
+            return list(deduped_by_row_id.values())
+        except Exception as ex:
+            print(f"fetch_my_connection_rows error: {ex}")
+            return None  # distinct from [] — signals "couldn't determine", not "zero"
+
+    def get_my_accepted_connections():
+        """Returns {other_user_id: connection_row_id} for every ACCEPTED
+        connection involving the current user, or None if the underlying
+        fetch failed. Deduplicates by the OTHER participant's id (not just
+        row id) so the count always matches the number of distinct people
+        the user is actually connected to, even in the unlikely event of
+        a duplicate row for the same pair."""
         user_id = get_cached_user_id()
         if not user_id:
             return {}
-        try:
-            resp = supabase.table("connections").select("id, requester_id, recipient_id, status") \
-                .or_(f"requester_id.eq.{user_id},recipient_id.eq.{user_id}").execute()
-            result = {}
-            for row in (resp.data or []):
-                other = row["recipient_id"] if row["requester_id"] == user_id else row["requester_id"]
-                result[other] = {
-                    "status": row["status"],
-                    "request_id": row["id"],
-                    "is_requester": row["requester_id"] == user_id
-                }
-            return result
-        except Exception as ex:
-            print(f"get_my_connections_map error: {ex}")
+        rows = fetch_my_connection_rows(user_id, status="accepted")
+        if rows is None:
+            return None  # propagate "fetch failed" — do not fabricate an empty result
+        result = {}
+        for row in rows:
+            requester = row.get("requester_id")
+            recipient = row.get("recipient_id")
+            if not requester or not recipient:
+                continue  # malformed row — skip rather than crash
+            if requester == recipient:
+                continue  # defensive: a connection can't be with yourself
+            other = recipient if requester == user_id else requester
+            if not other or other == user_id:
+                continue
+            result[other] = row.get("id")
+        return result
+
+    def get_my_connections_map():
+        """One entry per connection the current user has (any status),
+        keyed by the OTHER person's id. Used to label the + button on
+        every row in Find Friends in a single round trip. Returns {} both
+        when there are genuinely no connections AND when the fetch failed
+        — this map only ever adds a badge, so failing open (no badge) is
+        the safe default; the stats row and Followers/Following list are
+        what carry the stronger "don't show a false 0" guarantee."""
+        user_id = get_cached_user_id()
+        if not user_id:
             return {}
+        rows = fetch_my_connection_rows(user_id)
+        if rows is None:
+            return {}
+        result = {}
+        for row in rows:
+            requester = row.get("requester_id")
+            recipient = row.get("recipient_id")
+            if not requester or not recipient or requester == recipient:
+                continue
+            other = recipient if requester == user_id else requester
+            result[other] = {
+                "status": row.get("status"),
+                "request_id": row.get("id"),
+                "is_requester": requester == user_id
+            }
+        return result
 
     def open_respond_dialog(request_id, requester_username, on_responded=None):
         """Shared Accept/Decline dialog — used from the profile page, the
@@ -2066,10 +2154,16 @@ async def main(page: ft.Page):
 
     # --- PROFILE STATS ROW (Posts / Followers / Following / Total Likes) ---
     def format_count(n):
+        """Renders a stat count. None means 'we don't actually know this
+        value' (a failed fetch) and must never be silently shown as 0 —
+        that's the exact bug that made real friends look like they'd
+        vanished. None renders as an em dash instead."""
+        if n is None:
+            return "—"
         try:
             n = int(n)
         except Exception:
-            return "0"
+            return "—"
         if n >= 1_000_000:
             return f"{n / 1_000_000:.1f}".rstrip("0").rstrip(".") + "M"
         if n >= 1_000:
@@ -2094,42 +2188,37 @@ async def main(page: ft.Page):
     # --- FOLLOWERS / FOLLOWING LIST (backed by accepted connections) ---
     def get_my_connection_users():
         """Returns [{user_id, username, avatar_url, request_id}, ...] for every
-        user the current user has an accepted connection with, minus anyone blocked."""
+        user the current user has an accepted connection with, minus anyone
+        blocked. Returns None (not []) if the fetch itself failed, so callers
+        can show "couldn't load" instead of a misleading "no connections"."""
         user_id = get_cached_user_id()
         if not user_id:
             return []
         try:
-            # Fetch ALL of this user's connection rows first (same query shape
-            # as get_my_connections_map, which the Friends tab already relies
-            # on successfully), then filter for "accepted" in Python — rather
-            # than filtering status inside the query itself.
-            resp = supabase.table("connections").select("id, requester_id, recipient_id, status") \
-                .or_(f"requester_id.eq.{user_id},recipient_id.eq.{user_id}").execute()
-            rows = [r for r in (resp.data or []) if r.get("status") == "accepted"]
+            # Single source of truth: the same accepted-connections lookup
+            # used by the stats counters, so the list and the numbers can
+            # never drift apart from each other.
+            accepted = get_my_accepted_connections()  # {other_user_id: request_id}, or None on failure
+            if accepted is None:
+                return None
             blocked = get_blocked_ids()
-            id_to_request = {}
-            other_ids = []
-            for r in rows:
-                other = r["recipient_id"] if r["requester_id"] == user_id else r["requester_id"]
-                if other in blocked:
-                    continue
-                id_to_request[other] = r["id"]
-                other_ids.append(other)
+            other_ids = [uid for uid in accepted.keys() if uid not in blocked]
             if not other_ids:
                 return []
-            profiles_resp = supabase.table("profiles").select("user_id, username, avatar_url").in_("user_id", other_ids).execute()
+            profiles_resp = supabase.table("profiles") \
+                .select("user_id, username, avatar_url").in_("user_id", other_ids).execute()
             results = []
             for pr in (profiles_resp.data or []):
                 results.append({
                     "user_id": pr["user_id"],
-                    "username": pr.get("username", "Unknown"),
+                    "username": pr.get("username") or "Unknown",
                     "avatar_url": pr.get("avatar_url"),
-                    "request_id": id_to_request.get(pr["user_id"])
+                    "request_id": accepted.get(pr["user_id"])
                 })
             return results
         except Exception as ex:
             print(f"get_my_connection_users error: {ex}")
-            return []
+            return None
 
     def remove_connection_action(request_id):
         try:
@@ -2176,6 +2265,13 @@ async def main(page: ft.Page):
         def load_list():
             list_col.controls.clear()
             users = get_my_connection_users()
+            if users is None:
+                list_col.controls.append(
+                    ft.Text("Couldn't load your connections — check your connection and try again.",
+                           color=COLOR_DANGER, size=12)
+                )
+                page.update()
+                return
             if not users:
                 list_col.controls.append(ft.Text("No connections yet.", color=COLOR_TEXT_MUTED, size=12))
                 page.update()
@@ -2261,21 +2357,32 @@ async def main(page: ft.Page):
     )
 
     def get_my_stats():
+        """Returns {posts, followers, following, likes}. Any value this
+        function couldn't actually determine is None, never a fabricated
+        0 — callers (via format_count) render that as '—' so a network
+        hiccup can never masquerade as 'you have 0 friends'."""
         user_id = get_cached_user_id()
-        stats = {"posts": 0, "followers": 0, "following": 0, "likes": 0}
+        stats = {"posts": None, "followers": None, "following": None, "likes": None}
         if not user_id:
             return stats
         try:
             posts_resp = supabase.table("posts").select("id", count="exact").eq("user_id", user_id).execute()
-            stats["posts"] = posts_resp.count or 0
+            stats["posts"] = posts_resp.count if posts_resp.count is not None else len(posts_resp.data or [])
         except Exception as ex:
             print(f"stats posts error: {ex}")
         try:
-            conns_resp = supabase.table("connections").select("id, status") \
-                .or_(f"requester_id.eq.{user_id},recipient_id.eq.{user_id}").execute()
-            conn_count = len([r for r in (conns_resp.data or []) if r.get("status") == "accepted"])
-            stats["followers"] = conn_count
-            stats["following"] = conn_count
+            # Same data layer as the Followers/Following list dialog and the
+            # Find Friends badges — one accepted-connections source of truth,
+            # so the number on the stats row can never drift from the list
+            # you see when you tap it.
+            accepted = get_my_accepted_connections()
+            if accepted is None:
+                stats["followers"] = None
+                stats["following"] = None
+            else:
+                conn_count = len(accepted)
+                stats["followers"] = conn_count
+                stats["following"] = conn_count
         except Exception as ex:
             print(f"stats connections error: {ex}")
         try:
@@ -2658,12 +2765,27 @@ async def main(page: ft.Page):
         my_posts_grid
     ], spacing=10, width=340, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
+    # Guards load_own_profile() against overlapping calls: if the user taps
+    # into Profile again before a slow fetch finishes, the older call's
+    # results must never land on screen after the newer call's results —
+    # each call checks this token before writing to any shared control.
+    profile_load_state = {"token": 0}
+
     def load_own_profile():
         user_id = get_cached_user_id()
         if not user_id:
             return
+
+        profile_load_state["token"] += 1
+        my_token = profile_load_state["token"]
+
+        def superseded():
+            return profile_load_state["token"] != my_token
+
         try:
             resp = supabase.table("profiles").select("*").eq("user_id", user_id).execute()
+            if superseded():
+                return  # a newer load_own_profile() call has already started
             if not resp.data:
                 return
             p = resp.data[0]
@@ -2684,8 +2806,13 @@ async def main(page: ft.Page):
             lga_dd.options = [ft.dropdown.Option(o) for o in NIGERIA_LGAS_BY_STATE.get(saved_state, [])]
             set_dd_value(lga_dd, p.get("local_government"))
 
-            # Stats row (Posts / Followers / Following / Total Likes)
+            # Stats row (Posts / Followers / Following / Total Likes).
+            # format_count() renders None as "—", never as a false "0", so
+            # a failed fetch here is visibly "unknown" rather than looking
+            # like you actually have zero friends.
             stats = get_my_stats()
+            if superseded():
+                return
             profile_stat_posts.value = format_count(stats["posts"])
             profile_stat_followers.value = format_count(stats["followers"])
             profile_stat_following.value = format_count(stats["following"])
@@ -2697,13 +2824,15 @@ async def main(page: ft.Page):
             for key, btn in my_posts_tab_buttons.items():
                 btn.icon_color = COLOR_PRIMARY if key == "grid" else COLOR_TEXT_MUTED
             try:
-                render_my_posts_grid()
+                if not superseded():
+                    render_my_posts_grid()
             except Exception as grid_ex:
                 print(f"Error rendering My Posts grid: {grid_ex}")
                 my_posts_status.value = "Couldn't load your posts — try again."
                 my_posts_status.color = COLOR_DANGER
 
-            page.update()
+            if not superseded():
+                page.update()
         except Exception as ex:
             print(f"Error loading profile: {ex}")
 
