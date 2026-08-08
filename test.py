@@ -2099,10 +2099,13 @@ async def main(page: ft.Page):
         if not user_id:
             return []
         try:
+            # Fetch ALL of this user's connection rows first (same query shape
+            # as get_my_connections_map, which the Friends tab already relies
+            # on successfully), then filter for "accepted" in Python — rather
+            # than filtering status inside the query itself.
             resp = supabase.table("connections").select("id, requester_id, recipient_id, status") \
-                .eq("status", "accepted") \
                 .or_(f"requester_id.eq.{user_id},recipient_id.eq.{user_id}").execute()
-            rows = resp.data or []
+            rows = [r for r in (resp.data or []) if r.get("status") == "accepted"]
             blocked = get_blocked_ids()
             id_to_request = {}
             other_ids = []
@@ -2268,9 +2271,9 @@ async def main(page: ft.Page):
         except Exception as ex:
             print(f"stats posts error: {ex}")
         try:
-            conns_resp = supabase.table("connections").select("id").eq("status", "accepted") \
+            conns_resp = supabase.table("connections").select("id, status") \
                 .or_(f"requester_id.eq.{user_id},recipient_id.eq.{user_id}").execute()
-            conn_count = len(conns_resp.data or [])
+            conn_count = len([r for r in (conns_resp.data or []) if r.get("status") == "accepted"])
             stats["followers"] = conn_count
             stats["following"] = conn_count
         except Exception as ex:
