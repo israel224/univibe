@@ -26,7 +26,15 @@ except ImportError:
 # --- LIVE DATABASE CONNECTION ---
 SUPABASE_URL = "https://vjvynztrznvlhxqatcsi.supabase.co"
 SUPABASE_KEY = "sb_publishable_CGotNkzRyXY-P7klDoCysw_hFoo-8rq"
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# NOTE: the actual `supabase` client is created per-session, inside main()
+# below — not here. A client created here would be a single object shared
+# by every browser tab/user connected to the running server process, and
+# supabase.postgrest.auth(token) (called on login) mutates that shared
+# object's auth header. With one client for everyone, whoever logs in most
+# recently silently overwrites which user every other open session's next
+# request runs as — the exact cause of connections/likes/stats randomly
+# showing another account's data or 0. Each session must get its own
+# private client so logins can never bleed into each other.
 
 MEDIA_BUCKET = "post-media"
 AVATARS_BUCKET = "avatars"
@@ -209,6 +217,14 @@ NIGERIA_LGAS_BY_STATE = {
 NIGERIAN_STATES = list(NIGERIA_LGAS_BY_STATE.keys())
 
 async def main(page: ft.Page):
+    # One private Supabase client per session (per browser tab / user).
+    # Created here, inside main(), instead of at module scope, so this
+    # session's login token can never overwrite — or be overwritten by —
+    # any other concurrently connected user's token. See the note above
+    # SUPABASE_URL/SUPABASE_KEY for why a shared client caused random
+    # connections/likes/stats data to leak between accounts.
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
     page.title = "UniVibe - Master Console"
     page.window_width = 400
     page.window_height = 780
