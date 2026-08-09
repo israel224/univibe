@@ -8,6 +8,21 @@ import asyncio
 import urllib.parse
 from datetime import datetime, timezone
 
+# --- VIDEO PLAYBACK ---
+# In Flet 0.70+ the Video control was split out of core `flet` into the
+# separate `flet-video` package (same pattern as flet-audio, flet-webview,
+# etc.) — it's no longer available as ft.Video. Import it here, once, and
+# fail over to None (not a crash) if the package isn't installed yet, so
+# build_inline_video_player() below can degrade gracefully instead of the
+# whole app breaking on startup.
+#
+#     pip install flet-video
+#
+try:
+    import flet_video as ftv
+except ImportError:
+    ftv = None
+
 # --- LIVE DATABASE CONNECTION ---
 SUPABASE_URL = "https://vjvynztrznvlhxqatcsi.supabase.co"
 SUPABASE_KEY = "sb_publishable_CGotNkzRyXY-P7klDoCysw_hFoo-8rq"
@@ -590,25 +605,28 @@ async def main(page: ft.Page):
     # starts.
     # ============================================================
     def build_inline_video_player(url, width, height, autoplay=True):
-        """Returns a control that plays `url` in place. Uses Flet's native
-        Video control when the running Flet build supports it; if it
-        doesn't (older Flet build without video support), fails over to a
-        clearly-labeled control that opens the stream externally instead
+        """Returns a control that plays `url` in place. Uses the flet_video
+        package's Video control (imported as `ftv` at the top of the file)
+        when it's installed; if it isn't, fails over to a clearly-labeled,
+        actually-tappable control that opens the stream externally instead
         of leaving a silently broken placeholder on screen."""
-        video_cls = getattr(ft, "Video", None)
-        media_cls = getattr(ft, "VideoMedia", None)
-        if not url or video_cls is None or media_cls is None:
+        if not url or ftv is None:
             return ft.Container(
                 content=ft.Column([
                     ft.Icon(ft.Icons.OPEN_IN_NEW_ROUNDED, color="white", size=32),
-                    ft.Text("Opening video…", color="white", size=12)
-                ], alignment=ft.MainAxisAlignment.CENTER, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                    ft.Text(
+                        "Video player not installed.\nTap to open in browser instead."
+                        if ftv is None else "No video to play.",
+                        color="white", size=12, text_align=ft.TextAlign.CENTER
+                    )
+                ], alignment=ft.MainAxisAlignment.CENTER, horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                   spacing=6),
                 width=width, height=height, bgcolor=COLOR_CARD, border_radius=RADIUS_MD,
                 alignment=ft.Alignment.CENTER,
                 on_click=(lambda e: page.launch_url(url)) if url else None
             )
-        return video_cls(
-            playlist=[media_cls(resource=url)],
+        return ftv.Video(
+            playlist=[ftv.VideoMedia(resource=url)],
             width=width,
             height=height,
             autoplay=autoplay,
