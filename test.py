@@ -580,6 +580,56 @@ async def main(page: ft.Page):
     friends_layout = ft.Column(spacing=8, scroll=ft.ScrollMode.ALWAYS, height=400)
     whisper_feed_layout = ft.Column(spacing=10)
 
+    # ============================================================
+    # --- INLINE VIDEO PLAYBACK ----------------------------------
+    # One shared player-builder used by every tap-to-play surface (Feed
+    # cards, Reels, the immersive post viewer) so a tap always swaps the
+    # placeholder for a real, controllable video instance streaming the
+    # Supabase public URL directly — never a redirect out to the system
+    # browser, and never a dead tap target left behind after playback
+    # starts.
+    # ============================================================
+    def build_inline_video_player(url, width, height, autoplay=True):
+        """Returns a control that plays `url` in place. Uses Flet's native
+        Video control when the running Flet build supports it; if it
+        doesn't (older Flet build without video support), fails over to a
+        clearly-labeled control that opens the stream externally instead
+        of leaving a silently broken placeholder on screen."""
+        video_cls = getattr(ft, "Video", None)
+        media_cls = getattr(ft, "VideoMedia", None)
+        if not url or video_cls is None or media_cls is None:
+            return ft.Container(
+                content=ft.Column([
+                    ft.Icon(ft.Icons.OPEN_IN_NEW_ROUNDED, color="white", size=32),
+                    ft.Text("Opening video…", color="white", size=12)
+                ], alignment=ft.MainAxisAlignment.CENTER, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                width=width, height=height, bgcolor=COLOR_CARD, border_radius=RADIUS_MD,
+                alignment=ft.Alignment.CENTER,
+                on_click=(lambda e: page.launch_url(url)) if url else None
+            )
+        return video_cls(
+            playlist=[media_cls(resource=url)],
+            width=width,
+            height=height,
+            autoplay=autoplay,
+            show_controls=True,
+        )
+
+    def make_play_video_handler(container, url, width, height):
+        """Swaps a placeholder Container's content for a live player on
+        tap, then disables the placeholder's own on_click (the player
+        supplies its own controls from here on) — a clean one-way state
+        transition from 'preview' to 'playing', no leftover dead tap
+        target underneath the player."""
+        def handler(e):
+            if not url:
+                return
+            container.content = build_inline_video_player(url, width, height)
+            container.padding = 0
+            container.on_click = None
+            page.update()
+        return handler
+
     # --- RENDERING FUNCS ---
     def render_public_feed():
         public_feed_layout.controls.clear()
@@ -621,14 +671,15 @@ async def main(page: ft.Page):
                     ft.Image(src=media_url, width=300, height=180, fit=ft.BoxFit.COVER, border_radius=RADIUS_MD)
                 )
             elif media_url and p.get("media_type") == "video":
-                post_body.append(
-                    ft.Container(
-                        content=ft.Row([ft.Icon(ft.Icons.PLAY_CIRCLE_ROUNDED, color="white"),
-                                        ft.Text("Video attached — tap to view", color="white", size=12)]),
-                        padding=SPACE_MD, bgcolor=COLOR_BORDER, border_radius=RADIUS_SM,
-                        on_click=lambda e, url=media_url: page.launch_url(url)
-                    )
+                feed_video_container = ft.Container(
+                    content=ft.Row([ft.Icon(ft.Icons.PLAY_CIRCLE_ROUNDED, color="white"),
+                                    ft.Text("Video attached — tap to play", color="white", size=12)]),
+                    padding=SPACE_MD, bgcolor=COLOR_BORDER, border_radius=RADIUS_SM,
                 )
+                feed_video_container.on_click = make_play_video_handler(
+                    feed_video_container, media_url, 300, 180
+                )
+                post_body.append(feed_video_container)
 
             # Like / Comment action bar
             post_id = p.get("id")
@@ -836,19 +887,24 @@ async def main(page: ft.Page):
         for p in video_posts:
             is_anon = p.get("is_anonymous", False)
             display_name = "Anonymous Ghost \U0001F47B" if is_anon else p.get("username", "Unknown")
+
+            reel_video_container = ft.Container(
+                content=ft.Column([
+                    ft.Icon(ft.Icons.PLAY_CIRCLE_ROUNDED, color="white", size=48),
+                    ft.Text("Tap to play", color="white", size=12)
+                ], alignment=ft.MainAxisAlignment.CENTER,
+                   horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                width=340, height=420, bgcolor=COLOR_CARD, border_radius=RADIUS_MD,
+                alignment=ft.Alignment.CENTER,
+            )
+            reel_video_container.on_click = make_play_video_handler(
+                reel_video_container, p["media_url"], 340, 420
+            )
+
             reels_layout.controls.append(
                 ft.Container(
                     content=ft.Column([
-                        ft.Container(
-                            content=ft.Column([
-                                ft.Icon(ft.Icons.PLAY_CIRCLE_ROUNDED, color="white", size=48),
-                                ft.Text("Tap to play", color="white", size=12)
-                            ], alignment=ft.MainAxisAlignment.CENTER,
-                               horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-                            width=340, height=420, bgcolor=COLOR_CARD, border_radius=RADIUS_MD,
-                            alignment=ft.Alignment.CENTER,
-                            on_click=lambda e, url=p["media_url"]: page.launch_url(url)
-                        ),
+                        reel_video_container,
                         ft.Row([
                             ft.Icon(ft.Icons.SECURITY_ROUNDED if is_anon else ft.Icons.ACCOUNT_CIRCLE_ROUNDED,
                                     color=COLOR_DANGER if is_anon else COLOR_PRIMARY, size=16),
@@ -2567,15 +2623,18 @@ async def main(page: ft.Page):
                 src=media_url, width=340, height=380, fit=ft.BoxFit.CONTAIN, border_radius=RADIUS_MD
             )
         elif media_url and media_type == "video":
-            post_viewer_media_area.content = ft.Container(
+            viewer_video_container = ft.Container(
                 content=ft.Column([
                     ft.Icon(ft.Icons.PLAY_CIRCLE_ROUNDED, color="white", size=64),
                     ft.Text("Tap to play video", color="white", size=12)
                 ], alignment=ft.MainAxisAlignment.CENTER, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
                 width=340, height=380, bgcolor=COLOR_CARD, border_radius=RADIUS_MD,
                 alignment=ft.Alignment.CENTER,
-                on_click=lambda e: page.launch_url(media_url)
             )
+            viewer_video_container.on_click = make_play_video_handler(
+                viewer_video_container, media_url, 340, 380
+            )
+            post_viewer_media_area.content = viewer_video_container
         else:
             post_viewer_media_area.content = ft.Container(
                 content=ft.Text(post.get("content") or "", color="white", size=18,
