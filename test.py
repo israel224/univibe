@@ -269,13 +269,82 @@ async def main(page: ft.Page):
     RADIUS_LG = 16   # chat bubbles and other rounder, "pill-like" surfaces
     DIALOG_WIDTH = 300  # every AlertDialog content column standardizes on this
 
+    # ============================================================
+    # --- SESSION-SAFE SUPABASE WRAPPER ---------------------------
+    # Every supabase.table()/.rpc() call in this file should go through
+    # safe_supabase_call() instead of calling .execute() directly. It
+    # detects an expired/invalid JWT (PGRST303 and friends), refreshes
+    # the session once, retries the same call, and — only if the refresh
+    # itself fails — forces a clean logout instead of leaving the UI
+    # showing a stale "0" or crashing on a raw error dict. This is the
+    # single choke point for the "profile shows 0 followers after token
+    # expiry" class of bug: no caller needs its own expiry handling.
+    # ============================================================
+    def is_session_expired_error(ex) -> bool:
+        """Matches every shape Supabase/PostgREST uses for 'this token is
+        dead': PGRST303 (JWT expired), a plain expired/invalid JWT message,
+        or the auth client reporting it has no usable session/refresh token."""
+        msg = str(ex).lower()
+        markers = (
+            "pgrst303", "jwt expired", "jwt is expired", "invalid jwt",
+            "invalid_grant", "session missing", "session_not_found",
+            "refresh_token_not_found", "auth session missing",
+        )
+        return any(m in msg for m in markers)
 
+    def force_reauth(message="Your session expired — please log in again."):
+        """Single choke point for an unrecoverable session: clears
+        everything client-side and drops to a clean login screen instead
+        of leaving the UI showing stale/failed data or a raw error dict."""
+        cache_user(None)
+        page.run_task(clear_session)
+        ui_message.value = message
+        ui_message.color = COLOR_DANGER
+        show_auth()
+
+    def safe_supabase_call(fn, *args, **kwargs):
+        """Runs fn(*args, **kwargs) — pass a lambda wrapping a .execute()
+        chain or an .rpc() call. On a session-expired error, refreshes the
+        token via the cached refresh_token, re-arms postgrest with the new
+        token, and retries ONCE. If the refresh itself fails (refresh token
+        is also dead), forces a clean re-login instead of retrying forever
+        or crashing the caller.
+
+        Returns the underlying result on success, or None if unrecoverable
+        — callers must treat None the same as "couldn't fetch" (never as a
+        fabricated zero — see format_count()), and any other exception is
+        re-raised so the caller's own except block still handles it.
+        """
+        try:
+            return fn(*args, **kwargs)
+        except Exception as ex:
+            if not is_session_expired_error(ex):
+                raise  # not a session issue — let the caller's own except handle it
+
+            print(f"Session expired mid-request, attempting refresh: {ex}")
+            try:
+                refreshed = supabase.auth.refresh_session()
+                if not refreshed or not refreshed.session:
+                    raise RuntimeError("refresh_session() returned no session")
+
+                new_token = refreshed.session.access_token
+                supabase.postgrest.auth(new_token)
+                user_cache["access_token"] = new_token
+                page.run_task(save_session, refreshed.session, refreshed.user)
+
+                return fn(*args, **kwargs)  # retry once, now with a live token
+            except Exception as refresh_ex:
+                print(f"Session refresh failed — forcing re-login: {refresh_ex}")
+                force_reauth()
+                return None
 
     # --- DATABASE FETCHING FUNCTION ---
     def get_posts():
         try:
-            response = supabase.table("posts").select("*").order("created_at", desc=True).limit(50).execute()
-            return response.data
+            resp = safe_supabase_call(
+                lambda: supabase.table("posts").select("*").order("created_at", desc=True).limit(50).execute()
+            )
+            return resp.data if resp else []
         except Exception as e:
             print(f"Error fetching posts: {e}")
             return []
@@ -285,21 +354,27 @@ async def main(page: ft.Page):
         if not post_ids:
             return {}
         try:
-            resp = supabase.rpc("get_post_likes", {
-                "p_post_ids": post_ids,
-                "p_user_id": get_cached_user_id() or "00000000-0000-0000-0000-000000000000"
-            }).execute()
-            return {r["post_id"]: r for r in (resp.data or [])}
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("get_post_likes", {
+                    "p_post_ids": post_ids,
+                    "p_user_id": get_cached_user_id() or "00000000-0000-0000-0000-000000000000"
+                }).execute()
+            )
+            return {r["post_id"]: r for r in (resp.data or [])} if resp else {}
         except Exception as e:
             print(f"Likes fetch error: {e}")
             return {}
 
     def handle_toggle_like(post_id, like_btn, like_count_text, post_owner_id):
         try:
-            resp = supabase.rpc("toggle_post_like", {
-                "p_post_id": post_id,
-                "p_user_id": get_cached_user_id()
-            }).execute()
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("toggle_post_like", {
+                    "p_post_id": post_id,
+                    "p_user_id": get_cached_user_id()
+                }).execute()
+            )
+            if resp is None:
+                return  # session died and force_reauth() already fired
             new_count = resp.data or 0
             like_count_text.value = str(new_count)
             # Toggle heart colour
@@ -325,8 +400,10 @@ async def main(page: ft.Page):
         def load_comments():
             comments_col.controls.clear()
             try:
-                resp = supabase.rpc("get_post_comments", {"p_post_id": post_id}).execute()
-                for c in (resp.data or []):
+                resp = safe_supabase_call(
+                    lambda: supabase.rpc("get_post_comments", {"p_post_id": post_id}).execute()
+                )
+                for c in (resp.data or [] if resp else []):
                     comments_col.controls.append(
                         ft.Container(
                             content=ft.Column([
@@ -337,7 +414,7 @@ async def main(page: ft.Page):
                             padding=SPACE_MD, bgcolor=COLOR_BG, border_radius=RADIUS_SM
                         )
                     )
-                if not resp.data:
+                if not resp or not resp.data:
                     comments_col.controls.append(
                         ft.Text("No comments yet. Be first!", color=COLOR_TEXT_MUTED, size=12)
                     )
@@ -359,14 +436,19 @@ async def main(page: ft.Page):
             status.value = ""
             page.update()
             try:
-                supabase.rpc("add_post_comment", {
-                    "p_post_id": post_id,
-                    "p_user_id": get_cached_user_id(),
-                    "p_username": user_cache.get("username", "Unknown"),
-                    "p_content": content
-                }).execute()
-                comment_input.value = ""
+                resp = safe_supabase_call(
+                    lambda: supabase.rpc("add_post_comment", {
+                        "p_post_id": post_id,
+                        "p_user_id": get_cached_user_id(),
+                        "p_username": user_cache.get("username", "Unknown"),
+                        "p_content": content
+                    }).execute()
+                )
                 send_btn.disabled = False
+                if resp is None:
+                    page.update()
+                    return  # session died and force_reauth() already fired
+                comment_input.value = ""
                 load_comments()  # already calls page.update()
                 create_notification(post_owner_id, "comment",
                                     f"{user_cache.get('username','Someone')} commented on your post", post_id)
@@ -476,14 +558,16 @@ async def main(page: ft.Page):
             is_anon_original = post.get("is_anonymous", False)
             source_label = "an anonymous secret" if is_anon_original else f"@{post.get('username', 'Unknown')}"
             prefix = f"\U0001F501 Repost from {source_label}: "
-            supabase.table("posts").insert({
-                "user_id": user_id,
-                "username": username,
-                "content": prefix + (post.get("content") or ""),
-                "media_url": post.get("media_url"),
-                "media_type": post.get("media_type"),
-                "is_anonymous": False
-            }).execute()
+            safe_supabase_call(
+                lambda: supabase.table("posts").insert({
+                    "user_id": user_id,
+                    "username": username,
+                    "content": prefix + (post.get("content") or ""),
+                    "media_url": post.get("media_url"),
+                    "media_type": post.get("media_type"),
+                    "is_anonymous": False
+                }).execute()
+            )
             render_public_feed()
         except Exception as ex:
             print(f"Repost error: {ex}")
@@ -505,8 +589,10 @@ async def main(page: ft.Page):
         if not media_url:
             return
         try:
-            others = supabase.table("posts").select("id").eq("media_url", media_url).neq("id", deleted_post["id"]).execute()
-            if others.data:
+            others = safe_supabase_call(
+                lambda: supabase.table("posts").select("id").eq("media_url", media_url).neq("id", deleted_post["id"]).execute()
+            )
+            if others is None or others.data:
                 return  # still referenced by another post (e.g. a repost) — keep the file
             storage_path = extract_storage_path(media_url, MEDIA_BUCKET)
             if storage_path:
@@ -520,10 +606,12 @@ async def main(page: ft.Page):
             return
         try:
             cleanup_post_media(post)
-            supabase.rpc("delete_own_post", {
-                "p_post_id": post["id"],
-                "p_user_id": user_id
-            }).execute()
+            safe_supabase_call(
+                lambda: supabase.rpc("delete_own_post", {
+                    "p_post_id": post["id"],
+                    "p_user_id": user_id
+                }).execute()
+            )
             render_public_feed()
         except Exception as ex:
             print(f"Delete post error: {ex}")
@@ -570,8 +658,6 @@ async def main(page: ft.Page):
         dlg.open = True
         page.update()
 
-
-
     def get_real_users(search_query=""):
         """Fetch registered users, filtered and capped at the database level —
         never pulls the whole profiles table, scales regardless of user count."""
@@ -581,27 +667,28 @@ async def main(page: ft.Page):
             # Strip characters that would break Supabase's or_() filter syntax
             q = (search_query or "").strip().replace(",", "").replace("%", "")
 
-            query = supabase.table("profiles").select("user_id, username, country, state, department, avatar_url")
+            def do_query():
+                query = supabase.table("profiles").select("user_id, username, country, state, department, avatar_url")
+                if q:
+                    query = query.ilike("username", f"%{q}%")
+                if current_id:
+                    query = query.neq("user_id", current_id)
+                if blocked:
+                    query = query.not_.in_("user_id", blocked)
+                return query.order("username").limit(50).execute()
 
-            if q:
-                query = query.ilike("username", f"%{q}%")
-
-            if current_id:
-                query = query.neq("user_id", current_id)
-
-            if blocked:
-                query = query.not_.in_("user_id", blocked)
-
-            resp = query.order("username").limit(50).execute()
-            return resp.data or []
+            resp = safe_supabase_call(do_query)
+            return resp.data if resp else []
         except Exception as e:
             print(f"Error fetching users: {e}")
             return []
 
     def get_whisper_posts():
         try:
-            response = supabase.table("posts").select("*").eq("is_anonymous", True).order("created_at", desc=True).limit(50).execute()
-            return response.data
+            resp = safe_supabase_call(
+                lambda: supabase.table("posts").select("*").eq("is_anonymous", True).order("created_at", desc=True).limit(50).execute()
+            )
+            return resp.data if resp else []
         except Exception as e:
             print(f"Error fetching whisper posts: {e}")
             return []
@@ -884,14 +971,19 @@ async def main(page: ft.Page):
         try:
             real_username = user_cache.get("username", "Unknown")
             user_id = get_cached_user_id()
-            supabase.table("posts").insert({
-                "user_id": user_id,
-                "username": real_username,
-                "content": content,
-                "media_url": None,
-                "media_type": None,
-                "is_anonymous": True
-            }).execute()
+            resp = safe_supabase_call(
+                lambda: supabase.table("posts").insert({
+                    "user_id": user_id,
+                    "username": real_username,
+                    "content": content,
+                    "media_url": None,
+                    "media_type": None,
+                    "is_anonymous": True
+                }).execute()
+            )
+            if resp is None:
+                page.update()
+                return  # session died and force_reauth() already fired
             whisper_text_box.value = ""
             whisper_status_text.value = "Secret posted! 🤫"
             whisper_status_text.color = COLOR_SUCCESS
@@ -974,8 +1066,10 @@ async def main(page: ft.Page):
         if not user_id:
             return
         try:
-            resp = supabase.rpc("get_notifications", {"p_user_id": user_id}).execute()
-            notifs = resp.data or []
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("get_notifications", {"p_user_id": user_id}).execute()
+            )
+            notifs = resp.data if resp else []
         except Exception as ex:
             print(f"Notifications load error: {ex}")
             notifs = []
@@ -1005,8 +1099,10 @@ async def main(page: ft.Page):
         if not user_id:
             return
         try:
-            resp = supabase.rpc("get_unread_notification_count", {"p_user_id": user_id}).execute()
-            count = resp.data or 0
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("get_unread_notification_count", {"p_user_id": user_id}).execute()
+            )
+            count = (resp.data if resp else 0) or 0
             if count and count > 0:
                 nav_buttons["notifications"].icon = ft.Icons.NOTIFICATIONS_ACTIVE_ROUNDED
                 nav_buttons["notifications"].icon_color = COLOR_DANGER
@@ -1077,7 +1173,9 @@ async def main(page: ft.Page):
         user_id = get_cached_user_id()
         if user_id:
             try:
-                supabase.rpc("mark_notifications_read", {"p_user_id": user_id}).execute()
+                safe_supabase_call(
+                    lambda: supabase.rpc("mark_notifications_read", {"p_user_id": user_id}).execute()
+                )
             except Exception as ex:
                 print(f"Mark read error: {ex}")
 
@@ -1119,8 +1217,10 @@ async def main(page: ft.Page):
                 page.update()
                 return
             try:
-                resp = supabase.table("profiles").select("user_id, username").in_("user_id", ids).execute()
-                for u in (resp.data or []):
+                resp = safe_supabase_call(
+                    lambda: supabase.table("profiles").select("user_id, username").in_("user_id", ids).execute()
+                )
+                for u in (resp.data if resp else []) or []:
                     def make_unblock(target=u.get("user_id"), uname=u.get("username", "Unknown")):
                         def do_unblock(e):
                             unblock_user_action(target)
@@ -1372,13 +1472,19 @@ async def main(page: ft.Page):
                 media_url = supabase.storage.from_(MEDIA_BUCKET).get_public_url(storage_path)
                 media_type = selected_media["type"]
 
-            supabase.table("posts").insert({
-                "user_id": user_id,
-                "username": username,
-                "content": text_content,
-                "media_url": media_url,
-                "media_type": media_type
-            }).execute()
+            resp = safe_supabase_call(
+                lambda: supabase.table("posts").insert({
+                    "user_id": user_id,
+                    "username": username,
+                    "content": text_content,
+                    "media_url": media_url,
+                    "media_type": media_type
+                }).execute()
+            )
+
+            if resp is None:
+                set_composer_busy(False)
+                return  # session died and force_reauth() already fired
 
             reset_post_composer()
             set_composer_busy(False)
@@ -1500,8 +1606,10 @@ async def main(page: ft.Page):
 
     def refresh_cached_username(user_id):
         try:
-            resp = supabase.table("profiles").select("username").eq("user_id", user_id).execute()
-            if resp.data and resp.data[0].get("username"):
+            resp = safe_supabase_call(
+                lambda: supabase.table("profiles").select("username").eq("user_id", user_id).execute()
+            )
+            if resp and resp.data and resp.data[0].get("username"):
                 user_cache["username"] = resp.data[0]["username"]
             else:
                 user_cache["username"] = "Unknown"
@@ -1519,13 +1627,15 @@ async def main(page: ft.Page):
         if not recipient_id or recipient_id == get_cached_user_id():
             return
         try:
-            supabase.rpc("create_notification", {
-                "p_recipient_id": recipient_id,
-                "p_actor_username": user_cache.get("username", "Someone"),
-                "p_type": notif_type,
-                "p_message": message,
-                "p_post_id": post_id
-            }).execute()
+            safe_supabase_call(
+                lambda: supabase.rpc("create_notification", {
+                    "p_recipient_id": recipient_id,
+                    "p_actor_username": user_cache.get("username", "Someone"),
+                    "p_type": notif_type,
+                    "p_message": message,
+                    "p_post_id": post_id
+                }).execute()
+            )
         except Exception as ex:
             print(f"Notification create error: {ex}")
 
@@ -1541,9 +1651,12 @@ async def main(page: ft.Page):
         if blocked_ids_cache["loaded"] and not force_refresh:
             return blocked_ids_cache["ids"]
         try:
-            resp = supabase.rpc("get_blocked_user_ids", {"p_user_id": user_id}).execute()
-            blocked_ids_cache["ids"] = {row["blocked_id"] for row in (resp.data or [])}
-            blocked_ids_cache["loaded"] = True
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("get_blocked_user_ids", {"p_user_id": user_id}).execute()
+            )
+            if resp is not None:
+                blocked_ids_cache["ids"] = {row["blocked_id"] for row in (resp.data or [])}
+                blocked_ids_cache["loaded"] = True
         except Exception as ex:
             print(f"get_blocked_ids error: {ex}")
         return blocked_ids_cache["ids"]
@@ -1553,7 +1666,11 @@ async def main(page: ft.Page):
         if not user_id or not target_user_id or target_user_id == user_id:
             return False
         try:
-            supabase.rpc("block_user", {"p_blocker_id": user_id, "p_blocked_id": target_user_id}).execute()
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("block_user", {"p_blocker_id": user_id, "p_blocked_id": target_user_id}).execute()
+            )
+            if resp is None:
+                return False
             get_blocked_ids(force_refresh=True)
             return True
         except Exception as ex:
@@ -1565,7 +1682,11 @@ async def main(page: ft.Page):
         if not user_id:
             return False
         try:
-            supabase.rpc("unblock_user", {"p_blocker_id": user_id, "p_blocked_id": target_user_id}).execute()
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("unblock_user", {"p_blocker_id": user_id, "p_blocked_id": target_user_id}).execute()
+            )
+            if resp is None:
+                return False
             get_blocked_ids(force_refresh=True)
             return True
         except Exception as ex:
@@ -1577,10 +1698,12 @@ async def main(page: ft.Page):
         if not user_id:
             return False
         try:
-            supabase.rpc("report_post", {
-                "p_post_id": post_id, "p_reporter_id": user_id, "p_reason": reason
-            }).execute()
-            return True
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("report_post", {
+                    "p_post_id": post_id, "p_reporter_id": user_id, "p_reason": reason
+                }).execute()
+            )
+            return resp is not None
         except Exception as ex:
             print(f"Report post error: {ex}")
             return False
@@ -1590,10 +1713,12 @@ async def main(page: ft.Page):
         if not user_id:
             return False
         try:
-            supabase.rpc("report_user", {
-                "p_reported_user_id": target_user_id, "p_reporter_id": user_id, "p_reason": reason
-            }).execute()
-            return True
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("report_user", {
+                    "p_reported_user_id": target_user_id, "p_reporter_id": user_id, "p_reason": reason
+                }).execute()
+            )
+            return resp is not None
         except Exception as ex:
             print(f"Report user error: {ex}")
             return False
@@ -1604,10 +1729,14 @@ async def main(page: ft.Page):
         if not user_id or not target_user_id:
             return None, "You must be logged in."
         try:
-            resp = supabase.rpc("send_connection_request", {
-                "p_requester_id": user_id,
-                "p_recipient_id": target_user_id
-            }).execute()
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("send_connection_request", {
+                    "p_requester_id": user_id,
+                    "p_recipient_id": target_user_id
+                }).execute()
+            )
+            if resp is None:
+                return None, "Session expired — please log in again."
             return resp.data, None
         except Exception as ex:
             return None, f"Couldn't send request: {str(ex)}"
@@ -1617,11 +1746,15 @@ async def main(page: ft.Page):
         if not user_id:
             return None, "You must be logged in."
         try:
-            resp = supabase.rpc("respond_connection_request", {
-                "p_request_id": request_id,
-                "p_user_id": user_id,
-                "p_accept": accept
-            }).execute()
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("respond_connection_request", {
+                    "p_request_id": request_id,
+                    "p_user_id": user_id,
+                    "p_accept": accept
+                }).execute()
+            )
+            if resp is None:
+                return None, "Session expired — please log in again."
             return resp.data, None
         except Exception as ex:
             return None, f"Couldn't respond: {str(ex)}"
@@ -1633,11 +1766,13 @@ async def main(page: ft.Page):
         if not user_id or not other_user_id:
             return None, None, None
         try:
-            resp = supabase.rpc("get_connection_status", {
-                "p_user_id": user_id,
-                "p_other_user_id": other_user_id
-            }).execute()
-            if resp.data:
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("get_connection_status", {
+                    "p_user_id": user_id,
+                    "p_other_user_id": other_user_id
+                }).execute()
+            )
+            if resp and resp.data:
                 row = resp.data[0]
                 return row.get("status"), row.get("request_id"), row.get("is_requester")
         except Exception as ex:
@@ -1649,8 +1784,10 @@ async def main(page: ft.Page):
         if not user_id:
             return []
         try:
-            resp = supabase.rpc("get_pending_connection_requests", {"p_user_id": user_id}).execute()
-            return resp.data or []
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("get_pending_connection_requests", {"p_user_id": user_id}).execute()
+            )
+            return resp.data if resp else []
         except Exception as ex:
             print(f"get_pending_connection_requests error: {ex}")
             return []
@@ -1687,18 +1824,22 @@ async def main(page: ft.Page):
         if not user_id:
             return []
         try:
-            requester_query = supabase.table("connections") \
-                .select("id, requester_id, recipient_id, status") \
-                .eq("requester_id", user_id)
-            recipient_query = supabase.table("connections") \
-                .select("id, requester_id, recipient_id, status") \
-                .eq("recipient_id", user_id)
-            if status:
-                requester_query = requester_query.eq("status", status)
-                recipient_query = recipient_query.eq("status", status)
+            def do_requester_query():
+                q = supabase.table("connections").select("id, requester_id, recipient_id, status").eq("requester_id", user_id)
+                if status:
+                    q = q.eq("status", status)
+                return q.execute()
 
-            as_requester = requester_query.execute()
-            as_recipient = recipient_query.execute()
+            def do_recipient_query():
+                q = supabase.table("connections").select("id, requester_id, recipient_id, status").eq("recipient_id", user_id)
+                if status:
+                    q = q.eq("status", status)
+                return q.execute()
+
+            as_requester = safe_supabase_call(do_requester_query)
+            as_recipient = safe_supabase_call(do_recipient_query)
+            if as_requester is None or as_recipient is None:
+                return None  # session died and force_reauth() already fired
             rows = (as_requester.data or []) + (as_recipient.data or [])
 
             deduped_by_row_id = {}
@@ -1802,10 +1943,12 @@ async def main(page: ft.Page):
         if not user_id:
             return []
         try:
-            resp = supabase.rpc("get_user_conversations", {
-                "p_user_id": user_id
-            }).execute()
-            return resp.data or []
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("get_user_conversations", {
+                    "p_user_id": user_id
+                }).execute()
+            )
+            return resp.data if resp else []
         except Exception as e:
             print(f"Error fetching conversations: {e}")
             return []
@@ -1824,7 +1967,11 @@ async def main(page: ft.Page):
 
             # Look up the target user's profile (case-insensitive, exact match —
             # ilike with no % wildcards behaves like a case-insensitive eq)
-            profile_resp = supabase.table("profiles").select("user_id, username").ilike("username", cleaned_username).execute()
+            profile_resp = safe_supabase_call(
+                lambda: supabase.table("profiles").select("user_id, username").ilike("username", cleaned_username).execute()
+            )
+            if profile_resp is None:
+                return None, "Session expired — please log in again."
             if not profile_resp.data:
                 return None, f"No user found with username '{cleaned_username}'."
             target_uid = profile_resp.data[0]["user_id"]
@@ -1838,13 +1985,17 @@ async def main(page: ft.Page):
 
             # Use a SECURITY DEFINER database function to create the conversation.
             # This bypasses RLS entirely so the sync client's JWT issue doesn't matter.
-            result = supabase.rpc("create_conversation_between", {
-                "p_user1": user_id,
-                "p_user2": target_uid
-            }).execute()
+            result = safe_supabase_call(
+                lambda: supabase.rpc("create_conversation_between", {
+                    "p_user1": user_id,
+                    "p_user2": target_uid
+                }).execute()
+            )
 
-            if result.data:
+            if result and result.data:
                 return result.data, None
+            elif result is None:
+                return None, "Session expired — please log in again."
             else:
                 return None, "Couldn't create conversation — check Supabase logs."
         except Exception as e:
@@ -1852,10 +2003,12 @@ async def main(page: ft.Page):
 
     def get_messages(conversation_id):
         try:
-            resp = supabase.rpc("get_conversation_messages", {
-                "p_conversation_id": conversation_id
-            }).execute()
-            return resp.data or []
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("get_conversation_messages", {
+                    "p_conversation_id": conversation_id
+                }).execute()
+            )
+            return resp.data if resp else []
         except Exception as e:
             print(f"Error fetching messages: {e}")
             return []
@@ -1865,17 +2018,23 @@ async def main(page: ft.Page):
         if not user_id or not content.strip():
             return False, None
         try:
-            supabase.rpc("send_chat_message", {
-                "p_conversation_id": conversation_id,
-                "p_sender_id": user_id,
-                "p_content": content.strip()
-            }).execute()
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("send_chat_message", {
+                    "p_conversation_id": conversation_id,
+                    "p_sender_id": user_id,
+                    "p_content": content.strip()
+                }).execute()
+            )
+            if resp is None:
+                return False, "Session expired — please log in again."
             # Notify the other participant(s) in this conversation
             try:
-                parts = supabase.rpc("get_conversation_participant_ids", {
-                    "p_conversation_id": conversation_id
-                }).execute()
-                for part in (parts.data or []):
+                parts = safe_supabase_call(
+                    lambda: supabase.rpc("get_conversation_participant_ids", {
+                        "p_conversation_id": conversation_id
+                    }).execute()
+                )
+                for part in (parts.data if parts else []) or []:
                     other_id = part.get("user_id")
                     if other_id and other_id != user_id:
                         create_notification(other_id, "message",
@@ -2203,7 +2362,9 @@ async def main(page: ft.Page):
                     # Keep profiles.email in sync — username login depends on this
                     user_id = get_cached_user_id()
                     if user_id:
-                        supabase.table("profiles").update({"email": new_email}).eq("user_id", user_id).execute()
+                        safe_supabase_call(
+                            lambda: supabase.table("profiles").update({"email": new_email}).eq("user_id", user_id).execute()
+                        )
                     user_cache["email"] = new_email
                 profile_password.value = ""
                 settings_status.value = "Account updated! ✅"
@@ -2240,7 +2401,6 @@ async def main(page: ft.Page):
         page.overlay.append(dlg)
         dlg.open = True
         page.update()
-
 
     # --- PROFILE STATS ROW (Posts / Followers / Following / Total Likes) ---
     def format_count(n):
@@ -2295,8 +2455,11 @@ async def main(page: ft.Page):
             other_ids = [uid for uid in accepted.keys() if uid not in blocked]
             if not other_ids:
                 return []
-            profiles_resp = supabase.table("profiles") \
-                .select("user_id, username, avatar_url").in_("user_id", other_ids).execute()
+            profiles_resp = safe_supabase_call(
+                lambda: supabase.table("profiles").select("user_id, username, avatar_url").in_("user_id", other_ids).execute()
+            )
+            if profiles_resp is None:
+                return None
             results = []
             for pr in (profiles_resp.data or []):
                 results.append({
@@ -2312,8 +2475,10 @@ async def main(page: ft.Page):
 
     def remove_connection_action(request_id):
         try:
-            supabase.table("connections").delete().eq("id", request_id).execute()
-            return True
+            resp = safe_supabase_call(
+                lambda: supabase.table("connections").delete().eq("id", request_id).execute()
+            )
+            return resp is not None
         except Exception as ex:
             print(f"remove_connection_action error: {ex}")
             return False
@@ -2433,7 +2598,6 @@ async def main(page: ft.Page):
         load_list()
         page.update()
 
-
     profile_stats_row = ft.Container(
         content=ft.Row([
             make_stat_column(profile_stat_posts, "Posts"),
@@ -2456,8 +2620,11 @@ async def main(page: ft.Page):
         if not user_id:
             return stats
         try:
-            posts_resp = supabase.table("posts").select("id", count="exact").eq("user_id", user_id).execute()
-            stats["posts"] = posts_resp.count if posts_resp.count is not None else len(posts_resp.data or [])
+            posts_resp = safe_supabase_call(
+                lambda: supabase.table("posts").select("id", count="exact").eq("user_id", user_id).execute()
+            )
+            if posts_resp is not None:
+                stats["posts"] = posts_resp.count if posts_resp.count is not None else len(posts_resp.data or [])
         except Exception as ex:
             print(f"stats posts error: {ex}")
         try:
@@ -2476,8 +2643,10 @@ async def main(page: ft.Page):
         except Exception as ex:
             print(f"stats connections error: {ex}")
         try:
-            my_ids_resp = supabase.table("posts").select("id").eq("user_id", user_id).execute()
-            ids = [r["id"] for r in (my_ids_resp.data or [])]
+            my_ids_resp = safe_supabase_call(
+                lambda: supabase.table("posts").select("id").eq("user_id", user_id).execute()
+            )
+            ids = [r["id"] for r in (my_ids_resp.data or [])] if my_ids_resp else []
             likes_map = get_likes_map(ids)
             stats["likes"] = sum(v.get("like_count", 0) for v in likes_map.values())
         except Exception as ex:
@@ -2497,8 +2666,10 @@ async def main(page: ft.Page):
         if not user_id:
             return []
         try:
-            resp = supabase.table("posts").select("*").eq("user_id", user_id).order("created_at", desc=True).limit(30).execute()
-            return resp.data or []
+            resp = safe_supabase_call(
+                lambda: supabase.table("posts").select("*").eq("user_id", user_id).order("created_at", desc=True).limit(30).execute()
+            )
+            return resp.data if resp else []
         except Exception as ex:
             print(f"get_my_posts error: {ex}")
             return []
@@ -2518,7 +2689,12 @@ async def main(page: ft.Page):
         def save_edit(e):
             new_text = (edit_field.value or "").strip()
             try:
-                supabase.table("posts").update({"content": new_text}).eq("id", post["id"]).execute()
+                resp = safe_supabase_call(
+                    lambda: supabase.table("posts").update({"content": new_text}).eq("id", post["id"]).execute()
+                )
+                if resp is None:
+                    page.update()
+                    return  # session died and force_reauth() already fired
                 post["content"] = new_text
                 status.value = "Post updated! ✅"
                 status.color = COLOR_SUCCESS
@@ -2561,15 +2737,19 @@ async def main(page: ft.Page):
             post_id = post.get("id")
             media_url = post.get("media_url")
             if media_url:
-                resp = supabase.table("posts").select("id", count="exact") \
-                    .eq("media_url", media_url).neq("id", post_id).execute()
-                return resp.count or 0
+                resp = safe_supabase_call(
+                    lambda: supabase.table("posts").select("id", count="exact")
+                        .eq("media_url", media_url).neq("id", post_id).execute()
+                )
+                return (resp.count or 0) if resp else 0
             content_snip = (post.get("content") or "")[:40].strip()
             if not content_snip:
                 return 0
-            resp = supabase.table("posts").select("id", count="exact") \
-                .ilike("content", f"%{content_snip}%").neq("id", post_id).execute()
-            return resp.count or 0
+            resp = safe_supabase_call(
+                lambda: supabase.table("posts").select("id", count="exact")
+                    .ilike("content", f"%{content_snip}%").neq("id", post_id).execute()
+            )
+            return (resp.count or 0) if resp else 0
         except Exception as ex:
             print(f"get_share_count error: {ex}")
             return 0
@@ -2594,8 +2774,10 @@ async def main(page: ft.Page):
     def load_post_viewer_comments(post_id):
         post_viewer_comments_col.controls.clear()
         try:
-            resp = supabase.rpc("get_post_comments", {"p_post_id": post_id}).execute()
-            comments = resp.data or []
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("get_post_comments", {"p_post_id": post_id}).execute()
+            )
+            comments = resp.data if resp else []
             post_viewer_comment_count.value = f"{len(comments)} comment{'s' if len(comments) != 1 else ''}"
             for c in comments:
                 post_viewer_comments_col.controls.append(
@@ -2623,12 +2805,16 @@ async def main(page: ft.Page):
         if not content:
             return
         try:
-            supabase.rpc("add_post_comment", {
-                "p_post_id": post["id"],
-                "p_user_id": get_cached_user_id(),
-                "p_username": user_cache.get("username", "Unknown"),
-                "p_content": content
-            }).execute()
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("add_post_comment", {
+                    "p_post_id": post["id"],
+                    "p_user_id": get_cached_user_id(),
+                    "p_username": user_cache.get("username", "Unknown"),
+                    "p_content": content
+                }).execute()
+            )
+            if resp is None:
+                return  # session died and force_reauth() already fired
             post_viewer_comment_input.value = ""
             load_post_viewer_comments(post["id"])
             create_notification(post.get("user_id"), "comment",
@@ -2876,11 +3062,13 @@ async def main(page: ft.Page):
             return profile_load_state["token"] != my_token
 
         try:
-            resp = supabase.table("profiles").select("*").eq("user_id", user_id).execute()
+            resp = safe_supabase_call(
+                lambda: supabase.table("profiles").select("*").eq("user_id", user_id).execute()
+            )
             if superseded():
                 return  # a newer load_own_profile() call has already started
-            if not resp.data:
-                return
+            if resp is None or not resp.data:
+                return  # session died (force_reauth() already fired) or no profile row
             p = resp.data[0]
             profile_username_label.value = f"@{p.get('username', '')}"
             profile_bio.value = p.get("bio") or ""
@@ -2988,7 +3176,12 @@ async def main(page: ft.Page):
                 pass
             upload_with_retry(AVATARS_BUCKET, storage_path, file_bytes, content_type)
             avatar_url = supabase.storage.from_(AVATARS_BUCKET).get_public_url(storage_path)
-            supabase.table("profiles").update({"avatar_url": avatar_url}).eq("user_id", user_id).execute()
+            resp = safe_supabase_call(
+                lambda: supabase.table("profiles").update({"avatar_url": avatar_url}).eq("user_id", user_id).execute()
+            )
+            if resp is None:
+                page.update()
+                return  # session died and force_reauth() already fired
             profile_avatar_img.src = avatar_url
             profile_status_text.value = "Profile picture updated! ✅"
             profile_status_text.color = COLOR_SUCCESS
@@ -3011,7 +3204,12 @@ async def main(page: ft.Page):
             "local_government": get_dd_value(lga_dd),
         }
         try:
-            supabase.table("profiles").update(updates).eq("user_id", user_id).execute()
+            resp = safe_supabase_call(
+                lambda: supabase.table("profiles").update(updates).eq("user_id", user_id).execute()
+            )
+            if resp is None:
+                page.update()
+                return  # session died and force_reauth() already fired
             profile_status_text.value = "Profile saved! ✅"
             profile_status_text.color = COLOR_SUCCESS
             page.update()
@@ -3068,9 +3266,11 @@ async def main(page: ft.Page):
 
     def load_other_profile(username):
         try:
-            resp = supabase.table("profiles").select("*").eq("username", username).execute()
-            if not resp.data:
-                return
+            resp = safe_supabase_call(
+                lambda: supabase.table("profiles").select("*").eq("username", username).execute()
+            )
+            if resp is None or not resp.data:
+                return  # session died (force_reauth() already fired) or no such profile
             p = resp.data[0]
             uname = p.get("username", "U")
             viewed_profile_state["user_id"] = p.get("user_id")
@@ -3392,9 +3592,15 @@ async def main(page: ft.Page):
             if "@" in login_input:
                 login_email = login_input
             else:
-                # Treat as username — resolve to the account's email via profiles
-                lookup = supabase.table("profiles").select("email").eq("username", login_input).execute()
-                if not lookup.data or not lookup.data[0].get("email"):
+                # Treat as username — resolve to the account's email via profiles.
+                # This is a fresh login, so there's no session yet to expire —
+                # but we still route it through safe_supabase_call for
+                # consistency and so a transient network hiccup on THIS lookup
+                # doesn't get misread as "no account found".
+                lookup = safe_supabase_call(
+                    lambda: supabase.table("profiles").select("email").eq("username", login_input).execute()
+                )
+                if lookup is None or not lookup.data or not lookup.data[0].get("email"):
                     ui_message.value = "No account found for that username."
                     ui_message.color = COLOR_DANGER
                     page.update()
@@ -3585,13 +3791,24 @@ We may update these terms; continued use of the app means you accept the changes
             cache_user(result.user, result.session.access_token)
             reg_state["session"] = result.session  # keep for step 3, avoids relying on get_session()
 
-            # Create the profile row now that the account is confirmed
-            supabase.table("profiles").insert({
-                "username": reg_state["username"],
-                "location": "Not Specified Yet",
-                "user_id": result.user.id,
-                "email": reg_state["email"]
-            }).execute()
+            # Create the profile row now that the account is confirmed.
+            # This is a brand-new token straight from verify_otp(), so it
+            # can't be expired — but wrapping it means a mid-registration
+            # network hiccup still gets the same one-retry treatment as
+            # every other write in the app instead of a bespoke handler.
+            profile_insert = safe_supabase_call(
+                lambda: supabase.table("profiles").insert({
+                    "username": reg_state["username"],
+                    "location": "Not Specified Yet",
+                    "user_id": result.user.id,
+                    "email": reg_state["email"]
+                }).execute()
+            )
+            if profile_insert is None:
+                reg_step2_status.value = "Session expired during signup — please try registering again."
+                reg_step2_status.color = COLOR_DANGER
+                page.update()
+                return
             refresh_cached_username(result.user.id)
 
             reg_step2_status.value = ""
@@ -3725,29 +3942,31 @@ We may update these terms; continued use of the app means you accept the changes
                 # if the app was closed for a while (Supabase JWTs last
                 # ~1 hour) — sending an expired token to a table that now
                 # has RLS enforced comes back as "JWT expired" (PGRST303).
-                # If that happens here, clear the dead session and drop
-                # back to login instead of continuing into a dashboard
-                # where every request would fail the same way.
-                username_check = None
-                try:
-                    username_check = supabase.table("profiles").select("username").eq("user_id", user_id).execute()
-                except Exception as ex:
-                    msg = str(ex).lower()
-                    if "jwt" in msg or "expired" in msg or "pgrst303" in msg:
-                        print(f"Stored session is no longer valid — clearing it: {ex}")
-                        await clear_session()
-                        cache_user(None)
-                        return False
-                    # Some other (likely transient/network) error — fall
-                    # through and let the app proceed; individual screens
-                    # already handle their own fetch failures gracefully.
+                #
+                # This now goes through the SAME is_session_expired_error()
+                # check and refresh flow as every other call in the app
+                # (via safe_supabase_call), instead of a bespoke probe —
+                # so "expired while the app was closed" and "expired mid-
+                # session" are handled identically. If the refresh itself
+                # fails, we still clear the dead session and drop back to
+                # login rather than continuing into a dashboard where
+                # every request would fail the same way.
+                username_check = safe_supabase_call(
+                    lambda: supabase.table("profiles").select("username").eq("user_id", user_id).execute()
+                )
+                if username_check is None:
+                    # safe_supabase_call already tried a refresh and, on
+                    # failure, already called force_reauth() — which itself
+                    # calls cache_user(None)/clear_session()/show_auth().
+                    # Nothing more to do here except stop the restore.
+                    return False
 
                 # Rebuild the user cache directly from stored values —
                 # never call get_user() here, it fails on the sync client
                 user_cache["id"]           = user_id
                 user_cache["email"]        = user_email
-                user_cache["access_token"] = access_token
-                if username_check and username_check.data and username_check.data[0].get("username"):
+                user_cache["access_token"] = user_cache.get("access_token") or access_token
+                if username_check.data and username_check.data[0].get("username"):
                     user_cache["username"] = username_check.data[0]["username"]
                 else:
                     refresh_cached_username(user_id)  # Get the REAL username, not email prefix
