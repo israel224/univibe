@@ -2700,6 +2700,10 @@ async def main(page: ft.Page):
     post_viewer_like_count = ft.Text("0", color="white", size=13)
     post_viewer_comment_count = ft.Text("0 comments", color=COLOR_TEXT_MUTED, size=12)
     post_viewer_share_count = ft.Text("0 shares", color=COLOR_TEXT_MUTED, size=12)
+    post_viewer_delete_btn = ft.IconButton(
+        icon=ft.Icons.DELETE_OUTLINE_ROUNDED, icon_color=COLOR_DANGER, icon_size=22,
+        tooltip="Delete post", visible=False
+    )
     post_viewer_comments_col = ft.Column(spacing=6, scroll=ft.ScrollMode.AUTO, height=160)
     post_viewer_comment_input = ft.TextField(hint_text="Add a comment...", expand=True, dense=True,
                                              color="white", border_color=COLOR_BORDER, content_padding=10)
@@ -2767,6 +2771,49 @@ async def main(page: ft.Page):
 
     post_viewer_like_btn.on_click = toggle_post_viewer_like
 
+    def confirm_delete_post_from_viewer(post):
+        """Confirmation dialog for the immersive post viewer's Delete
+        button (My Profile -> My Posts -> tap post). Ownership is
+        re-checked here too, even though post_viewer_delete_btn's
+        visibility already gates on it in open_post_viewer() -- this is
+        the one place a delete can actually fire from the viewer, so it
+        gets its own check rather than trusting visibility alone.
+
+        Reuses handle_delete_from_grid() completely unchanged: the exact
+        same Supabase deletion (RPC delete_own_post, ownership enforced
+        server-side by p_user_id) already used by the profile grid's own
+        3-dot menu and, underneath that, the same handle_delete_post()
+        the main Feed's delete button calls. No second deletion path, no
+        duplicate post handling -- deleting here removes the same row
+        Feed reads from, so it disappears from Feed too.
+        """
+        if not post or post.get("user_id") != get_cached_user_id():
+            return
+
+        def close_confirm(d):
+            d.open = False
+            page.update()
+
+        def do_delete(e):
+            close_confirm(confirm_dlg)
+            handle_delete_from_grid(post)  # deletes + refreshes Feed + profile grid + stats
+            close_post_viewer()
+
+        confirm_dlg = ft.AlertDialog(
+            title=ft.Text("Delete this post?", color="white", size=16),
+            bgcolor=COLOR_CARD,
+            content=ft.Text("This can't be undone.", color=COLOR_TEXT_MUTED, size=13),
+            actions=[
+                ft.TextButton(content=ft.Text("Cancel", color=COLOR_TEXT_MUTED), on_click=lambda e: close_confirm(confirm_dlg)),
+                ft.TextButton(content=ft.Text("Delete", color=COLOR_DANGER), on_click=do_delete),
+            ]
+        )
+        page.overlay.append(confirm_dlg)
+        confirm_dlg.open = True
+        page.update()
+
+    post_viewer_delete_btn.on_click = lambda e: confirm_delete_post_from_viewer(post_viewer_state["post"])
+
     def open_post_viewer(post):
         post_viewer_state["post"] = post
         is_anon = post.get("is_anonymous", False)
@@ -2806,6 +2853,10 @@ async def main(page: ft.Page):
         post_viewer_like_btn.icon_color = COLOR_DANGER if like_info.get("user_liked") else COLOR_TEXT_FAINT
         post_viewer_like_count.value = str(like_info.get("like_count", 0))
 
+        # Only the post's owner ever sees Delete here -- same ownership
+        # check the main Feed already uses for its own delete button.
+        post_viewer_delete_btn.visible = (post.get("user_id") == get_cached_user_id())
+
         load_post_viewer_comments(post_id)
 
         share_count = get_share_count(post)
@@ -2835,7 +2886,8 @@ async def main(page: ft.Page):
                     icon=ft.Icons.SHARE_ROUNDED, icon_color=COLOR_TEXT_FAINT, icon_size=22, tooltip="Share",
                     on_click=lambda e: open_share_dialog(post_viewer_state["post"]) if post_viewer_state["post"] else None
                 ),
-                post_viewer_share_count
+                post_viewer_share_count,
+                post_viewer_delete_btn
             ], spacing=6),
             ft.Divider(color=COLOR_BORDER),
             ft.Text("Comments", color="white", weight=ft.FontWeight.BOLD, size=13),
