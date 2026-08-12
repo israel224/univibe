@@ -3488,6 +3488,9 @@ async def main(page: ft.Page):
         reg_step1.visible = False
         reg_step2.visible = False
         reg_step3.visible = False
+        fp_step1.visible = False
+        fp_step2.visible = False
+        fp_step3.visible = False
         layout_login_form.visible = True
         page.update()
 
@@ -3793,10 +3796,273 @@ We may update these terms; continued use of the app means you accept the changes
         reg_step3_status
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
+    # ============================================================
+    # --- FORGOT PASSWORD / PASSWORD RECOVERY --------------------
+    # Reuses the SAME Supabase OTP mechanism as registration
+    # (sign_in_with_otp -> verify_otp(type="email") -> update_user),
+    # just with should_create_user=False since the account must
+    # already exist. This is a fully separate, self-contained flow:
+    # it never touches cache_user/user_cache, never calls
+    # save_session()/clear_session() (those belong to the persisted
+    # app session), and never reuses reg_state. The transient auth
+    # session created here for verification is explicitly signed out
+    # of once the password is changed, so it can't leak into or
+    # interfere with the normal login session or the session-refresh
+    # wrapper (safe_supabase_call / try_restore_session) at all.
+    # ============================================================
+    recovery_state = {"identifier": None, "email": None, "session": None}
+
+    input_fp_identifier = ft.TextField(label="Email or Username", width=300, color="white")
+    input_fp_otp = ft.TextField(label="6-Digit Code", width=300, color="white", max_length=6)
+    input_fp_new_password = ft.TextField(label="Create New Password", password=True, width=300, color="white")
+    input_fp_confirm_password = ft.TextField(label="Confirm New Password", password=True, width=300, color="white")
+
+    fp_step1_status = ft.Text("", size=12)
+    fp_step2_status = ft.Text("", size=12)
+    fp_step3_status = ft.Text("", size=12)
+
+    def reset_recovery_fields():
+        recovery_state["identifier"] = None
+        recovery_state["email"] = None
+        recovery_state["session"] = None
+        input_fp_identifier.value = ""
+        input_fp_otp.value = ""
+        input_fp_new_password.value = ""
+        input_fp_confirm_password.value = ""
+        fp_step1_status.value = ""
+        fp_step2_status.value = ""
+        fp_step3_status.value = ""
+
+    def switch_to_forgot_password(e):
+        reset_recovery_fields()
+        layout_login_form.visible = False
+        reg_step1.visible = False
+        reg_step2.visible = False
+        reg_step3.visible = False
+        fp_step1.visible = True
+        fp_step2.visible = False
+        fp_step3.visible = False
+        ui_message.value = ""
+        page.update()
+
+    def back_to_login_from_recovery(e=None):
+        # If a transient recovery session was left open (e.g. the user
+        # navigated away mid-flow), sign it out so it can never be
+        # mistaken for — or interfere with — a real logged-in session.
+        if recovery_state.get("session"):
+            try:
+                supabase.auth.sign_out()
+            except Exception as ex:
+                print(f"Recovery session sign-out warning: {ex}")
+        reset_recovery_fields()
+        fp_step1.visible = False
+        fp_step2.visible = False
+        fp_step3.visible = False
+        show_auth()
+
+    def handle_send_recovery_code(e):
+        identifier = (input_fp_identifier.value or "").strip()
+        if not identifier:
+            fp_step1_status.value = "Enter your email or username."
+            fp_step1_status.color = COLOR_DANGER
+            page.update()
+            return
+
+        fp_step1_status.value = ""
+        page.update()
+
+        try:
+            if "@" in identifier:
+                recovery_email = identifier
+            else:
+                # Username lookup uses the same safe_supabase_call wrapper
+                # as every other authenticated-table read in the app, so a
+                # mid-lookup session hiccup is retried the same way.
+                lookup = safe_supabase_call(
+                    lambda: supabase.table("profiles").select("email").ilike("username", identifier).execute()
+                )
+                if lookup is None:
+                    fp_step1_status.value = "Something went wrong — please try again."
+                    fp_step1_status.color = COLOR_DANGER
+                    page.update()
+                    return
+                if not lookup.data or not lookup.data[0].get("email"):
+                    fp_step1_status.value = "No account found for that username."
+                    fp_step1_status.color = COLOR_DANGER
+                    page.update()
+                    return
+                recovery_email = lookup.data[0]["email"]
+
+            # Uses the dedicated password-recovery API (reset_password_for_email)
+            # instead of sign_in_with_otp. sign_in_with_otp routes an EXISTING,
+            # already-confirmed account to Supabase's "Magic Link" email
+            # template (a sign-in link) regardless of should_create_user —
+            # only a brand-new, unconfirmed account (registration's case)
+            # gets the "Confirm signup" template, which is the one already
+            # customized to show the 6-digit {{ .Token }}. reset_password_for_email
+            # instead fires the "Reset Password" template, which needs that
+            # same {{ .Token }} customization in the Supabase Dashboard
+            # (Authentication -> Email Templates -> Reset Password) to show
+            # a code instead of a link.
+            try:
+                supabase.auth.reset_password_for_email(recovery_email, {})
+            except AttributeError:
+                # Older gotrue-py naming, kept as a fallback so this doesn't
+                # hard-break on a slightly different installed SDK version.
+                supabase.auth.reset_password_email(recovery_email, {})
+
+            recovery_state["identifier"] = identifier
+            recovery_state["email"] = recovery_email
+            fp_step1_status.value = ""
+            fp_step1.visible = False
+            fp_step2.visible = True
+            fp_step2_status.value = "If that account exists, a code has been sent to its email."
+            fp_step2_status.color = COLOR_TEXT_MUTED
+            page.update()
+        except Exception as ex:
+            fp_step1_status.value = f"Couldn't send code: {str(ex)}"
+            fp_step1_status.color = COLOR_DANGER
+            page.update()
+
+    def handle_resend_recovery_code(e):
+        if not recovery_state.get("email"):
+            return
+        try:
+            try:
+                supabase.auth.reset_password_for_email(recovery_state["email"], {})
+            except AttributeError:
+                supabase.auth.reset_password_email(recovery_state["email"], {})
+            fp_step2_status.value = "Code resent — check your inbox."
+            fp_step2_status.color = COLOR_SUCCESS
+            page.update()
+        except Exception as ex:
+            fp_step2_status.value = f"Couldn't resend: {str(ex)}"
+            fp_step2_status.color = COLOR_DANGER
+            page.update()
+
+    def handle_verify_recovery_otp(e):
+        code = (input_fp_otp.value or "").strip()
+        if not code:
+            fp_step2_status.value = "Enter the 6-digit code."
+            fp_step2_status.color = COLOR_DANGER
+            page.update()
+            return
+        try:
+            result = supabase.auth.verify_otp({
+                "email": recovery_state["email"],
+                "token": code,
+                "type": "recovery"
+            })
+            if not result.session or not result.user:
+                fp_step2_status.value = "Verification failed — check the code and try again."
+                fp_step2_status.color = COLOR_DANGER
+                page.update()
+                return
+
+            # Set the session on the auth client so update_user() (step 3)
+            # can act on it — same pattern as handle_verify_reg_otp — but
+            # deliberately do NOT call cache_user() here: this session is
+            # only for changing the password, not for logging the user
+            # into the app. The user still logs in normally afterward.
+            supabase.auth.set_session(result.session.access_token, result.session.refresh_token)
+            recovery_state["session"] = result.session
+
+            fp_step2_status.value = ""
+            fp_step2.visible = False
+            fp_step3.visible = True
+            page.update()
+        except Exception as ex:
+            msg = str(ex).lower()
+            if "expired" in msg or "invalid" in msg:
+                fp_step2_status.value = "That code is invalid or expired. Tap Resend for a new one."
+            else:
+                fp_step2_status.value = f"Verification failed: {str(ex)}"
+            fp_step2_status.color = COLOR_DANGER
+            page.update()
+
+    def handle_reset_password_from_recovery(e):
+        new_password = input_fp_new_password.value or ""
+        confirm_password = input_fp_confirm_password.value or ""
+        if not new_password or not confirm_password:
+            fp_step3_status.value = "Please fill in both password fields."
+            fp_step3_status.color = COLOR_DANGER
+            page.update()
+            return
+        if len(new_password) < 6:
+            fp_step3_status.value = "Password must be at least 6 characters."
+            fp_step3_status.color = COLOR_DANGER
+            page.update()
+            return
+        if new_password != confirm_password:
+            fp_step3_status.value = "Passwords do not match."
+            fp_step3_status.color = COLOR_DANGER
+            page.update()
+            return
+        try:
+            # Defensive re-assert of the recovery session before the
+            # password update, mirroring handle_finalize_registration's
+            # own belt-and-braces set_session call before update_user().
+            if recovery_state.get("session"):
+                try:
+                    supabase.auth.set_session(
+                        recovery_state["session"].access_token,
+                        recovery_state["session"].refresh_token
+                    )
+                except Exception as ex:
+                    print(f"set_session before recovery password update warning: {ex}")
+
+            supabase.auth.update_user({"password": new_password})
+
+            # This transient verification session's only job was to
+            # authorize the password change. Sign it out now so it can
+            # never be confused with — or persist alongside — the user's
+            # normal app session; they log in fresh from here.
+            try:
+                supabase.auth.sign_out()
+            except Exception as ex:
+                print(f"Post-reset sign-out warning: {ex}")
+            recovery_state["session"] = None
+
+            fp_step3_status.value = "Password changed successfully! ✅"
+            fp_step3_status.color = COLOR_SUCCESS
+            page.update()
+        except Exception as ex:
+            fp_step3_status.value = f"Couldn't change password: {str(ex)}"
+            fp_step3_status.color = COLOR_DANGER
+            page.update()
+
+    fp_step1 = ft.Column([
+        ft.Text("Reset Your Password", size=18, weight=ft.FontWeight.BOLD, color="white"),
+        ft.Text("Enter your email or username", color=COLOR_TEXT_MUTED, size=12),
+        input_fp_identifier,
+        ft.ElevatedButton(content=ft.Text("Send Code", color="white"), on_click=handle_send_recovery_code, width=300, bgcolor=COLOR_SUCCESS),
+        fp_step1_status,
+        ft.TextButton(content=ft.Text("Back to Login", color=COLOR_TEXT_MUTED), on_click=back_to_login_from_recovery)
+    ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+
+    fp_step2 = ft.Column([
+        ft.Text("Enter the 6-digit code", size=18, weight=ft.FontWeight.BOLD, color="white"),
+        input_fp_otp,
+        ft.ElevatedButton(content=ft.Text("Verify Code", color="white"), on_click=handle_verify_recovery_otp, width=300, bgcolor=COLOR_SUCCESS),
+        fp_step2_status,
+        ft.TextButton(content=ft.Text("Resend code", color=COLOR_TEXT_MUTED, size=12), on_click=handle_resend_recovery_code),
+        ft.TextButton(content=ft.Text("Back to Login", color=COLOR_TEXT_MUTED), on_click=back_to_login_from_recovery)
+    ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+
+    fp_step3 = ft.Column([
+        ft.Text("Create New Password", size=18, weight=ft.FontWeight.BOLD, color="white"),
+        input_fp_new_password,
+        input_fp_confirm_password,
+        ft.ElevatedButton(content=ft.Text("Update Password", color="white"), on_click=handle_reset_password_from_recovery, width=300, bgcolor=COLOR_SUCCESS),
+        fp_step3_status,
+        ft.TextButton(content=ft.Text("Back to Login", color=COLOR_TEXT_MUTED), on_click=back_to_login_from_recovery)
+    ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+
     layout_login_form = ft.Column([
         input_login_email,
         input_login_password,
         ft.ElevatedButton(content=ft.Text("Log In", color="white"), on_click=handle_login, width=300, bgcolor=COLOR_PRIMARY),
+        ft.TextButton(content=ft.Text("Forgot Password?", color=COLOR_TEXT_MUTED), on_click=switch_to_forgot_password),
         ft.TextButton(content=ft.Text("New here? Create an account", color=COLOR_TEXT_MUTED), on_click=switch_to_register),
         ft.TextButton(content=ft.Text("Resend confirmation email", color=COLOR_TEXT_MUTED, size=12), on_click=handle_resend_confirmation)
     ], horizontal_alignment=ft.CrossAxisAlignment.CENTER)
@@ -3807,6 +4073,9 @@ We may update these terms; continued use of the app means you accept the changes
         reg_step1,
         reg_step2,
         reg_step3,
+        fp_step1,
+        fp_step2,
+        fp_step3,
         ui_message
     ], horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
