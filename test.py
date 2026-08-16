@@ -345,7 +345,7 @@ async def main(page: ft.Page):
     def get_posts():
         try:
             resp = safe_supabase_call(
-                lambda: supabase.table("posts").select("*").order("created_at", desc=True).limit(50).execute()
+                lambda: supabase.rpc("get_visible_posts", {}).execute()
             )
             return resp.data if resp else []
         except Exception as e:
@@ -442,8 +442,6 @@ async def main(page: ft.Page):
                 result = safe_supabase_call(
                     lambda: supabase.rpc("add_post_comment", {
                         "p_post_id": post_id,
-                        "p_user_id": get_cached_user_id(),
-                        "p_username": user_cache.get("username", "Unknown"),
                         "p_content": content
                     }).execute()
                 )
@@ -615,8 +613,7 @@ async def main(page: ft.Page):
             cleanup_post_media(post)
             result = safe_supabase_call(
                 lambda: supabase.rpc("delete_own_post", {
-                    "p_post_id": post["id"],
-                    "p_user_id": user_id
+                    "p_post_id": post["id"]
                 }).execute()
             )
             if result is None:
@@ -696,7 +693,7 @@ async def main(page: ft.Page):
     def get_whisper_posts():
         try:
             resp = safe_supabase_call(
-                lambda: supabase.table("posts").select("*").eq("is_anonymous", True).order("created_at", desc=True).limit(50).execute()
+                lambda: supabase.rpc("get_visible_posts", {"p_only_anonymous": True}).execute()
             )
             return resp.data if resp else []
         except Exception as e:
@@ -707,6 +704,12 @@ async def main(page: ft.Page):
     public_feed_layout = ft.Column(spacing=10)
     friends_layout = ft.Column(spacing=8, scroll=ft.ScrollMode.ALWAYS, height=400)
     whisper_feed_layout = ft.Column(spacing=10)
+    # Session-local only — never persisted, never synced. Populated solely by
+    # successful admin_reveal_whisper_author() calls; the durable audit trail
+    # lives server-side in whisper_reveal_log, not here.
+    whisper_reveal_state = {}       # {post_id: revealed_username}
+    whisper_reveal_inprogress = set()  # post_ids with a reveal RPC currently in flight
+
 
     # ============================================================
     # --- INLINE VIDEO PLAYBACK ----------------------------------
@@ -826,7 +829,7 @@ async def main(page: ft.Page):
             comment_btn = ft.IconButton(
                 icon=ft.Icons.CHAT_BUBBLE_OUTLINE_ROUNDED,
                 icon_color=COLOR_TEXT_FAINT, icon_size=18,
-                on_click=lambda e, pid=post_id, uname=p.get("username","Unknown"), owner=p.get("user_id"): open_comments_dialog(pid, uname, owner)
+                on_click=lambda e, pid=post_id, uname=p.get("username") or "Unknown", owner=p.get("user_id"): open_comments_dialog(pid, uname, owner)
             )
 
             share_btn = ft.IconButton(
@@ -940,7 +943,7 @@ async def main(page: ft.Page):
             )
         page.update()
 
-    def render_whisper_feed(reveal_names=False):
+    def render_whisper_feed():
         whisper_feed_layout.controls.clear()
         blocked = get_blocked_ids()
         posts = [w for w in get_whisper_posts() if w.get("user_id") not in blocked]
@@ -949,18 +952,73 @@ async def main(page: ft.Page):
                 ft.Text("No secrets yet. Be the first to share one!", color=COLOR_TEXT_MUTED, size=12)
             )
         for w in posts:
-            real_name = w.get("username", "Unknown")
-            display_tag = f"Anonymous Ghost [Real: {real_name}]" if reveal_names else "Anonymous Ghost \U0001F47B"
-            header_color = COLOR_WARNING if reveal_names else COLOR_DANGER
+            post_id = w.get("id")
+            revealed_name = whisper_reveal_state.get(post_id)
+            is_revealed = revealed_name is not None
+            display_tag = f"Anonymous Ghost [Real: {revealed_name}]" if is_revealed else "Anonymous Ghost \U0001F47B"
+            header_color = COLOR_WARNING if is_revealed else COLOR_DANGER
+
+            header_controls = [
+                ft.Icon(ft.Icons.SECURITY_ROUNDED, color=header_color),
+                ft.Text(display_tag, weight=ft.FontWeight.BOLD, color=header_color)
+            ]
+
+            # Reveal control is admin-only for UI purposes; the real boundary is
+            # server-side inside admin_reveal_whisper_author() (auth.uid() check
+            # against admin_users). Only shown while not yet revealed this session.
+            if user_cache.get("is_admin") and not is_revealed:
+                if post_id in whisper_reveal_inprogress:
+                    header_controls.append(ft.ProgressRing(width=14, height=14, stroke_width=2))
+                else:
+                    header_controls.append(
+                        ft.IconButton(
+                            icon=ft.Icons.VISIBILITY_ROUNDED, icon_color=COLOR_WARNING, icon_size=16,
+                            tooltip="Reveal author (admin)",
+                            on_click=lambda e, pid=post_id: handle_reveal_whisper_author(pid)
+                        )
+                    )
+
             whisper_feed_layout.controls.append(
                 ft.Container(
                     content=ft.Column([
-                        ft.Row([ft.Icon(ft.Icons.SECURITY_ROUNDED, color=header_color), ft.Text(display_tag, weight=ft.FontWeight.BOLD, color=header_color)]),
+                        ft.Row(header_controls),
                         ft.Text(w.get("content", ""), color=COLOR_TEXT_BODY)
                     ]), padding=SPACE_LG, bgcolor=COLOR_WHISPER, border_radius=RADIUS_MD, width=340
                 )
             )
         page.update()
+
+    def handle_reveal_whisper_author(post_id):
+        if post_id in whisper_reveal_inprogress:
+            return  # a reveal for this exact post is already in flight — ignore repeat taps
+        whisper_reveal_inprogress.add(post_id)
+        render_whisper_feed()  # swap that post's button for a progress indicator immediately
+        try:
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("admin_reveal_whisper_author", {"p_whisper_post_id": post_id}).execute()
+            )
+            if resp is None:
+                whisper_status_text.value = "Your session expired — please log in again."
+                whisper_status_text.color = COLOR_DANGER
+            elif resp.data:
+                row = resp.data[0] if isinstance(resp.data, list) else resp.data
+                uname = row.get("username") if isinstance(row, dict) else None
+                if uname:
+                    whisper_reveal_state[post_id] = uname
+                else:
+                    whisper_status_text.value = "Couldn't reveal author — try again."
+                    whisper_status_text.color = COLOR_DANGER
+            else:
+                whisper_status_text.value = "Couldn't reveal author — try again."
+                whisper_status_text.color = COLOR_DANGER
+        except Exception as ex:
+            print(f"Whisper reveal error: {ex}")
+            whisper_status_text.value = f"Couldn't reveal author: {str(ex)}"
+            whisper_status_text.color = COLOR_DANGER
+        finally:
+            whisper_reveal_inprogress.discard(post_id)
+            render_whisper_feed()
+            page.update()
 
     def handle_post_whisper(e):
         content = (whisper_text_box.value or "").strip()
@@ -989,7 +1047,7 @@ async def main(page: ft.Page):
             whisper_status_text.value = "Secret posted! 🤫"
             whisper_status_text.color = COLOR_SUCCESS
             page.update()
-            render_whisper_feed(reveal_names=creator_admin_switch.value)
+            render_whisper_feed()
         except Exception as ex:
             whisper_status_text.value = f"Failed to post: {str(ex)}"
             whisper_status_text.color = COLOR_DANGER
@@ -1141,7 +1199,7 @@ async def main(page: ft.Page):
 
     def nav_to_secrets(e):
         set_panel_visibility(secrets=True)
-        render_whisper_feed(reveal_names=creator_admin_switch.value)
+        render_whisper_feed()
         highlight_nav("secrets")
 
     def nav_to_chats(e):
@@ -1253,46 +1311,73 @@ async def main(page: ft.Page):
         load_blocked_list()
         page.update()
 
+    def open_admin_from_menu(dlg):
+        close_menu_dialog(dlg)
+        nav_to_admin(None)
+
     def open_main_menu(e):
+        # Built as a list (rather than inline in the Column) so the
+        # Admin Console entry can be inserted conditionally -- it's the
+        # ONLY new branch here; every other item is unchanged.
+        menu_items = [
+            ft.ListTile(
+                leading=ft.Icon(ft.Icons.PERSON_ROUNDED, color=COLOR_PRIMARY),
+                title=ft.Text("Profile", color="white"),
+                subtitle=ft.Text("Edit your bio, avatar & school", color=COLOR_TEXT_MUTED, size=11),
+                on_click=lambda ev: open_profile_from_menu(dlg)
+            ),
+            ft.ListTile(
+                leading=ft.Icon(ft.Icons.SETTINGS_ROUNDED, color=COLOR_PRIMARY),
+                title=ft.Text("Settings", color="white"),
+                subtitle=ft.Text("Change password, email & more", color=COLOR_TEXT_MUTED, size=11),
+                on_click=lambda ev: open_settings_from_menu(dlg)
+            ),
+            ft.ListTile(
+                leading=ft.Icon(ft.Icons.BLOCK_ROUNDED, color=COLOR_DANGER),
+                title=ft.Text("Blocked Users", color="white"),
+                on_click=lambda ev: open_blocked_users_dialog(dlg)
+            ),
+            ft.ListTile(
+                leading=ft.Icon(ft.Icons.DESCRIPTION_ROUNDED, color=COLOR_TEXT_MUTED),
+                title=ft.Text("Terms & Privacy Policy", color="white"),
+                on_click=lambda ev: open_terms_dialog()
+            ),
+        ]
+
+        # Admin Console entry appears ONLY when am_i_admin() (the sole
+        # source of truth, refreshed at login and session restore) most
+        # recently returned is_admin=True. Never derived from username,
+        # email, or a hardcoded UID -- a normal user simply never sees
+        # this branch execute.
+        if user_cache.get("is_admin"):
+            menu_items.append(
+                ft.ListTile(
+                    leading=ft.Icon(ft.Icons.ADMIN_PANEL_SETTINGS_ROUNDED, color=COLOR_WARNING),
+                    title=ft.Text("Admin Console", color="white"),
+                    subtitle=ft.Text(user_cache.get("admin_role") or "Admin", color=COLOR_TEXT_MUTED, size=11),
+                    on_click=lambda ev: open_admin_from_menu(dlg)
+                )
+            )
+
+        menu_items.append(
+            ft.ListTile(
+                leading=ft.Icon(ft.Icons.LOGOUT_ROUNDED, color=COLOR_DANGER),
+                title=ft.Text("Log Out", color=COLOR_DANGER),
+                on_click=lambda ev: handle_logout_from_menu(dlg)
+            )
+        )
+
         dlg = ft.AlertDialog(
             title=ft.Text("Menu", color="white", size=16),
             bgcolor=COLOR_CARD,
-            content=ft.Column([
-                ft.ListTile(
-                    leading=ft.Icon(ft.Icons.PERSON_ROUNDED, color=COLOR_PRIMARY),
-                    title=ft.Text("Profile", color="white"),
-                    subtitle=ft.Text("Edit your bio, avatar & school", color=COLOR_TEXT_MUTED, size=11),
-                    on_click=lambda ev: open_profile_from_menu(dlg)
-                ),
-                ft.ListTile(
-                    leading=ft.Icon(ft.Icons.SETTINGS_ROUNDED, color=COLOR_PRIMARY),
-                    title=ft.Text("Settings", color="white"),
-                    subtitle=ft.Text("Change password, email & more", color=COLOR_TEXT_MUTED, size=11),
-                    on_click=lambda ev: open_settings_from_menu(dlg)
-                ),
-                ft.ListTile(
-                    leading=ft.Icon(ft.Icons.BLOCK_ROUNDED, color=COLOR_DANGER),
-                    title=ft.Text("Blocked Users", color="white"),
-                    on_click=lambda ev: open_blocked_users_dialog(dlg)
-                ),
-                ft.ListTile(
-                    leading=ft.Icon(ft.Icons.DESCRIPTION_ROUNDED, color=COLOR_TEXT_MUTED),
-                    title=ft.Text("Terms & Privacy Policy", color="white"),
-                    on_click=lambda ev: open_terms_dialog()
-                ),
-                ft.ListTile(
-                    leading=ft.Icon(ft.Icons.LOGOUT_ROUNDED, color=COLOR_DANGER),
-                    title=ft.Text("Log Out", color=COLOR_DANGER),
-                    on_click=lambda ev: handle_logout_from_menu(dlg)
-                ),
-            ], tight=True, width=DIALOG_WIDTH),
+            content=ft.Column(menu_items, tight=True, width=DIALOG_WIDTH),
             actions=[ft.TextButton("Close", on_click=lambda ev: close_menu_dialog(dlg))]
         )
         page.overlay.append(dlg)
         dlg.open = True
         page.update()
 
-    def set_panel_visibility(feed=False, secrets=False, chats=False, people=False, reels=False, notifications=False, profile=False):
+    def set_panel_visibility(feed=False, secrets=False, chats=False, people=False, reels=False, notifications=False, profile=False, admin=False):
         if not chats:
             chat_state["polling_active"] = False
             chat_state["inbox_polling_active"] = False
@@ -1303,6 +1388,7 @@ async def main(page: ft.Page):
         panel_reels.visible          = reels
         panel_notifications.visible  = notifications
         panel_settings.visible       = profile
+        panel_admin.visible          = admin
         panel_view_profile.visible   = False
         page.update()
 
@@ -1555,11 +1641,9 @@ async def main(page: ft.Page):
     # --- TAB 2: SECRETS ---
     whisper_text_box = ft.TextField(hint_text="Share a school secret anonymously...", width=260, dense=True, color="white")
     whisper_status_text = ft.Text("", size=11)
-    creator_admin_switch = ft.Switch(value=False, on_change=lambda e: render_whisper_feed(reveal_names=creator_admin_switch.value))
 
     panel_whisper_wall = ft.Column([
         ft.Text("The Whisper Wall \U0001F92B", size=18, weight=ft.FontWeight.BOLD, color=COLOR_DANGER),
-        ft.Row([ft.Text("Creator Key (Reveal Identity)", color="white"), creator_admin_switch], alignment=ft.MainAxisAlignment.CENTER),
         ft.Row([whisper_text_box, ft.IconButton(icon=ft.Icons.SEND_ROUNDED, icon_color=COLOR_DANGER, on_click=handle_post_whisper)], alignment=ft.MainAxisAlignment.CENTER),
         whisper_status_text,
         ft.Divider(height=10, color=COLOR_BORDER),
@@ -1567,7 +1651,8 @@ async def main(page: ft.Page):
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
     # --- GLOBAL USER STATE CACHE ---
-    user_cache = {"id": None, "email": None, "username": None, "access_token": None}
+    user_cache = {"id": None, "email": None, "username": None, "access_token": None,
+                  "is_admin": False, "admin_role": None}
 
     def cache_user(user_obj, access_token=None):
         """Store the user's info and force the PostgREST client to use
@@ -1584,9 +1669,34 @@ async def main(page: ft.Page):
             user_cache["email"] = None
             user_cache["username"] = None
             user_cache["access_token"] = None
+            user_cache["is_admin"] = False
+            user_cache["admin_role"] = None
 
         blocked_ids_cache["ids"] = set()
         blocked_ids_cache["loaded"] = False
+
+    def refresh_admin_status():
+        """Resolves admin status from the am_i_admin() RPC -- the ONLY
+        source of truth for is_admin/admin_role. Never derives this from
+        username, email, or any hardcoded UID. Fails closed: any RPC
+        error, missing session, or unexpected response shape leaves the
+        user as a normal (non-admin) user instead of crashing or
+        defaulting to admin access."""
+        user_cache["is_admin"] = False
+        user_cache["admin_role"] = None
+        if not get_cached_user_id():
+            return
+        try:
+            resp = safe_supabase_call(lambda: supabase.rpc("am_i_admin", {}).execute())
+            if resp is None or not resp.data:
+                return  # session died (safe_supabase_call already handled it) or empty response — stay non-admin
+            row = resp.data[0] if isinstance(resp.data, list) else resp.data
+            user_cache["is_admin"] = bool(row.get("is_admin"))
+            user_cache["admin_role"] = row.get("role")
+        except Exception as ex:
+            print(f"Admin status check failed — treating as non-admin: {ex}")
+            user_cache["is_admin"] = False
+            user_cache["admin_role"] = None
 
     def refresh_cached_username(user_id):
         try:
@@ -1650,7 +1760,7 @@ async def main(page: ft.Page):
             return False
         try:
             result = safe_supabase_call(
-                lambda: supabase.rpc("block_user", {"p_blocker_id": user_id, "p_blocked_id": target_user_id}).execute()
+                lambda: supabase.rpc("block_user", {"p_blocked_id": target_user_id}).execute()
             )
             if result is None:
                 return False
@@ -1666,7 +1776,7 @@ async def main(page: ft.Page):
             return False
         try:
             result = safe_supabase_call(
-                lambda: supabase.rpc("unblock_user", {"p_blocker_id": user_id, "p_blocked_id": target_user_id}).execute()
+                lambda: supabase.rpc("unblock_user", {"p_blocked_id": target_user_id}).execute()
             )
             if result is None:
                 return False
@@ -1683,7 +1793,7 @@ async def main(page: ft.Page):
         try:
             result = safe_supabase_call(
                 lambda: supabase.rpc("report_post", {
-                    "p_post_id": post_id, "p_reporter_id": user_id, "p_reason": reason
+                    "p_post_id": post_id, "p_reason": reason
                 }).execute()
             )
             return result is not None
@@ -1698,7 +1808,7 @@ async def main(page: ft.Page):
         try:
             result = safe_supabase_call(
                 lambda: supabase.rpc("report_user", {
-                    "p_reported_user_id": target_user_id, "p_reporter_id": user_id, "p_reason": reason
+                    "p_reported_user_id": target_user_id, "p_reason": reason
                 }).execute()
             )
             return result is not None
@@ -1714,7 +1824,6 @@ async def main(page: ft.Page):
         try:
             resp = safe_supabase_call(
                 lambda: supabase.rpc("send_connection_request", {
-                    "p_requester_id": user_id,
                     "p_recipient_id": target_user_id
                 }).execute()
             )
@@ -1732,7 +1841,6 @@ async def main(page: ft.Page):
             resp = safe_supabase_call(
                 lambda: supabase.rpc("respond_connection_request", {
                     "p_request_id": request_id,
-                    "p_user_id": user_id,
                     "p_accept": accept
                 }).execute()
             )
@@ -1967,7 +2075,6 @@ async def main(page: ft.Page):
             result = safe_supabase_call(
                 lambda: supabase.rpc("send_chat_message", {
                     "p_conversation_id": conversation_id,
-                    "p_sender_id": user_id,
                     "p_content": content.strip()
                 }).execute()
             )
@@ -2749,8 +2856,6 @@ async def main(page: ft.Page):
             result = safe_supabase_call(
                 lambda: supabase.rpc("add_post_comment", {
                     "p_post_id": post["id"],
-                    "p_user_id": get_cached_user_id(),
-                    "p_username": user_cache.get("username", "Unknown"),
                     "p_content": content
                 }).execute()
             )
@@ -3485,6 +3590,45 @@ async def main(page: ft.Page):
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
     # ============================================================
+    # --- ADMIN CONSOLE (stub) ------------------------------------
+    # Deliberately minimal for this stage: no moderation actions live
+    # here yet (no bans, suspensions, report review, post removal).
+    # Access is gated entirely by user_cache["is_admin"], which is set
+    # ONLY by refresh_admin_status() calling the am_i_admin() RPC --
+    # never by username/email/hardcoded UID. This panel is a fully
+    # separate screen from every normal-user panel above; it shares no
+    # controls or state with them.
+    # ============================================================
+    admin_role_text = ft.Text("", color=COLOR_TEXT_MUTED, size=13)
+
+    def close_admin_panel(e):
+        panel_admin.visible = False
+        set_panel_visibility(feed=True)
+        render_public_feed()
+
+    panel_admin = ft.Column([
+        ft.Row([
+            ft.IconButton(icon=ft.Icons.ARROW_BACK_ROUNDED, icon_color=COLOR_WARNING, on_click=close_admin_panel),
+            ft.Text("Admin Console", size=18, weight=ft.FontWeight.BOLD, color="white")
+        ]),
+        ft.Container(
+            content=ft.Column([
+                ft.Icon(ft.Icons.ADMIN_PANEL_SETTINGS_ROUNDED, color=COLOR_WARNING, size=48),
+                ft.Text("UNIVAS Admin Console", size=18, weight=ft.FontWeight.BOLD, color="white"),
+                admin_role_text,
+            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=8),
+            padding=SPACE_LG, bgcolor=COLOR_CARD, border_radius=RADIUS_MD, width=340,
+            alignment=ft.Alignment.CENTER
+        ),
+    ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=16)
+
+    def nav_to_admin(e):
+        role_label = (user_cache.get("admin_role") or "Admin").replace("_", " ").title()
+        admin_role_text.value = f"Role: {role_label}"
+        set_panel_visibility(admin=True)
+        highlight_nav("admin")
+
+    # ============================================================
     # --- AUTH: LOGIN / REGISTER (email + password, no OTP) ---
     # ============================================================
     input_login_email = ft.TextField(label="Email or Username", width=300, color="white")
@@ -3592,6 +3736,7 @@ async def main(page: ft.Page):
                 "password": input_login_password.value
             })
             cache_user(result.user, result.session.access_token)
+            refresh_admin_status()
             await save_session(result.session, result.user)
             ui_message.value = ""
             show_dashboard()
@@ -4140,7 +4285,8 @@ We may update these terms; continued use of the app means you accept the changes
         panel_reels,
         panel_notifications,
         panel_settings,
-        panel_view_profile
+        panel_view_profile,
+        panel_admin
     ], visible=False, horizontal_alignment="center")
 
     async def try_restore_session():
@@ -4200,6 +4346,7 @@ We may update these terms; continued use of the app means you accept the changes
                 else:
                     refresh_cached_username(user_id)
 
+                refresh_admin_status()
                 show_dashboard()
                 return True
         except Exception as ex:
