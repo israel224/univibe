@@ -2005,9 +2005,7 @@ async def main(page: ft.Page):
             return []
         try:
             resp = safe_supabase_call(
-                lambda: supabase.rpc("get_user_conversations", {
-                    "p_user_id": user_id
-                }).execute()
+                lambda: supabase.rpc("get_user_conversations", {}).execute()
             )
             return (resp.data if resp else []) or []
         except Exception as e:
