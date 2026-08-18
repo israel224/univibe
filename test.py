@@ -359,8 +359,7 @@ async def main(page: ft.Page):
         try:
             resp = safe_supabase_call(
                 lambda: supabase.rpc("get_post_likes", {
-                    "p_post_ids": post_ids,
-                    "p_user_id": get_cached_user_id() or "00000000-0000-0000-0000-000000000000"
+                    "p_post_ids": post_ids
                 }).execute()
             )
             return {r["post_id"]: r for r in (resp.data or [])} if resp else {}
@@ -372,8 +371,7 @@ async def main(page: ft.Page):
         try:
             resp = safe_supabase_call(
                 lambda: supabase.rpc("toggle_post_like", {
-                    "p_post_id": post_id,
-                    "p_user_id": get_cached_user_id()
+                    "p_post_id": post_id
                 }).execute()
             )
             if resp is None:
@@ -1126,7 +1124,7 @@ async def main(page: ft.Page):
             return
         try:
             resp = safe_supabase_call(
-                lambda: supabase.rpc("get_notifications", {"p_user_id": user_id}).execute()
+                lambda: supabase.rpc("get_notifications", {}).execute()
             )
             notifs = resp.data if resp else []
             notifs = notifs or []
@@ -1160,7 +1158,7 @@ async def main(page: ft.Page):
             return
         try:
             resp = safe_supabase_call(
-                lambda: supabase.rpc("get_unread_notification_count", {"p_user_id": user_id}).execute()
+                lambda: supabase.rpc("get_unread_notification_count", {}).execute()
             )
             count = (resp.data if resp else 0) or 0
             if count and count > 0:
@@ -1234,7 +1232,7 @@ async def main(page: ft.Page):
         if user_id:
             try:
                 safe_supabase_call(
-                    lambda: supabase.rpc("mark_notifications_read", {"p_user_id": user_id}).execute()
+                    lambda: supabase.rpc("mark_notifications_read", {}).execute()
                 )
             except Exception as ex:
                 print(f"Mark read error: {ex}")
