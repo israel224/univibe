@@ -1744,7 +1744,7 @@ async def main(page: ft.Page):
             return blocked_ids_cache["ids"]
         try:
             resp = safe_supabase_call(
-                lambda: supabase.rpc("get_blocked_user_ids", {"p_user_id": user_id}).execute()
+                lambda: supabase.rpc("get_blocked_user_ids", {}).execute()
             )
             blocked_ids_cache["ids"] = {row["blocked_id"] for row in ((resp.data if resp else []) or [])}
             blocked_ids_cache["loaded"] = True
