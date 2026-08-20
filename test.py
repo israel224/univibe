@@ -1874,7 +1874,7 @@ async def main(page: ft.Page):
             return []
         try:
             resp = safe_supabase_call(
-                lambda: supabase.rpc("get_pending_connection_requests", {"p_user_id": user_id}).execute()
+                lambda: supabase.rpc("get_pending_connection_requests", {}).execute()
             )
             return (resp.data if resp else []) or []
         except Exception as ex:
