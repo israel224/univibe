@@ -2037,7 +2037,6 @@ async def main(page: ft.Page):
 
             result = safe_supabase_call(
                 lambda: supabase.rpc("create_conversation_between", {
-                    "p_user1": user_id,
                     "p_user2": target_uid
                 }).execute()
             )
