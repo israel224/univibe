@@ -384,8 +384,7 @@ async def main(page: ft.Page):
             like_btn.icon_color = COLOR_DANGER if now_liked else COLOR_TEXT_FAINT
             page.update()
             if now_liked:
-                create_notification(post_owner_id, "like",
-                                    f"{user_cache.get('username','Someone')} liked your post", post_id)
+                create_notification(post_owner_id, "like", post_id)
         except Exception as ex:
             print(f"Like error: {ex}")
 
@@ -449,8 +448,7 @@ async def main(page: ft.Page):
                     return  # session died — force_reauth() already fired
                 comment_input.value = ""
                 load_comments()  # already calls page.update()
-                create_notification(post_owner_id, "comment",
-                                    f"{user_cache.get('username','Someone')} commented on your post", post_id)
+                create_notification(post_owner_id, "comment", post_id)
             except Exception as ex:
                 send_btn.disabled = False
                 status.value = f"Couldn't post comment: {str(ex)}"
@@ -1713,7 +1711,7 @@ async def main(page: ft.Page):
         """Return the cached user ID, or None if not logged in."""
         return user_cache["id"]
 
-    def create_notification(recipient_id, notif_type, message, post_id=None):
+    def create_notification(recipient_id, notif_type, post_id=None):
         """Fires a notification via RPC. Silently skips if recipient is the
         actor themself (no self-notifications) or not logged in."""
         if not recipient_id or recipient_id == get_cached_user_id():
@@ -1722,9 +1720,7 @@ async def main(page: ft.Page):
             safe_supabase_call(
                 lambda: supabase.rpc("create_notification", {
                     "p_recipient_id": recipient_id,
-                    "p_actor_username": user_cache.get("username", "Someone"),
                     "p_type": notif_type,
-                    "p_message": message,
                     "p_post_id": post_id
                 }).execute()
             )
@@ -2084,8 +2080,7 @@ async def main(page: ft.Page):
                 for part in (parts.data if parts else []) or []:
                     other_id = part.get("user_id")
                     if other_id and other_id != user_id:
-                        create_notification(other_id, "message",
-                                            f"{user_cache.get('username','Someone')} sent you a message")
+                        create_notification(other_id, "message")
             except Exception as notif_ex:
                 print(f"Message notification error: {notif_ex}")
             return True, None
@@ -2857,8 +2852,7 @@ async def main(page: ft.Page):
                 return
             post_viewer_comment_input.value = ""
             load_post_viewer_comments(post["id"])
-            create_notification(post.get("user_id"), "comment",
-                                f"{user_cache.get('username','Someone')} commented on your post", post["id"])
+            create_notification(post.get("user_id"), "comment", post["id"])
         except Exception as ex:
             print(f"post viewer submit comment error: {ex}")
 
