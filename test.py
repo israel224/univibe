@@ -1857,7 +1857,6 @@ async def main(page: ft.Page):
         try:
             resp = safe_supabase_call(
                 lambda: supabase.rpc("get_connection_status", {
-                    "p_user_id": user_id,
                     "p_other_user_id": other_user_id
                 }).execute()
             )
