@@ -3084,12 +3084,12 @@ async def main(page: ft.Page):
                 ft.Container(
                     content=ft.Stack([
                         ft.Container(content=tile_content, width=110, height=110, bgcolor=tile_bg,
-                                    border_radius=RADIUS_SM, alignment=ft.Alignment.CENTER,
-                                    on_click=make_view_handler()),
-                        ft.Container(content=post_menu_btn, alignment=ft.Alignment.TOP_RIGHT),
-                        ft.Container(content=count_badge, alignment=ft.Alignment.BOTTOM_LEFT, padding=6)
+                                    border_radius=RADIUS_SM, alignment=ft.Alignment.CENTER),
+                        ft.Container(content=post_menu_btn, top=0, right=0),
+                        ft.Container(content=count_badge, left=0, bottom=0, padding=6)
                     ], width=110, height=110),
-                    width=110, height=110
+                    width=110, height=110,
+                    on_click=make_view_handler()
                 )
             )
         page.update()
