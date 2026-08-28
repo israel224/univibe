@@ -664,23 +664,16 @@ async def main(page: ft.Page):
         """Fetch registered users, filtered and capped at the database level —
         never pulls the whole profiles table, scales regardless of user count."""
         try:
-            current_id = get_cached_user_id()
             blocked = list(get_blocked_ids())
             # Strip characters that would break Supabase's or_() filter syntax
             q = (search_query or "").strip().replace(",", "").replace("%", "")
 
-            query = supabase.table("profiles").select("user_id, username, country, state, department, avatar_url")
-
-            if q:
-                query = query.ilike("username", f"%{q}%")
-
-            if current_id:
-                query = query.neq("user_id", current_id)
-
-            if blocked:
-                query = query.not_.in_("user_id", blocked)
-
-            resp = safe_supabase_call(lambda: query.order("username").limit(50).execute())
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("get_public_profiles", {
+                    "p_username_search": q or None,
+                    "p_exclude_ids": blocked or None
+                }).execute()
+            )
             return resp.data if resp else []
         except Exception as e:
             print(f"Error fetching users: {e}")
@@ -1274,7 +1267,7 @@ async def main(page: ft.Page):
                 return
             try:
                 resp = safe_supabase_call(
-                    lambda: supabase.table("profiles").select("user_id, username").in_("user_id", ids).execute()
+                    lambda: supabase.rpc("get_public_profiles", {"p_user_ids": ids}).execute()
                 )
                 for u in (resp.data if resp else []) or []:
                     def make_unblock(target=u.get("user_id"), uname=u.get("username", "Unknown")):
@@ -2015,7 +2008,7 @@ async def main(page: ft.Page):
             cleaned_username = (target_username or "").strip().lstrip("@")
 
             profile_resp = safe_supabase_call(
-                lambda: supabase.table("profiles").select("user_id, username").ilike("username", cleaned_username).execute()
+                lambda: supabase.rpc("get_public_profiles", {"p_username_exact": cleaned_username}).execute()
             )
             if profile_resp is None:
                 return None, "Your session expired — please log in again."
@@ -2493,8 +2486,7 @@ async def main(page: ft.Page):
             if not other_ids:
                 return []
             profiles_resp = safe_supabase_call(
-                lambda: supabase.table("profiles")
-                    .select("user_id, username, avatar_url").in_("user_id", other_ids).execute()
+                lambda: supabase.rpc("get_public_profiles", {"p_user_ids": other_ids}).execute()
             )
             if profiles_resp is None:
                 return None
@@ -3344,7 +3336,7 @@ async def main(page: ft.Page):
     def load_other_profile(username):
         try:
             resp = safe_supabase_call(
-                lambda: supabase.table("profiles").select("*").eq("username", username).execute()
+                lambda: supabase.rpc("get_public_profiles", {"p_username_exact": username}).execute()
             )
             if not resp or not resp.data:
                 return
@@ -3705,19 +3697,18 @@ async def main(page: ft.Page):
             if "@" in login_input:
                 login_email = login_input
             else:
-                # Treat as username — resolve to the account's email via profiles.
-                # Uses safe_supabase_call even though there's no user session yet
-                # (this table read runs on the anon key) purely for consistency —
-                # it's a no-op wrapper here since there's no JWT to expire.
+                # Treat as username — resolve to the account's email via the
+                # narrow get_email_for_login RPC (never reads profiles.email
+                # directly; profiles' SELECT policy is now owner-only).
                 lookup = safe_supabase_call(
-                    lambda: supabase.table("profiles").select("email").eq("username", login_input).execute()
+                    lambda: supabase.rpc("get_email_for_login", {"p_username": login_input}).execute()
                 )
-                if not lookup or not lookup.data or not lookup.data[0].get("email"):
+                if not lookup or not lookup.data:
                     ui_message.value = "No account found for that username."
                     ui_message.color = COLOR_DANGER
                     page.update()
                     return
-                login_email = lookup.data[0]["email"]
+                login_email = lookup.data
 
             result = supabase.auth.sign_in_with_password({
                 "email": login_email,
@@ -4060,23 +4051,25 @@ We may update these terms; continued use of the app means you accept the changes
             if "@" in identifier:
                 recovery_email = identifier
             else:
-                # Username lookup uses the same safe_supabase_call wrapper
-                # as every other authenticated-table read in the app, so a
-                # mid-lookup session hiccup is retried the same way.
+                # Username lookup now goes through the narrow get_email_for_login
+                # RPC (never reads profiles.email directly; profiles' SELECT
+                # policy is owner-only). Uses the same safe_supabase_call
+                # wrapper as every other read in the app, so a mid-lookup
+                # session hiccup is retried the same way.
                 lookup = safe_supabase_call(
-                    lambda: supabase.table("profiles").select("email").ilike("username", identifier).execute()
+                    lambda: supabase.rpc("get_email_for_login", {"p_username": identifier}).execute()
                 )
                 if lookup is None:
                     fp_step1_status.value = "Something went wrong — please try again."
                     fp_step1_status.color = COLOR_DANGER
                     page.update()
                     return
-                if not lookup.data or not lookup.data[0].get("email"):
+                if not lookup.data:
                     fp_step1_status.value = "No account found for that username."
                     fp_step1_status.color = COLOR_DANGER
                     page.update()
                     return
-                recovery_email = lookup.data[0]["email"]
+                recovery_email = lookup.data
 
             # Uses the dedicated password-recovery API (reset_password_for_email)
             # instead of sign_in_with_otp. sign_in_with_otp routes an EXISTING,
