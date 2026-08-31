@@ -3201,15 +3201,18 @@ async def main(page: ft.Page):
             print(f"Compression failed, using original file: {ex}")
             return file_bytes, "application/octet-stream"
 
-    def upload_with_retry(bucket, storage_path, file_bytes, content_type, max_retries=2):
+    def upload_with_retry(bucket, storage_path, file_bytes, content_type, max_retries=2, upsert=False):
         """Retries an upload up to 2 extra times if the connection drops mid-transfer.
         Session-expiry is handled through safe_supabase_call so a dead token during
         upload triggers the same refresh-then-retry path as every other call."""
         last_error = None
+        file_options = {"content-type": content_type}
+        if upsert:
+            file_options["upsert"] = "true"
         for attempt in range(max_retries + 1):
             try:
                 result = safe_supabase_call(
-                    lambda: supabase.storage.from_(bucket).upload(storage_path, file_bytes, {"content-type": content_type})
+                    lambda: supabase.storage.from_(bucket).upload(storage_path, file_bytes, file_options)
                 )
                 if result is None:
                     raise RuntimeError("Session expired during upload — please log in again.")
@@ -3238,11 +3241,7 @@ async def main(page: ft.Page):
             user_id = get_cached_user_id()
             file_bytes, content_type = compress_image_for_upload(f.bytes)
             storage_path = f"{user_id}/avatar.jpg"
-            try:
-                safe_supabase_call(lambda: supabase.storage.from_(AVATARS_BUCKET).remove([storage_path]))
-            except Exception:
-                pass
-            upload_with_retry(AVATARS_BUCKET, storage_path, file_bytes, content_type)
+            upload_with_retry(AVATARS_BUCKET, storage_path, file_bytes, content_type, upsert=True)
             avatar_url = safe_supabase_call(
                 lambda: supabase.storage.from_(AVATARS_BUCKET).get_public_url(storage_path)
             )
