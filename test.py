@@ -3245,6 +3245,13 @@ async def main(page: ft.Page):
             avatar_url = safe_supabase_call(
                 lambda: supabase.storage.from_(AVATARS_BUCKET).get_public_url(storage_path)
             )
+            # Cache-bust only the displayed/stored URL — the underlying storage
+            # path stays fixed at {user_id}/avatar.jpg (upsert overwrites the
+            # same object), but a fixed URL string means the browser/renderer
+            # never sees a reason to re-fetch after a re-upload. Appending a
+            # changing query param makes each upload's URL distinct so the
+            # new image actually gets loaded instead of a cached old one.
+            avatar_url = f"{avatar_url}?t={int(datetime.now(timezone.utc).timestamp())}"
             result = safe_supabase_call(
                 lambda: supabase.table("profiles").update({"avatar_url": avatar_url}).eq("user_id", user_id).execute()
             )
