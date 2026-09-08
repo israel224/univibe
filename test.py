@@ -230,7 +230,12 @@ async def main(page: ft.Page):
     page.window_width = 400
     page.window_height = 780
     page.window_resizable = True
-    page.scroll = ft.ScrollMode.AUTO
+    # Page-level scrolling is intentionally off. With it on, the whole page
+    # (including the dashboard's top header and bottom nav) scrolled as one
+    # unit, so the bottom nav ended up below the fold on the Feed. Instead,
+    # layout_auth_master and the dashboard's middle content area each own
+    # their own scroll region below, while the header/bottom nav stay fixed.
+    page.scroll = None
     page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
     page.bgcolor = "#0f172a"
 
@@ -4282,10 +4287,13 @@ We may update these terms; continued use of the app means you accept the changes
         fp_step2,
         fp_step3,
         ui_message
-    ], horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+    ], horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+       scroll=ft.ScrollMode.AUTO, expand=True)
 
-    layout_dashboard_master = ft.Column([
-        top_header_bar,
+    # Only this middle area scrolls -- top_header_bar and bottom_nav_bar sit
+    # outside it (below) so they stay fixed/visible at all times, the same
+    # existing panels are just wrapped, nothing about them changes.
+    dashboard_scroll_area = ft.Column([
         panel_home_feed,
         panel_whisper_wall,
         panel_messages,
@@ -4294,9 +4302,15 @@ We may update these terms; continued use of the app means you accept the changes
         panel_notifications,
         panel_settings,
         panel_view_profile,
-        panel_admin,
+        panel_admin
+    ], horizontal_alignment="center",
+       scroll=ft.ScrollMode.AUTO, expand=True)
+
+    layout_dashboard_master = ft.Column([
+        top_header_bar,
+        dashboard_scroll_area,
         bottom_nav_bar
-    ], visible=False, horizontal_alignment="center")
+    ], visible=False, horizontal_alignment="center", expand=True, spacing=0)
 
     async def try_restore_session():
         """Restores a saved session on app start, refreshing proactively
