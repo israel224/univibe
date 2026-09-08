@@ -1309,23 +1309,87 @@ async def main(page: ft.Page):
         close_menu_dialog(dlg)
         nav_to_admin(None)
 
+    # --- MAIN MENU GRID: placeholder destinations ---------------
+    # Groups, Pages, Saved, and Events have no backend/feature yet -- each
+    # of these just closes the menu and shows a simple "coming soon" note.
+    # No database logic, no new screens beyond this dialog.
+    def open_coming_soon_dialog(title, message):
+        def close_dlg(d):
+            d.open = False
+            page.update()
+
+        soon_dlg = ft.AlertDialog(
+            title=ft.Text(title, color="white", size=16),
+            bgcolor=COLOR_CARD,
+            content=ft.Text(message, color=COLOR_TEXT_MUTED, size=13),
+            actions=[ft.TextButton("Close", on_click=lambda ev: close_dlg(soon_dlg))]
+        )
+        page.overlay.append(soon_dlg)
+        soon_dlg.open = True
+        page.update()
+
+    def open_groups_from_menu(dlg):
+        close_menu_dialog(dlg)
+        open_coming_soon_dialog("Groups", "Groups are coming soon to UNiVAS. Stay tuned!")
+
+    def open_pages_from_menu(dlg):
+        close_menu_dialog(dlg)
+        open_coming_soon_dialog("Pages", "Pages are coming soon to UNiVAS. Stay tuned!")
+
+    def open_saved_from_menu(dlg):
+        close_menu_dialog(dlg)
+        open_coming_soon_dialog("Saved", "Saved items are coming soon to UNiVAS. Stay tuned!")
+
+    def open_events_from_menu(dlg):
+        close_menu_dialog(dlg)
+        open_coming_soon_dialog("Events", "Events are coming soon to UNiVAS. Stay tuned!")
+
     def open_main_menu(e):
-        # Built as a list (rather than inline in the Column) so the
-        # Admin Console entry can be inserted conditionally -- it's the
-        # ONLY new branch here; every other item is unchanged.
-        menu_items = [
-            ft.ListTile(
-                leading=ft.Icon(ft.Icons.PERSON_ROUNDED, color=COLOR_PRIMARY),
-                title=ft.Text("Profile", color="white"),
-                subtitle=ft.Text("Edit your bio, avatar & school", color=COLOR_TEXT_MUTED, size=11),
-                on_click=lambda ev: open_profile_from_menu(dlg)
-            ),
-            ft.ListTile(
-                leading=ft.Icon(ft.Icons.SETTINGS_ROUNDED, color=COLOR_PRIMARY),
-                title=ft.Text("Settings", color="white"),
-                subtitle=ft.Text("Change password, email & more", color=COLOR_TEXT_MUTED, size=11),
-                on_click=lambda ev: open_settings_from_menu(dlg)
-            ),
+        # Six primary destinations as a responsive 2-column grid, in the
+        # required order: Profile, Groups, Pages, Saved, Events, Settings.
+        # Profile and Settings reuse their exact existing handlers unchanged
+        # (open_profile_from_menu -> nav_to_profile, open_settings_from_menu
+        # -> open_account_settings); Groups/Pages/Saved/Events are UI-only
+        # placeholders. Blocked Users, Terms & Privacy, and the conditional
+        # Admin Console entry are preserved exactly as before, just moved
+        # into a secondary list below the grid so the grid itself holds
+        # exactly the six required items. Logout stays separated at the
+        # very bottom, reusing handle_logout_from_menu unchanged.
+        grid_specs = [
+            (ft.Icons.PERSON_ROUNDED, "Profile", lambda ev: open_profile_from_menu(dlg)),
+            (ft.Icons.GROUP_ROUNDED, "Groups", lambda ev: open_groups_from_menu(dlg)),
+            (ft.Icons.ARTICLE_ROUNDED, "Pages", lambda ev: open_pages_from_menu(dlg)),
+            (ft.Icons.BOOKMARK_ROUNDED, "Saved", lambda ev: open_saved_from_menu(dlg)),
+            (ft.Icons.EVENT_ROUNDED, "Events", lambda ev: open_events_from_menu(dlg)),
+            (ft.Icons.SETTINGS_ROUNDED, "Settings", lambda ev: open_settings_from_menu(dlg)),
+        ]
+
+        def build_grid_card(icon, label, handler):
+            return ft.Container(
+                content=ft.Column([
+                    ft.Icon(icon, color=COLOR_PRIMARY, size=26),
+                    ft.Text(label, color="white", size=13, weight=ft.FontWeight.BOLD)
+                ], spacing=8, horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                   alignment=ft.MainAxisAlignment.CENTER),
+                bgcolor=COLOR_BG, border_radius=RADIUS_MD, padding=SPACE_LG,
+                alignment=ft.Alignment.CENTER, ink=True, on_click=handler,
+                expand=True, height=84
+            )
+
+        menu_grid_rows = []
+        for i in range(0, len(grid_specs), 2):
+            pair = grid_specs[i:i + 2]
+            menu_grid_rows.append(
+                ft.Row(
+                    [build_grid_card(icon, label, handler) for icon, label, handler in pair],
+                    spacing=SPACE_MD
+                )
+            )
+        menu_grid = ft.Column(menu_grid_rows, spacing=SPACE_MD)
+
+        # Secondary items -- unchanged from the previous menu, just no
+        # longer mixed into the primary 6-item grid.
+        secondary_items = [
             ft.ListTile(
                 leading=ft.Icon(ft.Icons.BLOCK_ROUNDED, color=COLOR_DANGER),
                 title=ft.Text("Blocked Users", color="white"),
@@ -1342,9 +1406,9 @@ async def main(page: ft.Page):
         # source of truth, refreshed at login and session restore) most
         # recently returned is_admin=True. Never derived from username,
         # email, or a hardcoded UID -- a normal user simply never sees
-        # this branch execute.
+        # this branch execute. Unchanged from before.
         if user_cache.get("is_admin"):
-            menu_items.append(
+            secondary_items.append(
                 ft.ListTile(
                     leading=ft.Icon(ft.Icons.ADMIN_PANEL_SETTINGS_ROUNDED, color=COLOR_WARNING),
                     title=ft.Text("Admin Console", color="white"),
@@ -1353,18 +1417,25 @@ async def main(page: ft.Page):
                 )
             )
 
-        menu_items.append(
-            ft.ListTile(
-                leading=ft.Icon(ft.Icons.LOGOUT_ROUNDED, color=COLOR_DANGER),
-                title=ft.Text("Log Out", color=COLOR_DANGER),
-                on_click=lambda ev: handle_logout_from_menu(dlg)
-            )
+        logout_row = ft.Container(
+            content=ft.Row([
+                ft.Icon(ft.Icons.LOGOUT_ROUNDED, color=COLOR_DANGER, size=18),
+                ft.Text("Log Out", color=COLOR_DANGER, weight=ft.FontWeight.BOLD, size=13)
+            ], alignment=ft.MainAxisAlignment.CENTER, spacing=8),
+            padding=SPACE_MD, border_radius=RADIUS_MD, bgcolor=COLOR_WHISPER,
+            ink=True, on_click=lambda ev: handle_logout_from_menu(dlg)
         )
 
         dlg = ft.AlertDialog(
             title=ft.Text("Menu", color="white", size=16),
             bgcolor=COLOR_CARD,
-            content=ft.Column(menu_items, tight=True, width=DIALOG_WIDTH),
+            content=ft.Column([
+                menu_grid,
+                ft.Divider(height=16, color=COLOR_BORDER),
+                ft.Column(secondary_items, spacing=0, tight=True),
+                ft.Divider(height=16, color=COLOR_BORDER),
+                logout_row
+            ], tight=True, width=DIALOG_WIDTH, spacing=4),
             actions=[ft.TextButton("Close", on_click=lambda ev: close_menu_dialog(dlg))]
         )
         page.overlay.append(dlg)
