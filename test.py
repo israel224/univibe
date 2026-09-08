@@ -1401,12 +1401,33 @@ async def main(page: ft.Page):
     menu_button = ft.IconButton(icon=ft.Icons.MENU_ROUNDED, icon_color=NAV_INACTIVE, tooltip="Menu",
                                 icon_size=20, style=NAV_BTN_STYLE, on_click=open_main_menu)
 
-    custom_nav_bar = ft.Container(
+    # --- TOP HEADER (branding + Search + Chats + Menu) ---
+    # Search and Chats are second entry points into the SAME existing panels
+    # and handlers used elsewhere (nav_to_people / nav_to_chats) -- no new
+    # search system, no new chat system, no change to chat/inbox polling.
+    top_search_btn = ft.IconButton(icon=ft.Icons.SEARCH_ROUNDED, icon_color=NAV_INACTIVE, tooltip="Search",
+                                   icon_size=20, style=NAV_BTN_STYLE, on_click=nav_to_people)
+    top_chats_btn = ft.IconButton(icon=ft.Icons.CHAT_BUBBLE_ROUNDED, icon_color=NAV_INACTIVE, tooltip="Chats",
+                                  icon_size=20, style=NAV_BTN_STYLE, on_click=nav_to_chats)
+
+    top_header_bar = ft.Container(
         content=ft.Row([
-            nav_buttons["feed"], nav_buttons["secrets"], nav_buttons["people"],
-            nav_buttons["chats"], nav_buttons["reels"], nav_buttons["notifications"],
-            menu_button
-        ], alignment=ft.MainAxisAlignment.START, spacing=2, scroll=ft.ScrollMode.AUTO),
+            ft.Text("UNiVAS", size=18, weight=ft.FontWeight.BOLD, color=COLOR_PRIMARY),
+            ft.Row([top_search_btn, top_chats_btn, menu_button], spacing=2)
+        ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        padding=ft.Padding.symmetric(horizontal=14, vertical=8),
+        bgcolor=COLOR_CARD
+    )
+
+    # --- BOTTOM NAVIGATION (Feed, Friends, Secret, Reels, Alerts) ---
+    # Reuses the exact same nav_buttons IconButtons (and their on_click
+    # handlers) already wired above -- Chats and Menu are deliberately left
+    # out of this bar since they now live in the top header.
+    bottom_nav_bar = ft.Container(
+        content=ft.Row([
+            nav_buttons["feed"], nav_buttons["people"], nav_buttons["secrets"],
+            nav_buttons["reels"], nav_buttons["notifications"]
+        ], alignment=ft.MainAxisAlignment.SPACE_EVENLY),
         padding=ft.Padding.symmetric(vertical=6),
         bgcolor=COLOR_CARD
     )
@@ -4264,7 +4285,7 @@ We may update these terms; continued use of the app means you accept the changes
     ], horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
     layout_dashboard_master = ft.Column([
-        custom_nav_bar,
+        top_header_bar,
         panel_home_feed,
         panel_whisper_wall,
         panel_messages,
@@ -4273,7 +4294,8 @@ We may update these terms; continued use of the app means you accept the changes
         panel_notifications,
         panel_settings,
         panel_view_profile,
-        panel_admin
+        panel_admin,
+        bottom_nav_bar
     ], visible=False, horizontal_alignment="center")
 
     async def try_restore_session():
