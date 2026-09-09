@@ -2,6 +2,7 @@ from supabase import create_client, Client
 import flet as ft
 import os
 import sys
+import re
 import uuid
 import mimetypes
 import asyncio
@@ -1244,7 +1245,7 @@ async def main(page: ft.Page):
 
     def open_settings_from_menu(dlg):
         close_menu_dialog(dlg)
-        open_account_settings(None)
+        nav_to_account_settings(None)
 
     def open_profile_from_menu(dlg):
         close_menu_dialog(dlg)
@@ -1433,7 +1434,7 @@ async def main(page: ft.Page):
         dlg.open = True
         page.update()
 
-    def set_panel_visibility(feed=False, secrets=False, chats=False, people=False, reels=False, notifications=False, profile=False, admin=False):
+    def set_panel_visibility(feed=False, secrets=False, chats=False, people=False, reels=False, notifications=False, profile=False, admin=False, account_settings=False):
         if not chats:
             chat_state["polling_active"] = False
             chat_state["inbox_polling_active"] = False
@@ -1445,6 +1446,7 @@ async def main(page: ft.Page):
         panel_notifications.visible  = notifications
         panel_settings.visible       = profile
         panel_admin.visible          = admin
+        panel_account_settings.visible = account_settings
         panel_view_profile.visible   = False
         page.update()
 
@@ -3664,6 +3666,160 @@ async def main(page: ft.Page):
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
     # ============================================================
+    # --- ACCOUNT SETTINGS SCREEN (Stage 3A) ----------------------
+    # A dedicated panel, not a dialog, consistent with the rest of the
+    # app's screen architecture (same pattern as panel_admin below).
+    # Change Email and Change Password both open the existing
+    # open_account_settings() dialog UNCHANGED -- that dialog remains the
+    # single source of truth for the actual save logic (settings_email,
+    # profile_password, handle_save_account_settings all untouched).
+    # Change Username and 2-Step Verification are UI-only placeholders
+    # for this stage, reusing the existing open_coming_soon_dialog()
+    # helper -- no new dialog code, no backend calls.
+    # ============================================================
+    def build_settings_row(icon, title, subtitle, handler):
+        return ft.Container(
+            content=ft.Row([
+                ft.Icon(icon, color=COLOR_PRIMARY, size=22),
+                ft.Column([
+                    ft.Text(title, color="white", size=14, weight=ft.FontWeight.BOLD),
+                    ft.Text(subtitle, color=COLOR_TEXT_MUTED, size=11)
+                ], spacing=2, expand=True),
+                ft.Icon(ft.Icons.CHEVRON_RIGHT_ROUNDED, color=COLOR_TEXT_FAINT, size=18)
+            ], spacing=SPACE_MD, alignment=ft.MainAxisAlignment.START,
+               vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            padding=SPACE_MD, bgcolor=COLOR_CARD, border_radius=RADIUS_MD, width=340,
+            ink=True, on_click=handler
+        )
+
+    def close_account_settings_panel(e):
+        panel_account_settings.visible = False
+        set_panel_visibility(feed=True)
+        render_public_feed()
+
+    # --- CHANGE USERNAME (Stage 3B) -------------------------------
+    # Calls the new authenticated-only change_username RPC. The RPC
+    # derives the caller from auth.uid() server-side and enforces
+    # length/character-set/case-insensitive-uniqueness rules there --
+    # that is the real security boundary. The checks below are only a
+    # fast, friendly first pass so the user doesn't wait on a round
+    # trip for an obviously-invalid entry; the server re-validates
+    # everything regardless of what passes here.
+    change_username_input = ft.TextField(label="New username", width=280, color="white",
+                                         border_color=COLOR_PRIMARY, max_length=20)
+    change_username_status = ft.Text("", size=12)
+
+    def handle_change_username(e):
+        new_username = (change_username_input.value or "").strip()
+
+        if len(new_username) < 3 or len(new_username) > 20:
+            change_username_status.value = "Username must be between 3 and 20 characters."
+            change_username_status.color = COLOR_DANGER
+            page.update()
+            return
+        if not re.match(r'^[A-Za-z0-9_]+$', new_username):
+            change_username_status.value = "Only letters, numbers, and underscores are allowed."
+            change_username_status.color = COLOR_DANGER
+            page.update()
+            return
+
+        change_username_status.value = "Saving..."
+        change_username_status.color = COLOR_TEXT_MUTED
+        page.update()
+
+        try:
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("change_username", {"p_new_username": new_username}).execute()
+            )
+            if resp is None:
+                change_username_status.value = "Your session expired — please log in again."
+                change_username_status.color = COLOR_DANGER
+                page.update()
+                return
+
+            result = resp.data if isinstance(resp.data, dict) else None
+            if not result:
+                change_username_status.value = "Couldn't update username — try again."
+                change_username_status.color = COLOR_DANGER
+                page.update()
+                return
+
+            if result.get("success"):
+                user_id = get_cached_user_id()
+                if user_id:
+                    refresh_cached_username(user_id)
+                new_value = result.get("username") or new_username
+                profile_username_label.value = f"@{new_value}"
+                change_username_status.value = result.get("message") or "Username updated successfully! ✅"
+                change_username_status.color = COLOR_SUCCESS
+                change_username_input.value = ""
+            else:
+                change_username_status.value = result.get("message") or "Couldn't update username — try again."
+                change_username_status.color = COLOR_DANGER
+            page.update()
+        except Exception as ex:
+            change_username_status.value = f"Couldn't update username: {str(ex)}"
+            change_username_status.color = COLOR_DANGER
+            page.update()
+
+    def close_change_username_dialog(d):
+        d.open = False
+        page.update()
+
+    def open_change_username_dialog(e):
+        change_username_input.value = ""
+        change_username_status.value = ""
+        dlg = ft.AlertDialog(
+            title=ft.Text("Change Username", color="white", size=16),
+            bgcolor=COLOR_CARD,
+            content=ft.Column([
+                ft.Text(f"Current: @{user_cache.get('username') or 'Unknown'}", color=COLOR_TEXT_MUTED, size=12),
+                change_username_input,
+                change_username_status
+            ], tight=True, spacing=10, width=DIALOG_WIDTH),
+            actions=[
+                ft.TextButton("Save", on_click=handle_change_username),
+                ft.TextButton("Close", on_click=lambda ev: close_change_username_dialog(dlg))
+            ]
+        )
+        page.overlay.append(dlg)
+        dlg.open = True
+        page.update()
+
+    panel_account_settings = ft.Column([
+        ft.Row([
+            ft.IconButton(icon=ft.Icons.ARROW_BACK_ROUNDED, icon_color=COLOR_PRIMARY, on_click=close_account_settings_panel),
+            ft.Text("Settings", size=18, weight=ft.FontWeight.BOLD, color="white")
+        ]),
+        ft.Text("ACCOUNT", size=12, weight=ft.FontWeight.BOLD, color=COLOR_TEXT_MUTED),
+        build_settings_row(
+            ft.Icons.BADGE_ROUNDED, "Change Username", "Update your UNiVAS username",
+            lambda e: open_change_username_dialog(e)
+        ),
+        build_settings_row(
+            ft.Icons.EMAIL_ROUNDED, "Change Email", "Update your email address",
+            lambda e: open_account_settings(e)
+        ),
+        build_settings_row(
+            ft.Icons.LOCK_RESET_ROUNDED, "Change Password", "Secure your account with a new password",
+            lambda e: open_account_settings(e)
+        ),
+        ft.Divider(height=16, color=COLOR_BORDER),
+        ft.Text("SECURITY", size=12, weight=ft.FontWeight.BOLD, color=COLOR_TEXT_MUTED),
+        build_settings_row(
+            ft.Icons.SHIELD_ROUNDED, "2-Step Verification", "Coming soon",
+            lambda e: open_coming_soon_dialog(
+                "2-Step Verification",
+                "2-Step Verification is coming soon. Your account is not yet protected by this feature."
+            )
+        ),
+    ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=SPACE_MD)
+
+    def nav_to_account_settings(e):
+        set_panel_visibility(account_settings=True)
+        highlight_nav("account_settings")
+
+    # ============================================================
     # --- ADMIN CONSOLE (stub) ------------------------------------
     # Deliberately minimal for this stage: no moderation actions live
     # here yet (no bans, suspensions, report review, post removal).
@@ -4364,7 +4520,8 @@ We may update these terms; continued use of the app means you accept the changes
         panel_notifications,
         panel_settings,
         panel_view_profile,
-        panel_admin
+        panel_admin,
+        panel_account_settings
     ], horizontal_alignment="center",
        scroll=ft.ScrollMode.AUTO, expand=True)
 
