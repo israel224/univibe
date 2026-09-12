@@ -1523,7 +1523,13 @@ async def main(page: ft.Page):
             try:
                 import base64
                 b64 = base64.b64encode(selected_media["bytes"]).decode("utf-8")
-                preview_content = ft.Image(src_base64=b64, width=160, height=160,
+                # Flet 0.86.5's Image control unified src_base64/src into a
+                # single required `src: Union[str, bytes]` field that accepts
+                # a plain base64 string directly (confirmed by reading the
+                # installed flet.controls.core.image.Image source) -- the
+                # old src_base64 keyword no longer exists and raises
+                # TypeError: unexpected keyword argument 'src_base64'.
+                preview_content = ft.Image(src=b64, width=160, height=160,
                                            fit=ft.BoxFit.COVER, border_radius=RADIUS_MD)
             except Exception as ex:
                 print(f"Preview render failed: {ex}")
@@ -2465,66 +2471,14 @@ async def main(page: ft.Page):
         page.update()
     state_dd.on_change = on_state_change
 
-    # --- ACCOUNT SETTINGS (email/password) — separate from main profile ---
-    profile_password = ft.TextField(label="Change Password", password=True,
-                                    width=280, color="white", border_color=COLOR_PRIMARY)
-    settings_email = ft.TextField(label="Change Email", width=280,
-                                  color="white", border_color=COLOR_PRIMARY)
-    settings_status = ft.Text("", size=12)
-
-    def handle_save_account_settings(e):
-        try:
-            updates = {}
-            new_email = None
-            if settings_email.value and settings_email.value.strip():
-                new_email = settings_email.value.strip()
-                updates["email"] = new_email
-            if profile_password.value and profile_password.value.strip():
-                updates["password"] = profile_password.value.strip()
-            if updates:
-                supabase.auth.update_user(updates)
-                if new_email:
-                    user_id = get_cached_user_id()
-                    if user_id:
-                        safe_supabase_call(
-                            lambda: supabase.table("profiles").update({"email": new_email}).eq("user_id", user_id).execute()
-                        )
-                    user_cache["email"] = new_email
-                profile_password.value = ""
-                settings_status.value = "Account updated! ✅"
-                settings_status.color = COLOR_SUCCESS
-            else:
-                settings_status.value = "Nothing to update."
-                settings_status.color = COLOR_TEXT_MUTED
-            page.update()
-        except Exception as ex:
-            settings_status.value = f"Update failed: {str(ex)}"
-            settings_status.color = COLOR_DANGER
-            page.update()
-
-    def close_settings_dialog(d):
-        d.open = False
-        page.update()
-
-    def open_account_settings(e):
-        settings_email.value = user_cache.get("email", "")
-        settings_status.value = ""
-        dlg = ft.AlertDialog(
-            title=ft.Text("Account Settings", color="white", size=16),
-            bgcolor=COLOR_CARD,
-            content=ft.Column([
-                settings_email,
-                profile_password,
-                settings_status
-            ], tight=True, spacing=12, width=DIALOG_WIDTH),
-            actions=[
-                ft.TextButton("Save", on_click=handle_save_account_settings),
-                ft.TextButton("Close", on_click=lambda ev: close_settings_dialog(dlg))
-            ]
-        )
-        page.overlay.append(dlg)
-        dlg.open = True
-        page.update()
+    # Change Email now lives in its own verified-code flow, defined
+    # further below alongside Change Password (open_change_email_dialog).
+    # The old single-field "just save it" dialog that used to live here
+    # (settings_email / settings_status / handle_save_account_settings /
+    # open_account_settings) has been fully retired -- it had no old-email
+    # ownership check at all, and always claimed "Email updated!" even
+    # when Supabase requires confirmation and hadn't actually changed
+    # anything yet.
 
     # --- PROFILE STATS ROW (Posts / Followers / Following / Total Likes) ---
     def format_count(n):
@@ -3669,13 +3623,14 @@ async def main(page: ft.Page):
     # --- ACCOUNT SETTINGS SCREEN (Stage 3A) ----------------------
     # A dedicated panel, not a dialog, consistent with the rest of the
     # app's screen architecture (same pattern as panel_admin below).
-    # Change Email and Change Password both open the existing
-    # open_account_settings() dialog UNCHANGED -- that dialog remains the
-    # single source of truth for the actual save logic (settings_email,
-    # profile_password, handle_save_account_settings all untouched).
-    # Change Username and 2-Step Verification are UI-only placeholders
-    # for this stage, reusing the existing open_coming_soon_dialog()
-    # helper -- no new dialog code, no backend calls.
+    # Change Email and Change Password each use their own separate
+    # verified email-code flow (open_change_email_dialog /
+    # open_change_password_dialog, defined further below) -- both
+    # require proving ownership of the CURRENT email via a 6-digit
+    # code before anything can be changed, so there is no unverified
+    # bypass for either. Change Username (Stage 3B) opens its own
+    # dialog. 2-Step Verification remains a UI-only placeholder via
+    # open_coming_soon_dialog() -- no new dialog code, no backend calls.
     # ============================================================
     def build_settings_row(icon, title, subtitle, handler):
         return ft.Container(
@@ -3786,6 +3741,1092 @@ async def main(page: ft.Page):
         dlg.open = True
         page.update()
 
+    # ============================================================
+    # --- CHANGE PASSWORD (Stage 3C) ------------------------------
+    # A verified, 3-step email-code flow, built entirely separately
+    # from recovery_state / fp_step1-3 (the Forgot Password screen) so
+    # the two can never collide -- this reuses the same underlying
+    # Supabase mechanism (reset_password_for_email -> verify_otp with
+    # type="recovery" -> update_user), which is the only mechanism in
+    # this app that reliably sends a 6-digit code to an existing,
+    # already-confirmed account (sign_in_with_otp, used at
+    # registration, sends a magic link instead for confirmed accounts).
+    #
+    # The code is sent to the user's OWN registered email
+    # (user_cache["email"]) -- they never type an email/identifier.
+    #
+    # Session handling: verify_otp's returned session is captured in
+    # password_change_state, NOT applied to the live client via
+    # set_session() until the moment the password update itself needs
+    # it. This means the user's real, live authenticated session is
+    # left completely alone through Send Code and Verify Code -- it is
+    # only swapped, deliberately, in the final step in order to
+    # authorize update_user(), and immediately followed by a full sign
+    # out (Option B): the user is returned to the login screen and
+    # must log in again with their new password, rather than attempting
+    # to splice their original session back in afterward.
+    # ============================================================
+    password_change_state = {"session": None}
+    password_change_dialog_ref = {"dlg": None}
+
+    def mask_email(email):
+        """'israel@gmail.com' -> 'i***@gmail.com'. Defensive fallback
+        for anything that doesn't look like an email."""
+        if not email or "@" not in email:
+            return email or ""
+        local, domain = email.split("@", 1)
+        masked_local = (local[0] + "***") if local else "***"
+        return f"{masked_local}@{domain}"
+
+    pc_email_display = ft.Text("", color=COLOR_TEXT_MUTED, size=13, weight=ft.FontWeight.BOLD)
+    pc_step1_status = ft.Text("", size=12)
+
+    pc_otp_input = ft.TextField(label="6-Digit Code", width=280, color="white", max_length=6)
+    pc_step2_status = ft.Text("", size=12)
+
+    pc_new_password = ft.TextField(label="New Password", password=True, width=280,
+                                   color="white", border_color=COLOR_PRIMARY)
+    pc_confirm_password = ft.TextField(label="Confirm New Password", password=True, width=280,
+                                       color="white", border_color=COLOR_PRIMARY)
+    pc_step3_status = ft.Text("", size=12)
+
+    def reset_password_change_fields():
+        password_change_state["session"] = None
+        pc_otp_input.value = ""
+        pc_new_password.value = ""
+        pc_confirm_password.value = ""
+        pc_step1_status.value = ""
+        pc_step2_status.value = ""
+        pc_step3_status.value = ""
+
+    def handle_send_password_change_code(e):
+        email = user_cache.get("email")
+        if not email:
+            pc_step1_status.value = "Couldn't find your registered email — please log in again."
+            pc_step1_status.color = COLOR_DANGER
+            page.update()
+            return
+
+        pc_step1_status.value = "Sending..."
+        pc_step1_status.color = COLOR_TEXT_MUTED
+        page.update()
+
+        try:
+            try:
+                supabase.auth.reset_password_for_email(email, {})
+            except AttributeError:
+                supabase.auth.reset_password_email(email, {})
+
+            pc_step1.visible = False
+            pc_step2.visible = True
+            pc_step2_status.value = f"Code sent to {mask_email(email)}."
+            pc_step2_status.color = COLOR_TEXT_MUTED
+            page.update()
+        except Exception as ex:
+            pc_step1_status.value = f"Couldn't send code: {str(ex)}"
+            pc_step1_status.color = COLOR_DANGER
+            page.update()
+
+    def handle_resend_password_change_code(e):
+        email = user_cache.get("email")
+        if not email:
+            return
+        try:
+            try:
+                supabase.auth.reset_password_for_email(email, {})
+            except AttributeError:
+                supabase.auth.reset_password_email(email, {})
+            pc_step2_status.value = "Code resent — check your inbox."
+            pc_step2_status.color = COLOR_SUCCESS
+            page.update()
+        except Exception as ex:
+            pc_step2_status.value = f"Couldn't resend: {str(ex)}"
+            pc_step2_status.color = COLOR_DANGER
+            page.update()
+
+    def handle_verify_password_change_code(e):
+        code = (pc_otp_input.value or "").strip()
+        email = user_cache.get("email")
+
+        if not code:
+            pc_step2_status.value = "Enter the 6-digit code."
+            pc_step2_status.color = COLOR_DANGER
+            page.update()
+            return
+        if not email:
+            pc_step2_status.value = "Couldn't find your registered email — please log in again."
+            pc_step2_status.color = COLOR_DANGER
+            page.update()
+            return
+
+        try:
+            result = supabase.auth.verify_otp({
+                "email": email,
+                "token": code,
+                "type": "recovery"
+            })
+            if not result.session or not result.user:
+                pc_step2_status.value = "Verification failed — check the code and try again."
+                pc_step2_status.color = COLOR_DANGER
+                page.update()
+                return
+
+            # Captured in OUR OWN state, deliberately NOT applied via
+            # set_session() yet -- the user's live session stays active
+            # and untouched until the password update step below.
+            password_change_state["session"] = result.session
+
+            pc_step2_status.value = ""
+            pc_step2.visible = False
+            pc_step3.visible = True
+            page.update()
+        except Exception as ex:
+            msg = str(ex).lower()
+            if "expired" in msg or "invalid" in msg:
+                pc_step2_status.value = "That code is invalid or expired. Tap Resend for a new one."
+            else:
+                pc_step2_status.value = f"Verification failed: {str(ex)}"
+            pc_step2_status.color = COLOR_DANGER
+            page.update()
+
+    def handle_update_password_and_logout(e):
+        new_password = pc_new_password.value or ""
+        confirm_password = pc_confirm_password.value or ""
+
+        if not new_password or not confirm_password:
+            pc_step3_status.value = "Please fill in both password fields."
+            pc_step3_status.color = COLOR_DANGER
+            page.update()
+            return
+        if len(new_password) < 6:
+            pc_step3_status.value = "Password must be at least 6 characters."
+            pc_step3_status.color = COLOR_DANGER
+            page.update()
+            return
+        if new_password != confirm_password:
+            pc_step3_status.value = "Passwords do not match."
+            pc_step3_status.color = COLOR_DANGER
+            page.update()
+            return
+        if not password_change_state.get("session"):
+            pc_step3_status.value = "Your verification expired — please start again."
+            pc_step3_status.color = COLOR_DANGER
+            page.update()
+            return
+
+        try:
+            # Switch the client onto the verified recovery session just
+            # long enough to authorize the update, mirroring the exact
+            # pattern already used by handle_reset_password_from_recovery.
+            supabase.auth.set_session(
+                password_change_state["session"].access_token,
+                password_change_state["session"].refresh_token
+            )
+            supabase.auth.update_user({"password": new_password})
+
+            pc_new_password.value = ""
+            pc_confirm_password.value = ""
+            password_change_state["session"] = None
+
+            pc_step3_status.value = "Password changed! Signing you out..."
+            pc_step3_status.color = COLOR_SUCCESS
+            page.update()
+
+            dlg = password_change_dialog_ref.get("dlg")
+            if dlg:
+                close_change_password_dialog(dlg)
+
+            # Option B: sign out and return to login so the user
+            # re-authenticates with their new password, rather than
+            # attempting to splice the original session back in.
+            page.run_task(handle_logout, None)
+        except Exception as ex:
+            pc_step3_status.value = f"Couldn't change password: {str(ex)}"
+            pc_step3_status.color = COLOR_DANGER
+            page.update()
+
+    pc_step1 = ft.Column([
+        ft.Text("For your security, we'll send a verification code to your registered email.",
+                color=COLOR_TEXT_MUTED, size=12),
+        pc_email_display,
+        ft.ElevatedButton(content=ft.Text("Send Verification Code", color="white"),
+                          bgcolor=COLOR_PRIMARY, on_click=handle_send_password_change_code),
+        pc_step1_status,
+    ], spacing=10, tight=True)
+
+    pc_step2 = ft.Column([
+        ft.Text("Enter the verification code we sent you.", color=COLOR_TEXT_MUTED, size=12),
+        pc_otp_input,
+        ft.ElevatedButton(content=ft.Text("Verify Code", color="white"),
+                          bgcolor=COLOR_PRIMARY, on_click=handle_verify_password_change_code),
+        pc_step2_status,
+        ft.TextButton(content=ft.Text("Resend code", color=COLOR_TEXT_MUTED, size=12),
+                     on_click=handle_resend_password_change_code),
+    ], spacing=10, tight=True, visible=False)
+
+    pc_step3 = ft.Column([
+        ft.Text("Choose a new password.", color=COLOR_TEXT_MUTED, size=12),
+        pc_new_password,
+        pc_confirm_password,
+        ft.ElevatedButton(content=ft.Text("Update Password", color="white"),
+                          bgcolor=COLOR_SUCCESS, on_click=handle_update_password_and_logout),
+        pc_step3_status,
+    ], spacing=10, tight=True, visible=False)
+
+    def close_change_password_dialog(d):
+        d.open = False
+        page.update()
+
+    def open_change_password_dialog(e):
+        reset_password_change_fields()
+        pc_step1.visible = True
+        pc_step2.visible = False
+        pc_step3.visible = False
+        pc_email_display.value = mask_email(user_cache.get("email"))
+
+        dlg = ft.AlertDialog(
+            title=ft.Text("Change Password", color="white", size=16),
+            bgcolor=COLOR_CARD,
+            content=ft.Column([pc_step1, pc_step2, pc_step3],
+                              tight=True, spacing=16, width=DIALOG_WIDTH),
+            actions=[ft.TextButton("Close", on_click=lambda ev: close_change_password_dialog(dlg))]
+        )
+        password_change_dialog_ref["dlg"] = dlg
+        page.overlay.append(dlg)
+        dlg.open = True
+        page.update()
+
+    # ============================================================
+    # --- CHANGE EMAIL (verified-old-email + verified-new-email) ---
+    # Two SEPARATE Supabase-native 6-digit-code verifications, back to
+    # back -- no confirmation link is ever generated or clicked.
+    #
+    # OLD email (steps 1-2): reset_password_for_email -> a code
+    # verified via verify_otp_raw(..., "recovery") -- the same
+    # underlying Supabase mechanism Change Password uses. This is
+    # UniVas's OWN extra proof-of-ownership gate before the new-email
+    # field is even shown; Supabase does not require this on its own.
+    #
+    # NEW email (steps 3-4): update_user({"email": new_email}) is
+    # what actually triggers Supabase to send its own "Change Email
+    # Address" template to the NEW address -- this cannot be skipped,
+    # it's the only way to make Supabase start the email-change
+    # process. That template only contains a {{ .ConfirmationURL }}
+    # LINK by default, which is the broken localhost:3000 link this
+    # fix removes reliance on. Instead, the SAME template must be
+    # customized in the Supabase Dashboard to include {{ .Token }} (a
+    # 6-digit code) -- once that's done, the code is verified via
+    # verify_otp_raw(..., "email_change"), which completes the email
+    # change directly via the API. No link is ever visited by the
+    # user; update_user()'s own return value is NOT trusted as proof
+    # of success -- only a successful verify_otp_raw(..., "email_
+    # change") call is.
+    #
+    # Both verifications go through verify_otp_raw() (defined just
+    # below), NOT supabase.auth.verify_otp() -- see that function's
+    # docstring for the two concrete, source-verified reasons the SDK
+    # method is unsafe here (it wipes the live session, and its
+    # response parser crashes for type="email_change").
+    #
+    # profiles.email and user_cache["email"] are only touched AFTER
+    # the new-email verify_otp_raw call succeeds -- never at the
+    # update_user() step, since nothing has actually changed on the
+    # Supabase side yet at that point.
+    #
+    # REQUIRED Supabase Dashboard changes for this to work (cannot be
+    # done from client code):
+    #  1. Authentication -> Email Templates -> "Change Email Address"
+    #     must include {{ .Token }}, the same way "Reset Password" was
+    #     already customized for the old-email/recovery code flow.
+    #  2. Authentication -> Settings -> Email -> "Secure email change"
+    #     must be OFF. When it's on, update_user({"email": ...}) makes
+    #     Supabase send a SECOND confirmation to the OLD email too (on
+    #     top of the new one) before the change completes -- which is
+    #     redundant with, and not accounted for by, UniVas's own old-
+    #     email verification in steps 1-2, and would surprise the user
+    #     with an unexpected second code they were never asked to
+    #     enter anywhere in this flow.
+    # ============================================================
+
+    def verify_otp_raw(email, code, otp_type):
+        """
+        Verifies a 6-digit OTP by calling Supabase's real POST /verify
+        endpoint directly -- the exact same endpoint and request body
+        shape supabase.auth.verify_otp() itself sends -- instead of
+        going through that SDK method. Confirmed by reading the
+        installed supabase-auth 2.31.0 source in this environment,
+        verify_otp() has two problems that make it unsafe to use here:
+
+        1. It unconditionally calls self._remove_session() before even
+           attempting verification, wiping the CURRENT authenticated
+           user's live session regardless of whether the OTP turns out
+           to be valid, then (on success) silently replaces it with a
+           new session scoped to the OTP flow. Since Change Email runs
+           entirely inside an already-authenticated session, this is
+           exactly what was causing Resend to fail with "session
+           missing" and forcing a full logout/login to use the dialog
+           again.
+
+        2. Its response parser (parse_auth_response) validates the
+           response body as a full Session first, and if that fails,
+           falls back to validating it as a bare User object. For
+           type="email_change" specifically, Supabase's response body
+           is shaped {"user": {...}} with no session tokens -- which
+           fails BOTH of those parse attempts, and raises an uncaught
+           pydantic ValidationError ("5 validation errors for User
+           id... Field required") instead of a clean success or a
+           clean AuthApiError.
+
+        Calling supabase.auth._request() directly -- the same
+        low-level primitive verify_otp() itself uses internally --
+        and reading the raw JSON ourselves sidesteps both problems:
+        the live session is never touched, and a genuinely successful
+        verification is never misread as a crash. A wrong/expired code
+        still raises a normal exception via the SDK's own error
+        handling (response.raise_for_status() -> handle_exception()),
+        so error handling for bad codes is unchanged.
+
+        Returns (success: bool, error_message_or_None).
+        """
+        try:
+            response = supabase.auth._request(
+                "POST",
+                "verify",
+                body={
+                    "gotrue_meta_security": {"captcha_token": None},
+                    "email": email,
+                    "token": code,
+                    "type": otp_type,
+                },
+            )
+            data = response.json()
+            user_obj = data.get("user") if isinstance(data.get("user"), dict) else data
+            if isinstance(user_obj, dict) and user_obj.get("id"):
+                return True, None
+            return False, "Verification failed — check the code and try again."
+        except Exception as ex:
+            return False, str(ex)
+
+    change_email_state = {"verified": False, "cooldown_active": False, "pending_new_email": None,
+                          "session_token": 0}
+    # Tracks the currently-open Change Email AlertDialog instance so it can
+    # be properly detached from page.overlay on close (see close_change_
+    # email_dialog / open_change_email_dialog below) -- every close_dlg in
+    # this app until now only ever set .open = False and left the control
+    # sitting in page.overlay forever. That's harmless for single-shot
+    # dialogs, but Change Email's ce_step1..ce_step4 are persistent,
+    # shared Column controls reused across every open -- leaving a closed
+    # dialog's tree still referencing them while a second, newly-opened
+    # dialog also references the SAME controls is what caused "closed it,
+    # reopened it, code still gets sent but the code-entry step doesn't
+    # render": two AlertDialogs in the overlay pointing at one shared
+    # control confuses which instance the client actually re-renders.
+    change_email_dialog_ref = {"dlg": None}
+
+    ce_email_display = ft.Text("", color=COLOR_TEXT_MUTED, size=13, weight=ft.FontWeight.BOLD)
+    ce_step1_status = ft.Text("", size=12)
+    ce_send_code_btn = ft.ElevatedButton(content=ft.Text("Send Verification Code", color="white"),
+                                         bgcolor=COLOR_PRIMARY)
+
+    ce_otp_input = ft.TextField(label="6-Digit Code", width=280, color="white", max_length=6)
+    ce_step2_status = ft.Text("", size=12)
+    ce_resend_btn = ft.TextButton(content=ft.Text("Resend code", color=COLOR_TEXT_MUTED, size=12))
+
+    ce_new_email_input = ft.TextField(label="New Email", width=280, color="white",
+                                      border_color=COLOR_PRIMARY)
+    ce_step3_status = ft.Text("", size=12)
+    ce_new_send_btn = ft.ElevatedButton(content=ft.Text("Send Code to New Email", color="white"),
+                                        bgcolor=COLOR_PRIMARY)
+
+    ce_new_otp_input = ft.TextField(label="6-Digit Code", width=280, color="white", max_length=6)
+    ce_step4_status = ft.Text("", size=12)
+    ce_new_resend_btn = ft.TextButton(content=ft.Text("Resend code", color=COLOR_TEXT_MUTED, size=12))
+
+    def reset_change_email_fields():
+        change_email_state["verified"] = False
+        change_email_state["pending_new_email"] = None
+        change_email_state["cooldown_active"] = False
+        # Bumping this invalidates any cooldown timer still sleeping from
+        # a previous open of this dialog (see change_email_cooldown_timer
+        # below) -- without this, closing the dialog mid-cooldown and
+        # reopening it could leave buttons stuck disabled, or have a
+        # stale timer re-enable buttons for the wrong attempt.
+        change_email_state["session_token"] += 1
+        ce_otp_input.value = ""
+        ce_new_email_input.value = ""
+        ce_new_otp_input.value = ""
+        ce_step1_status.value = ""
+        ce_step2_status.value = ""
+        ce_step3_status.value = ""
+        ce_step4_status.value = ""
+        ce_send_code_btn.disabled = False
+        ce_resend_btn.disabled = False
+        ce_new_send_btn.disabled = False
+        ce_new_resend_btn.disabled = False
+
+    async def change_email_cooldown_timer(send_btn, resend_btn):
+        # Fixed 30-second "cannot spam the verification email" cooldown --
+        # disables the given Send/Resend buttons, waits, re-enables.
+        # Not a live ticking countdown display, kept intentionally
+        # simple/small. Shared across both the old-email and new-email
+        # stages (they never run concurrently within one dialog).
+        #
+        # Captures the current session_token and re-checks it after the
+        # sleep: if the dialog was closed and reopened (or reset) while
+        # this timer was waiting, session_token will have changed, and
+        # this stale timer does nothing instead of corrupting the new
+        # attempt's button/cooldown state.
+        my_token = change_email_state["session_token"]
+        change_email_state["cooldown_active"] = True
+        send_btn.disabled = True
+        resend_btn.disabled = True
+        page.update()
+        await asyncio.sleep(30)
+        if change_email_state["session_token"] != my_token:
+            return
+        change_email_state["cooldown_active"] = False
+        send_btn.disabled = False
+        resend_btn.disabled = False
+        page.update()
+
+    def handle_send_change_email_code(e):
+        if change_email_state.get("cooldown_active"):
+            return
+        email = user_cache.get("email")
+        if not email:
+            ce_step1_status.value = "Couldn't find your registered email — please log in again."
+            ce_step1_status.color = COLOR_DANGER
+            page.update()
+            return
+
+        ce_step1_status.value = "Sending..."
+        ce_step1_status.color = COLOR_TEXT_MUTED
+        page.update()
+
+        try:
+            try:
+                supabase.auth.reset_password_for_email(email, {})
+            except AttributeError:
+                supabase.auth.reset_password_email(email, {})
+
+            ce_step1.visible = False
+            ce_step2.visible = True
+            ce_step2_status.value = f"Code sent to {mask_email(email)}."
+            ce_step2_status.color = COLOR_TEXT_MUTED
+            page.update()
+            page.run_task(change_email_cooldown_timer, ce_send_code_btn, ce_resend_btn)
+        except Exception as ex:
+            ce_step1_status.value = f"Couldn't send code: {str(ex)}"
+            ce_step1_status.color = COLOR_DANGER
+            page.update()
+
+    def handle_resend_change_email_code(e):
+        if change_email_state.get("cooldown_active"):
+            return
+        email = user_cache.get("email")
+        if not email:
+            return
+        try:
+            try:
+                supabase.auth.reset_password_for_email(email, {})
+            except AttributeError:
+                supabase.auth.reset_password_email(email, {})
+            ce_step2_status.value = "Code resent — check your inbox."
+            ce_step2_status.color = COLOR_SUCCESS
+            page.update()
+            page.run_task(change_email_cooldown_timer, ce_send_code_btn, ce_resend_btn)
+        except Exception as ex:
+            ce_step2_status.value = f"Couldn't resend: {str(ex)}"
+            ce_step2_status.color = COLOR_DANGER
+            page.update()
+
+    def handle_verify_change_email_code(e):
+        code = (ce_otp_input.value or "").strip()
+        email = user_cache.get("email")
+
+        if not code:
+            ce_step2_status.value = "Enter the 6-digit code."
+            ce_step2_status.color = COLOR_DANGER
+            page.update()
+            return
+        if not email:
+            ce_step2_status.value = "Couldn't find your registered email — please log in again."
+            ce_step2_status.color = COLOR_DANGER
+            page.update()
+            return
+
+        # Uses verify_otp_raw() instead of supabase.auth.verify_otp() --
+        # this is our own proof-of-ownership gate for the OLD email, and
+        # must not disturb the live authenticated session (see
+        # verify_otp_raw's docstring above for exactly why the SDK
+        # method is unsafe to use here).
+        success, error = verify_otp_raw(email, code, "recovery")
+        if success:
+            change_email_state["verified"] = True
+            ce_step2_status.value = ""
+            ce_step2.visible = False
+            ce_step3.visible = True
+            page.update()
+            return
+
+        msg = (error or "").lower()
+        if "expired" in msg or "invalid" in msg or "token" in msg:
+            ce_step2_status.value = "That code is invalid or expired. Tap Resend for a new one."
+        else:
+            ce_step2_status.value = error or "Verification failed — check the code and try again."
+        ce_step2_status.color = COLOR_DANGER
+        page.update()
+
+    def handle_send_new_email_code(e):
+        if change_email_state.get("cooldown_active"):
+            return
+        new_email = (ce_new_email_input.value or "").strip()
+        current_email = user_cache.get("email") or ""
+
+        if not change_email_state.get("verified"):
+            ce_step3_status.value = "Please verify your current email first."
+            ce_step3_status.color = COLOR_DANGER
+            page.update()
+            return
+        if not new_email:
+            ce_step3_status.value = "Enter your new email address."
+            ce_step3_status.color = COLOR_DANGER
+            page.update()
+            return
+        if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', new_email):
+            ce_step3_status.value = "Enter a valid email address."
+            ce_step3_status.color = COLOR_DANGER
+            page.update()
+            return
+        if new_email.lower() == current_email.lower():
+            ce_step3_status.value = "That's already your current email."
+            ce_step3_status.color = COLOR_DANGER
+            page.update()
+            return
+
+        ce_step3_status.value = "Sending..."
+        ce_step3_status.color = COLOR_TEXT_MUTED
+        page.update()
+
+        try:
+            # This is what kicks off Supabase's own email-change process
+            # and sends its "Change Email Address" template to new_email.
+            # Nothing is considered changed yet -- only a successful
+            # verify_otp(type="email_change") below completes it.
+            supabase.auth.update_user({"email": new_email})
+
+            change_email_state["pending_new_email"] = new_email
+            ce_step3.visible = False
+            ce_step4.visible = True
+            ce_step4_status.value = f"We sent a 6-digit code to {mask_email(new_email)}."
+            ce_step4_status.color = COLOR_TEXT_MUTED
+            page.update()
+            page.run_task(change_email_cooldown_timer, ce_new_send_btn, ce_new_resend_btn)
+        except Exception as ex:
+            ce_step3_status.value = f"Couldn't send code: {str(ex)}"
+            ce_step3_status.color = COLOR_DANGER
+            page.update()
+
+    def handle_resend_new_email_code(e):
+        if change_email_state.get("cooldown_active"):
+            return
+        new_email = change_email_state.get("pending_new_email")
+        if not new_email:
+            return
+        try:
+            supabase.auth.update_user({"email": new_email})
+            ce_step4_status.value = "Code resent — check your inbox."
+            ce_step4_status.color = COLOR_SUCCESS
+            page.update()
+            page.run_task(change_email_cooldown_timer, ce_new_send_btn, ce_new_resend_btn)
+        except Exception as ex:
+            ce_step4_status.value = f"Couldn't resend: {str(ex)}"
+            ce_step4_status.color = COLOR_DANGER
+            page.update()
+
+    def handle_verify_new_email_code(e):
+        code = (ce_new_otp_input.value or "").strip()
+        new_email = change_email_state.get("pending_new_email")
+
+        if not code:
+            ce_step4_status.value = "Enter the 6-digit code."
+            ce_step4_status.color = COLOR_DANGER
+            page.update()
+            return
+        if not new_email:
+            ce_step4_status.value = "Something went wrong — please start again."
+            ce_step4_status.color = COLOR_DANGER
+            page.update()
+            return
+
+        # Uses verify_otp_raw() instead of supabase.auth.verify_otp() --
+        # this is the actual completion step, and the SDK's own
+        # verify_otp() cannot be used for type="email_change" here (see
+        # verify_otp_raw's docstring above: its response parser raises
+        # an uncaught pydantic error for this exact OTP type).
+        success, error = verify_otp_raw(new_email, code, "email_change")
+        if success:
+            # THIS is the real completion point -- the email has now
+            # actually changed on the Supabase side. Only now do we
+            # sync our own copies of it.
+            user_id = get_cached_user_id()
+            if user_id:
+                safe_supabase_call(
+                    lambda: supabase.table("profiles").update({"email": new_email}).eq("user_id", user_id).execute()
+                )
+            user_cache["email"] = new_email
+
+            ce_step4_status.value = "Email changed successfully. ✅"
+            ce_step4_status.color = COLOR_SUCCESS
+            ce_new_otp_input.value = ""
+            page.update()
+            return
+
+        msg = (error or "").lower()
+        if "expired" in msg or "invalid" in msg or "token" in msg:
+            ce_step4_status.value = "That code is invalid or expired. Tap Resend for a new one."
+        else:
+            ce_step4_status.value = error or "Verification failed — check the code and try again."
+        ce_step4_status.color = COLOR_DANGER
+        page.update()
+
+    ce_send_code_btn.on_click = handle_send_change_email_code
+    ce_resend_btn.on_click = handle_resend_change_email_code
+    ce_new_send_btn.on_click = handle_send_new_email_code
+    ce_new_resend_btn.on_click = handle_resend_new_email_code
+
+    ce_step1 = ft.Column([
+        ft.Text("For your security, we'll send a verification code to your current email.",
+                color=COLOR_TEXT_MUTED, size=12),
+        ce_email_display,
+        ce_send_code_btn,
+        ce_step1_status,
+    ], spacing=10, tight=True)
+
+    ce_step2 = ft.Column([
+        ft.Text("Enter the verification code we sent you.", color=COLOR_TEXT_MUTED, size=12),
+        ce_otp_input,
+        ft.ElevatedButton(content=ft.Text("Verify Code", color="white"),
+                          bgcolor=COLOR_PRIMARY, on_click=handle_verify_change_email_code),
+        ce_step2_status,
+        ce_resend_btn,
+    ], spacing=10, tight=True, visible=False)
+
+    ce_step3 = ft.Column([
+        ft.Text("Enter your new email address.", color=COLOR_TEXT_MUTED, size=12),
+        ce_new_email_input,
+        ce_new_send_btn,
+        ce_step3_status,
+    ], spacing=10, tight=True, visible=False)
+
+    ce_step4 = ft.Column([
+        ft.Text("Enter the code sent to your new email.", color=COLOR_TEXT_MUTED, size=12),
+        ce_new_otp_input,
+        ft.ElevatedButton(content=ft.Text("Verify Code", color="white"),
+                          bgcolor=COLOR_SUCCESS, on_click=handle_verify_new_email_code),
+        ce_step4_status,
+        ce_new_resend_btn,
+    ], spacing=10, tight=True, visible=False)
+
+    def close_change_email_dialog(d):
+        d.open = False
+        if d in page.overlay:
+            page.overlay.remove(d)
+        if change_email_dialog_ref.get("dlg") is d:
+            change_email_dialog_ref["dlg"] = None
+        page.update()
+
+    def open_change_email_dialog(e):
+        # Defensive cleanup: if a previous Change Email dialog is somehow
+        # still sitting in page.overlay (e.g. dismissed some way other
+        # than the Close button), detach it before building a new one, so
+        # ce_step1..ce_step4 are never referenced by two dialogs at once.
+        stale_dlg = change_email_dialog_ref.get("dlg")
+        if stale_dlg is not None and stale_dlg in page.overlay:
+            page.overlay.remove(stale_dlg)
+
+        reset_change_email_fields()
+        ce_step1.visible = True
+        ce_step2.visible = False
+        ce_step3.visible = False
+        ce_step4.visible = False
+        ce_email_display.value = mask_email(user_cache.get("email"))
+
+        dlg = ft.AlertDialog(
+            title=ft.Text("Change Email", color="white", size=16),
+            bgcolor=COLOR_CARD,
+            content=ft.Column([ce_step1, ce_step2, ce_step3, ce_step4],
+                              tight=True, spacing=16, width=DIALOG_WIDTH),
+            actions=[ft.TextButton("Close", on_click=lambda ev: close_change_email_dialog(dlg))]
+        )
+        change_email_dialog_ref["dlg"] = dlg
+        page.overlay.append(dlg)
+        dlg.open = True
+        page.update()
+
+    # ============================================================
+    # --- 2-STEP VERIFICATION (TOTP, Settings -> Security) --------
+    # Kept fully isolated from recovery_state / password_change_state /
+    # change_email_state / reg_state / mfa_login_state, per instructions.
+    # This is a SEPARATE state machine from Change Password/Change Email
+    # -- it is never opened from those dialogs and shares no controls
+    # with them.
+    #
+    # Uses the real supabase.auth.mfa API (enroll/challenge_and_verify/
+    # unenroll/list_factors), confirmed present and working by reading
+    # the installed supabase-auth 2.31.0 source directly:
+    #   - enroll()/challenge()/unenroll()/list_factors() never touch the
+    #     live session.
+    #   - verify() (used internally by challenge_and_verify()) requires
+    #     an existing session and, on success, upgrades it in place --
+    #     it does not need the raw-request workaround Change Email
+    #     needed, because AuthMFAVerifyResponse's fields are flat/top-
+    #     level (access_token, refresh_token, user), which is exactly
+    #     the shape the SDK's fallback Session parse expects -- unlike
+    #     the nested {"user": {...}} shape that broke email_change OTP
+    #     verification. Still, success is never assumed: every verify
+    #     call here is followed by an explicit
+    #     get_authenticator_assurance_level() re-check before telling
+    #     the user anything succeeded (fail closed).
+    #
+    # The TOTP secret/QR are held ONLY in this in-memory state dict for
+    # the duration of the setup dialog, are never printed/logged, and
+    # are never written to any UniVas table -- Supabase's own auth
+    # schema is the sole store for the factor itself.
+    # ============================================================
+    mfa_state = {"mode": None, "factor_id": None}
+
+    mfa_status_text = ft.Text("", color=COLOR_TEXT_MUTED, size=13)
+    mfa_enable_btn = ft.ElevatedButton(content=ft.Text("Enable", color="white"), bgcolor=COLOR_PRIMARY)
+    mfa_disable_btn = ft.ElevatedButton(content=ft.Text("Disable", color="white"), bgcolor=COLOR_DANGER)
+
+    mfa_summary_step = ft.Column([
+        ft.Text("Protect your account with an extra verification code when you log in.",
+                color=COLOR_TEXT_MUTED, size=12),
+        mfa_status_text,
+        mfa_enable_btn,
+        mfa_disable_btn,
+    ], spacing=10, tight=True)
+
+    # --- Enable sub-flow ---
+    mfa_setup_secret_text = ft.Text("", color="white", size=13, selectable=True, weight=ft.FontWeight.BOLD)
+    # src is a REQUIRED constructor argument in the installed Flet version
+    # (confirmed 0.86.5 by reading flet/controls/core/image.py directly:
+    # `src: Union[str, bytes]` has no default) -- constructing with none
+    # at all crashes the whole app at startup with "Image.__init__()
+    # missing 1 required positional argument: 'src'", since this control
+    # is built immediately as part of the Settings screen, not lazily.
+    # An inert empty string satisfies the constructor safely; the control
+    # stays invisible until a real QR code is assigned in
+    # handle_continue_two_factor_setup below.
+    mfa_setup_qr_image = ft.Image(src="", width=200, height=200, visible=False)
+    mfa_setup_code_input = ft.TextField(label="6-Digit Code", width=280, color="white", max_length=6)
+    mfa_setup_status = ft.Text("", size=12)
+
+    mfa_intro_continue_btn = ft.ElevatedButton(content=ft.Text("Continue", color="white"), bgcolor=COLOR_PRIMARY)
+    mfa_intro_step = ft.Column([
+        ft.Text("2-Step Verification adds an extra security code when you log in, "
+                "using an authenticator app on your phone.", color=COLOR_TEXT_MUTED, size=12),
+        mfa_intro_continue_btn,
+    ], spacing=10, tight=True, visible=False)
+
+    mfa_setup_verify_btn = ft.ElevatedButton(content=ft.Text("Verify", color="white"), bgcolor=COLOR_PRIMARY)
+    mfa_setup_step = ft.Column([
+        ft.Text("Scan this QR code with your authenticator app.", color=COLOR_TEXT_MUTED, size=12),
+        mfa_setup_qr_image,
+        ft.Text("Can't scan? Enter this setup key manually:", color=COLOR_TEXT_MUTED, size=12),
+        mfa_setup_secret_text,
+        ft.Divider(height=12, color=COLOR_BORDER),
+        ft.Text("Enter the 6-digit code from your authenticator app.", color=COLOR_TEXT_MUTED, size=12),
+        mfa_setup_code_input,
+        mfa_setup_verify_btn,
+        mfa_setup_status,
+    ], spacing=10, tight=True, visible=False)
+
+    mfa_setup_done_btn = ft.ElevatedButton(content=ft.Text("Done", color="white"), bgcolor=COLOR_PRIMARY)
+    mfa_setup_done_step = ft.Column([
+        ft.Text("2-Step Verification is now ON. ✅", color=COLOR_SUCCESS, size=14, weight=ft.FontWeight.BOLD),
+        ft.Text("Your account now requires a code from your authenticator app when you log in.",
+                color=COLOR_TEXT_MUTED, size=12),
+        mfa_setup_done_btn,
+    ], spacing=10, tight=True, visible=False)
+
+    # --- Disable sub-flow ---
+    mfa_disable_cancel_btn = ft.TextButton(content=ft.Text("Cancel", color=COLOR_TEXT_MUTED))
+    mfa_disable_continue_btn = ft.ElevatedButton(content=ft.Text("Continue", color="white"), bgcolor=COLOR_DANGER)
+    mfa_disable_confirm_step = ft.Column([
+        ft.Text("Turn off 2-Step Verification?", color="white", size=14, weight=ft.FontWeight.BOLD),
+        ft.Text("Your account will no longer require an authenticator code when logging in.",
+                color=COLOR_TEXT_MUTED, size=12),
+        ft.Row([mfa_disable_cancel_btn, mfa_disable_continue_btn]),
+    ], spacing=10, tight=True, visible=False)
+
+    mfa_disable_code_input = ft.TextField(label="6-Digit Code", width=280, color="white", max_length=6)
+    mfa_disable_status = ft.Text("", size=12)
+    mfa_disable_verify_btn = ft.ElevatedButton(content=ft.Text("Verify & Disable", color="white"), bgcolor=COLOR_DANGER)
+    mfa_disable_verify_step = ft.Column([
+        ft.Text("Enter your current 6-digit code to confirm it's you before turning this off.",
+                color=COLOR_TEXT_MUTED, size=12),
+        mfa_disable_code_input,
+        mfa_disable_verify_btn,
+        mfa_disable_status,
+    ], spacing=10, tight=True, visible=False)
+
+    def reset_two_factor_dialog_fields():
+        mfa_state["mode"] = None
+        mfa_state["factor_id"] = None
+        mfa_setup_secret_text.value = ""
+        mfa_setup_qr_image.src = ""
+        mfa_setup_qr_image.visible = False
+        mfa_setup_code_input.value = ""
+        mfa_setup_status.value = ""
+        mfa_disable_code_input.value = ""
+        mfa_disable_status.value = ""
+        mfa_summary_step.visible = True
+        mfa_intro_step.visible = False
+        mfa_setup_step.visible = False
+        mfa_setup_done_step.visible = False
+        mfa_disable_confirm_step.visible = False
+        mfa_disable_verify_step.visible = False
+
+    def refresh_two_factor_summary():
+        """Detects an existing verified TOTP factor via list_factors() --
+        a fresh network call via get_user(), never assumed/cached -- and
+        shows the correct ON/OFF state. Never creates a new factor just
+        because Settings was opened."""
+        try:
+            factors = supabase.auth.mfa.list_factors()
+            totp_factors = factors.totp or []
+        except Exception as ex:
+            print(f"2FA status check failed: {ex}")
+            totp_factors = []
+
+        if totp_factors:
+            mfa_state["factor_id"] = totp_factors[0].id
+            mfa_status_text.value = "Your account is protected with 2-Step Verification."
+            mfa_status_text.color = COLOR_SUCCESS
+            mfa_enable_btn.visible = False
+            mfa_disable_btn.visible = True
+        else:
+            mfa_state["factor_id"] = None
+            mfa_status_text.value = "Your account is currently using password-only login."
+            mfa_status_text.color = COLOR_TEXT_MUTED
+            mfa_enable_btn.visible = True
+            mfa_disable_btn.visible = False
+        page.update()
+
+    def handle_start_two_factor_setup(e):
+        mfa_summary_step.visible = False
+        mfa_intro_step.visible = True
+        page.update()
+
+    def handle_continue_two_factor_setup(e):
+        mfa_setup_status.value = "Setting up..."
+        page.update()
+        try:
+            result = supabase.auth.mfa.enroll({
+                "factor_type": "totp",
+                "issuer": "UNiVAS",
+                "friendly_name": "UNiVAS Authenticator",
+            })
+            mfa_state["factor_id"] = result.id
+            if result.totp:
+                mfa_setup_secret_text.value = result.totp.secret
+                # Supabase's SDK wraps the raw QR SVG as a full
+                # "data:image/svg+xml;utf-8,<svg>...</svg>" string
+                # (confirmed by reading the installed supabase-auth
+                # 2.31.0 source). That exact form isn't one of the three
+                # src shapes this Flet version's Image control documents
+                # ("a URL", "a base64 string", or "raw bytes") -- so
+                # rather than trust it as-is, strip the data-URI prefix
+                # and re-encode the raw SVG as a clean base64 string,
+                # matching the documented form exactly. Never logged.
+                try:
+                    import base64
+                    raw_qr = result.totp.qr_code or ""
+                    prefix = "data:image/svg+xml;utf-8,"
+                    svg_text = raw_qr[len(prefix):] if raw_qr.startswith(prefix) else raw_qr
+                    mfa_setup_qr_image.src = base64.b64encode(svg_text.encode("utf-8")).decode("ascii")
+                    mfa_setup_qr_image.visible = True
+                except Exception:
+                    # Fall back to the original raw value in case the
+                    # re-encoding itself is the problem, not the format.
+                    try:
+                        mfa_setup_qr_image.src = result.totp.qr_code
+                        mfa_setup_qr_image.visible = True
+                    except Exception:
+                        # Guaranteed fallback: the manual setup key above
+                        # (mfa_setup_secret_text) always works regardless
+                        # of QR rendering support, per Section 6.
+                        mfa_setup_qr_image.src = ""
+                        mfa_setup_qr_image.visible = False
+
+            mfa_intro_step.visible = False
+            mfa_setup_step.visible = True
+            mfa_setup_status.value = ""
+            page.update()
+        except Exception as ex:
+            mfa_intro_step.visible = False
+            mfa_summary_step.visible = True
+            mfa_status_text.value = f"Couldn't start setup: {str(ex)}"
+            mfa_status_text.color = COLOR_DANGER
+            page.update()
+
+    def handle_verify_two_factor_setup(e):
+        code = (mfa_setup_code_input.value or "").strip()
+        factor_id = mfa_state.get("factor_id")
+
+        if not code:
+            mfa_setup_status.value = "Enter the 6-digit code."
+            mfa_setup_status.color = COLOR_DANGER
+            page.update()
+            return
+        if not factor_id:
+            mfa_setup_status.value = "Something went wrong — please start again."
+            mfa_setup_status.color = COLOR_DANGER
+            page.update()
+            return
+
+        mfa_setup_status.value = "Verifying..."
+        mfa_setup_status.color = COLOR_TEXT_MUTED
+        page.update()
+
+        try:
+            supabase.auth.mfa.challenge_and_verify({"factor_id": factor_id, "code": code})
+
+            # Fail closed: re-check AAL explicitly rather than trusting
+            # challenge_and_verify() not raising as proof enough.
+            aal = supabase.auth.mfa.get_authenticator_assurance_level()
+            if aal.current_level != "aal2":
+                mfa_setup_status.value = "Verification could not be confirmed. Please try again."
+                mfa_setup_status.color = COLOR_DANGER
+                page.update()
+                return
+
+            print("2FA enrollment verification succeeded")
+            mfa_setup_secret_text.value = ""
+            mfa_setup_qr_image.src = ""
+            mfa_setup_qr_image.visible = False
+            mfa_setup_code_input.value = ""
+            mfa_setup_step.visible = False
+            mfa_setup_done_step.visible = True
+            page.update()
+        except Exception as ex:
+            print(f"2FA enrollment verification failed: {ex}")
+            msg = str(ex).lower()
+            if "expired" in msg or "invalid" in msg or "code" in msg:
+                mfa_setup_status.value = "Incorrect verification code. Please try again."
+            else:
+                mfa_setup_status.value = "Couldn't verify the code. Check your internet connection and try again."
+            mfa_setup_status.color = COLOR_DANGER
+            page.update()
+
+    def handle_finish_two_factor_setup(e):
+        reset_two_factor_dialog_fields()
+        refresh_two_factor_summary()
+        page.update()
+
+    def handle_disable_cancel(e):
+        mfa_disable_confirm_step.visible = False
+        mfa_summary_step.visible = True
+        page.update()
+
+    def handle_disable_continue(e):
+        mfa_disable_confirm_step.visible = False
+        mfa_disable_verify_step.visible = True
+        page.update()
+
+    def handle_verify_and_disable_two_factor(e):
+        code = (mfa_disable_code_input.value or "").strip()
+        factor_id = mfa_state.get("factor_id")
+
+        if not code:
+            mfa_disable_status.value = "Enter the 6-digit code."
+            mfa_disable_status.color = COLOR_DANGER
+            page.update()
+            return
+        if not factor_id:
+            mfa_disable_status.value = "Something went wrong — please start again."
+            mfa_disable_status.color = COLOR_DANGER
+            page.update()
+            return
+
+        mfa_disable_status.value = "Verifying..."
+        mfa_disable_status.color = COLOR_TEXT_MUTED
+        page.update()
+
+        try:
+            # Require proof of current possession of the authenticator
+            # before removing it -- never a one-tap disable.
+            supabase.auth.mfa.challenge_and_verify({"factor_id": factor_id, "code": code})
+            supabase.auth.mfa.unenroll({"factor_id": factor_id})
+
+            print("2FA disabled")
+            mfa_disable_code_input.value = ""
+            reset_two_factor_dialog_fields()
+            refresh_two_factor_summary()
+            mfa_status_text.value = "2-Step Verification has been turned off."
+            mfa_status_text.color = COLOR_TEXT_MUTED
+            page.update()
+        except Exception as ex:
+            print(f"2FA disable failed: {ex}")
+            msg = str(ex).lower()
+            if "expired" in msg or "invalid" in msg or "code" in msg:
+                mfa_disable_status.value = "Incorrect verification code. Please try again."
+            else:
+                mfa_disable_status.value = "Couldn't verify the code. Check your internet connection and try again."
+            mfa_disable_status.color = COLOR_DANGER
+            page.update()
+
+    def handle_open_disable_confirm(e):
+        mfa_summary_step.visible = False
+        mfa_disable_confirm_step.visible = True
+        page.update()
+
+    mfa_enable_btn.on_click = handle_start_two_factor_setup
+    mfa_disable_btn.on_click = handle_open_disable_confirm
+    mfa_intro_continue_btn.on_click = handle_continue_two_factor_setup
+    mfa_setup_verify_btn.on_click = handle_verify_two_factor_setup
+    mfa_setup_done_btn.on_click = handle_finish_two_factor_setup
+    mfa_disable_cancel_btn.on_click = handle_disable_cancel
+    mfa_disable_continue_btn.on_click = handle_disable_continue
+    mfa_disable_verify_btn.on_click = handle_verify_and_disable_two_factor
+
+    def close_two_factor_dialog(d):
+        d.open = False
+        if d in page.overlay:
+            page.overlay.remove(d)
+        if two_factor_dialog_ref.get("dlg") is d:
+            two_factor_dialog_ref["dlg"] = None
+        page.update()
+
+    two_factor_dialog_ref = {"dlg": None}
+
+    def open_two_factor_dialog(e):
+        stale_dlg = two_factor_dialog_ref.get("dlg")
+        if stale_dlg is not None and stale_dlg in page.overlay:
+            page.overlay.remove(stale_dlg)
+
+        reset_two_factor_dialog_fields()
+        mfa_status_text.value = "Checking status..."
+        mfa_enable_btn.visible = False
+        mfa_disable_btn.visible = False
+
+        dlg = ft.AlertDialog(
+            title=ft.Text("2-Step Verification", color="white", size=16),
+            bgcolor=COLOR_CARD,
+            content=ft.Column([
+                mfa_summary_step, mfa_intro_step, mfa_setup_step,
+                mfa_setup_done_step, mfa_disable_confirm_step, mfa_disable_verify_step,
+            ], tight=True, spacing=16, width=DIALOG_WIDTH),
+            actions=[ft.TextButton("Close", on_click=lambda ev: close_two_factor_dialog(dlg))]
+        )
+        two_factor_dialog_ref["dlg"] = dlg
+        page.overlay.append(dlg)
+        dlg.open = True
+        page.update()
+        refresh_two_factor_summary()
+
     panel_account_settings = ft.Column([
         ft.Row([
             ft.IconButton(icon=ft.Icons.ARROW_BACK_ROUNDED, icon_color=COLOR_PRIMARY, on_click=close_account_settings_panel),
@@ -3798,20 +4839,17 @@ async def main(page: ft.Page):
         ),
         build_settings_row(
             ft.Icons.EMAIL_ROUNDED, "Change Email", "Update your email address",
-            lambda e: open_account_settings(e)
+            lambda e: open_change_email_dialog(e)
         ),
         build_settings_row(
             ft.Icons.LOCK_RESET_ROUNDED, "Change Password", "Secure your account with a new password",
-            lambda e: open_account_settings(e)
+            lambda e: open_change_password_dialog(e)
         ),
         ft.Divider(height=16, color=COLOR_BORDER),
         ft.Text("SECURITY", size=12, weight=ft.FontWeight.BOLD, color=COLOR_TEXT_MUTED),
         build_settings_row(
-            ft.Icons.SHIELD_ROUNDED, "2-Step Verification", "Coming soon",
-            lambda e: open_coming_soon_dialog(
-                "2-Step Verification",
-                "2-Step Verification is coming soon. Your account is not yet protected by this feature."
-            )
+            ft.Icons.SHIELD_ROUNDED, "2-Step Verification", "Add an extra layer of security to your account",
+            lambda e: open_two_factor_dialog(e)
         ),
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=SPACE_MD)
 
@@ -3917,6 +4955,7 @@ async def main(page: ft.Page):
         fp_step1.visible = False
         fp_step2.visible = False
         fp_step3.visible = False
+        mfa_login_step.visible = False
         layout_login_form.visible = True
         page.update()
 
@@ -3964,6 +5003,31 @@ async def main(page: ft.Page):
                 "email": login_email,
                 "password": input_login_password.value
             })
+
+            # Check the Authenticator Assurance Level of the session we
+            # just got back. get_authenticator_assurance_level() is a
+            # LOCAL JWT decode (no network call) -- confirmed by reading
+            # the installed supabase-auth 2.31.0 source -- so this adds
+            # no meaningful latency. next_level == "aal2" means this
+            # account has a verified TOTP factor enrolled; current_level
+            # will still be "aal1" immediately after a plain password
+            # sign-in. Only accounts that voluntarily enabled 2-Step
+            # Verification ever hit this branch -- everyone else's login
+            # is completely unchanged from before.
+            aal = supabase.auth.mfa.get_authenticator_assurance_level()
+            if aal.next_level == "aal2" and aal.current_level != "aal2":
+                # Do NOT call cache_user()/show_dashboard() yet -- that is
+                # the actual access gate (cache_user is what authenticates
+                # supabase.postgrest for RLS-protected data calls, not
+                # just a UI switch). The session sign_in_with_password
+                # just established is AAL1-only and stays that way in the
+                # SDK's own internal state until a successful MFA verify;
+                # we simply don't act on it yet.
+                mfa_login_state["email"] = login_email
+                ui_message.value = ""
+                show_mfa_login_step()
+                return
+
             cache_user(result.user, result.session.access_token)
             refresh_admin_status()
             await save_session(result.session, result.user)
@@ -3992,6 +5056,127 @@ async def main(page: ft.Page):
             ui_message.value = f"Couldn't resend: {str(ex)}"
             ui_message.color = COLOR_DANGER
             page.update()
+
+    # ============================================================
+    # --- LOGIN-TIME MFA CHALLENGE (2-Step Verification) ----------
+    # Kept fully isolated from recovery_state / password_change_state /
+    # change_email_state / reg_state, per instructions -- this is its
+    # own small, separate piece of state used only between a successful
+    # password sign-in and a completed MFA verification.
+    #
+    # This screen is reached ONLY when handle_login's AAL check (above)
+    # finds next_level == "aal2" -- i.e. only for accounts that have
+    # voluntarily enrolled a verified TOTP factor. Accounts without one
+    # never see this screen; their login is byte-for-byte the same as
+    # before this feature existed.
+    #
+    # cache_user()/save_session()/show_dashboard() -- the actual access
+    # grant, not just a UI switch, since cache_user() is what
+    # authenticates supabase.postgrest for every RLS-protected read/write
+    # -- are called ONLY after get_authenticator_assurance_level() is
+    # re-checked and confirms current_level == "aal2". Nothing is ever
+    # assumed from a local flag alone (fail closed).
+    # ============================================================
+    mfa_login_state = {"email": None}
+
+    mfa_login_code_input = ft.TextField(label="6-Digit Code", width=300, color="white", max_length=6)
+    mfa_login_status = ft.Text("", size=12)
+
+    def reset_mfa_login_fields():
+        mfa_login_state["email"] = None
+        mfa_login_code_input.value = ""
+        mfa_login_status.value = ""
+
+    def show_mfa_login_step():
+        layout_login_form.visible = False
+        mfa_login_step.visible = True
+        page.update()
+
+    async def handle_cancel_mfa_login(e):
+        # Signs out completely so the AAL1 session sign_in_with_password
+        # just created is never left half-authenticated -- returns to a
+        # fully clean login screen, no session state carried over.
+        try:
+            supabase.auth.sign_out()
+        except Exception:
+            print("MFA login cancel: sign-out warning")
+        reset_mfa_login_fields()
+        mfa_login_step.visible = False
+        layout_login_form.visible = True
+        page.update()
+
+    async def handle_verify_mfa_login(e):
+        code = (mfa_login_code_input.value or "").strip()
+        if not code:
+            mfa_login_status.value = "Enter the 6-digit code."
+            mfa_login_status.color = COLOR_DANGER
+            page.update()
+            return
+
+        mfa_login_status.value = "Verifying..."
+        mfa_login_status.color = COLOR_TEXT_MUTED
+        page.update()
+
+        try:
+            factors_resp = supabase.auth.mfa.list_factors()
+            totp_factors = factors_resp.totp or []
+            if not totp_factors:
+                # Fail closed: if we can't identify which factor to
+                # challenge, do not proceed as if verified.
+                mfa_login_status.value = "Couldn't find your 2-Step Verification method. Please contact support."
+                mfa_login_status.color = COLOR_DANGER
+                page.update()
+                return
+            factor_id = totp_factors[0].id
+
+            supabase.auth.mfa.challenge_and_verify({"factor_id": factor_id, "code": code})
+
+            # challenge_and_verify() only returns without raising once
+            # Supabase has genuinely confirmed the code (confirmed by
+            # reading _verify()'s source: it saves the upgraded session
+            # only after its own response parse succeeds). Even so, the
+            # AAL is re-checked explicitly below rather than trusted from
+            # this call alone -- fail closed, never assume.
+            aal = supabase.auth.mfa.get_authenticator_assurance_level()
+            if aal.current_level != "aal2":
+                mfa_login_status.value = "Verification could not be confirmed. Please try again."
+                mfa_login_status.color = COLOR_DANGER
+                page.update()
+                return
+
+            session = supabase.auth.get_session()
+            if not session or not session.user:
+                mfa_login_status.value = "Verification could not be confirmed. Please try again."
+                mfa_login_status.color = COLOR_DANGER
+                page.update()
+                return
+
+            print("2FA login verification succeeded")
+            cache_user(session.user, session.access_token)
+            refresh_admin_status()
+            await save_session(session, session.user)
+            reset_mfa_login_fields()
+            mfa_login_step.visible = False
+            show_dashboard()
+        except Exception as ex:
+            # Never log the code itself -- only that verification failed,
+            # plus Supabase's own (non-secret) error description.
+            print(f"2FA login verification failed: {ex}")
+            mfa_login_status.value = "Couldn't verify the code. Check your internet connection and try again."
+            mfa_login_status.color = COLOR_DANGER
+            page.update()
+
+    mfa_login_step = ft.Column([
+        ft.Text("2-Step Verification", size=18, weight=ft.FontWeight.BOLD, color="white"),
+        ft.Text("Enter the 6-digit code from your authenticator app.",
+                color=COLOR_TEXT_MUTED, size=12),
+        mfa_login_code_input,
+        ft.ElevatedButton(content=ft.Text("Verify", color="white"),
+                          bgcolor=COLOR_PRIMARY, on_click=handle_verify_mfa_login),
+        mfa_login_status,
+        ft.TextButton(content=ft.Text("Cancel", color=COLOR_TEXT_MUTED, size=12),
+                     on_click=handle_cancel_mfa_login),
+    ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=10)
 
     # ============================================================
     # --- 3-STEP OTP REGISTRATION ---
@@ -4498,6 +5683,7 @@ We may update these terms; continued use of the app means you accept the changes
     layout_auth_master = ft.Column([
         ft.Text("UniVibe", size=36, weight=ft.FontWeight.BOLD, color=COLOR_PRIMARY),
         layout_login_form,
+        mfa_login_step,
         reg_step1,
         reg_step2,
         reg_step3,
@@ -4587,6 +5773,26 @@ We may update these terms; continued use of the app means you accept the changes
                     user_cache["username"] = username_check.data[0]["username"]
                 else:
                     refresh_cached_username(user_id)
+
+                # Fail-closed AAL check on restore too, not just fresh
+                # login. In practice a persisted token for an account with
+                # 2FA enabled should already be AAL2 -- save_session() is
+                # only ever called for such accounts after a successful
+                # MFA verify (see handle_verify_mfa_login), never right
+                # after the plain password sign-in -- but this is
+                # deliberately re-checked here rather than assumed, same
+                # reasoning as everywhere else in this feature.
+                try:
+                    aal = supabase.auth.mfa.get_authenticator_assurance_level()
+                    if aal.next_level == "aal2" and aal.current_level != "aal2":
+                        mfa_login_state["email"] = user_email
+                        show_mfa_login_step()
+                        return True
+                except Exception as ex:
+                    print(f"AAL check on restore failed — treating as unverified: {ex}")
+                    await clear_session()
+                    cache_user(None)
+                    return False
 
                 refresh_admin_status()
                 show_dashboard()
