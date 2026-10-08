@@ -951,7 +951,7 @@ async def main(page: ft.Page):
             )
         for w in posts:
             post_id = w.get("id")
-            revealed_name = whisper_reveal_state.get(post_id)
+            revealed_name = whisper_reveal_state.get(post_id) if user_cache.get("is_admin") else None
             is_revealed = revealed_name is not None
             display_tag = f"Anonymous Ghost [Real: {revealed_name}]" if is_revealed else "Anonymous Ghost \U0001F47B"
             header_color = COLOR_WARNING if is_revealed else COLOR_DANGER
@@ -1398,14 +1398,17 @@ async def main(page: ft.Page):
             )
         menu_grid = ft.Column(menu_grid_rows, spacing=SPACE_MD)
 
-        logout_row = ft.Container(
-            content=ft.Row([
-                ft.Icon(ft.Icons.LOGOUT_ROUNDED, color=COLOR_DANGER, size=18),
-                ft.Text("Log Out", color=COLOR_DANGER, weight=ft.FontWeight.BOLD, size=13)
-            ], alignment=ft.MainAxisAlignment.CENTER, spacing=8),
-            padding=SPACE_MD, border_radius=RADIUS_MD, bgcolor=COLOR_WHISPER,
-            ink=True, on_click=lambda ev: handle_logout_from_menu(dlg)
-        )
+        # A real button (not a clickable Container): on the Windows desktop
+        # window the old Container row did not react to the mouse at all.
+        logout_row = ft.Row([
+            ft.TextButton(
+                content=ft.Row([
+                    ft.Icon(ft.Icons.LOGOUT_ROUNDED, color=COLOR_DANGER, size=18),
+                    ft.Text("Log Out", color=COLOR_DANGER, weight=ft.FontWeight.BOLD, size=13)
+                ], alignment=ft.MainAxisAlignment.CENTER, spacing=8),
+                on_click=lambda ev: handle_logout_from_menu(dlg)
+            )
+        ], alignment=ft.MainAxisAlignment.CENTER)
 
         # Everything below the grid: Admin Console (unchanged, conditional
         # on is_admin exactly as before) then a divider then Logout.
@@ -1748,6 +1751,11 @@ async def main(page: ft.Page):
     def cache_user(user_obj, access_token=None):
         """Store the user's info and force the PostgREST client to use
         their JWT token — without this, RLS sees all requests as anonymous."""
+        # Revealed Whisper identities belong to the admin session that asked
+        # for them: forget them on logout and whenever a different user signs in.
+        if (not user_obj) or user_cache.get("id") != getattr(user_obj, "id", None):
+            whisper_reveal_state.clear()
+            whisper_reveal_inprogress.clear()
         if user_obj:
             user_cache["id"] = user_obj.id
             user_cache["email"] = user_obj.email
@@ -5339,6 +5347,7 @@ async def main(page: ft.Page):
         fp_step3.visible = False
         mfa_login_step.visible = False
         layout_login_form.visible = True
+        input_login_password.value = ""
         page.update()
 
     def switch_to_register(e):
@@ -5465,6 +5474,7 @@ async def main(page: ft.Page):
             refresh_admin_status()
             await save_session(result.session, result.user)
             ui_message.value = ""
+            input_login_password.value = ""
             show_dashboard()
         except Exception as ex:
             if "not confirmed" in str(ex).lower() or "confirm" in str(ex).lower():
