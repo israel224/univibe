@@ -5357,15 +5357,14 @@ async def main(page: ft.Page):
         ui_message.value = ""
         page.update()
 
-    def login_via_username_function(username, password):
-        """Username sign-in runs on the server (Supabase Edge Function
-        'login-with-username'). The server looks up the email, checks the
-        password and applies the 5-tries / 15-minute lockout, then returns
-        a session. The email address never reaches this app.
-        Returns (http_status, parsed_json_body); status 0 = network problem."""
+    def call_edge_function(function_name, payload):
+        """Calls one of our Supabase Edge Functions and returns
+        (http_status, parsed_json_body); status 0 = network problem.
+        Used for username login and username password-reset, which run on
+        the server so the account's email address never reaches the app."""
         request = urllib.request.Request(
-            f"{SUPABASE_URL}/functions/v1/login-with-username",
-            data=json.dumps({"username": username, "password": password}).encode("utf-8"),
+            f"{SUPABASE_URL}/functions/v1/{function_name}",
+            data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
                 "apikey": SUPABASE_KEY,
@@ -5382,8 +5381,19 @@ async def main(page: ft.Page):
             except Exception:
                 return http_error.code, {}
         except Exception as ex:
-            print(f"login function request failed: {type(ex).__name__}")
+            print(f"edge function request failed ({function_name}): {type(ex).__name__}")
             return 0, {}
+
+    def login_via_username_function(username, password):
+        """Username sign-in runs on the server (Edge Function
+        'login-with-username'): it looks up the email, checks the password,
+        applies the 5-tries / 15-minute lockout and returns a session."""
+        return call_edge_function("login-with-username", {"username": username, "password": password})
+
+    def reset_via_username_function(payload):
+        """Username password-reset runs on the server (Edge Function
+        'reset-with-username'): actions send / verify / reset."""
+        return call_edge_function("reset-with-username", payload)
 
     async def handle_login(e):
         if not input_login_email.value or not input_login_password.value:
@@ -5844,7 +5854,7 @@ We may update these terms; continued use of the app means you accept the changes
     # interfere with the normal login session or the session-refresh
     # wrapper (safe_supabase_call / try_restore_session) at all.
     # ============================================================
-    recovery_state = {"identifier": None, "email": None, "session": None}
+    recovery_state = {"identifier": None, "email": None, "session": None, "username": None, "ticket": None}
 
     input_fp_identifier = ft.TextField(label="Email or Username", width=300, color="white")
     input_fp_otp = ft.TextField(label="6-Digit Code", width=300, color="white", max_length=6)
@@ -5859,6 +5869,8 @@ We may update these terms; continued use of the app means you accept the changes
         recovery_state["identifier"] = None
         recovery_state["email"] = None
         recovery_state["session"] = None
+        recovery_state["username"] = None
+        recovery_state["ticket"] = None
         input_fp_identifier.value = ""
         input_fp_otp.value = ""
         input_fp_new_password.value = ""
@@ -5908,47 +5920,44 @@ We may update these terms; continued use of the app means you accept the changes
         try:
             if "@" in identifier:
                 recovery_email = identifier
+                # Uses the dedicated password-recovery API (reset_password_for_email)
+                # instead of sign_in_with_otp. sign_in_with_otp routes an EXISTING,
+                # already-confirmed account to Supabase's "Magic Link" email
+                # template (a sign-in link) regardless of should_create_user --
+                # only a brand-new, unconfirmed account (registration's case)
+                # gets the "Confirm signup" template, which is the one already
+                # customized to show the 6-digit {{ .Token }}. reset_password_for_email
+                # instead fires the "Reset Password" template, which needs that
+                # same {{ .Token }} customization in the Supabase Dashboard
+                # (Authentication -> Email Templates -> Reset Password) to show
+                # a code instead of a link.
+                try:
+                    supabase.auth.reset_password_for_email(recovery_email, {})
+                except AttributeError:
+                    # Older gotrue-py naming, kept as a fallback so this doesn't
+                    # hard-break on a slightly different installed SDK version.
+                    supabase.auth.reset_password_email(recovery_email, {})
             else:
-                # Username lookup now goes through the narrow get_email_for_login
-                # RPC (never reads profiles.email directly; profiles' SELECT
-                # policy is owner-only). Uses the same safe_supabase_call
-                # wrapper as every other read in the app, so a mid-lookup
-                # session hiccup is retried the same way.
-                lookup = safe_supabase_call(
-                    lambda: supabase.rpc("get_email_for_login", {"p_username": identifier}).execute()
-                )
-                if lookup is None:
-                    fp_step1_status.value = "Something went wrong — please try again."
+                # Username: the server finds the account, sends the code to
+                # its email and always answers the same way, so the app never
+                # learns the email address or whether the username exists.
+                recovery_email = None
+                status, data = reset_via_username_function({"action": "send", "username": identifier})
+                if status == 429:
+                    fp_step1_status.value = (data or {}).get("error") or "Too many requests. Please try again in 15 minutes."
                     fp_step1_status.color = COLOR_DANGER
                     page.update()
                     return
-                if not lookup.data:
-                    fp_step1_status.value = "No account found for that username."
+                if status != 200:
+                    fp_step1_status.value = "Couldn't send the code right now. Please check your connection and try again."
                     fp_step1_status.color = COLOR_DANGER
                     page.update()
                     return
-                recovery_email = lookup.data
-
-            # Uses the dedicated password-recovery API (reset_password_for_email)
-            # instead of sign_in_with_otp. sign_in_with_otp routes an EXISTING,
-            # already-confirmed account to Supabase's "Magic Link" email
-            # template (a sign-in link) regardless of should_create_user —
-            # only a brand-new, unconfirmed account (registration's case)
-            # gets the "Confirm signup" template, which is the one already
-            # customized to show the 6-digit {{ .Token }}. reset_password_for_email
-            # instead fires the "Reset Password" template, which needs that
-            # same {{ .Token }} customization in the Supabase Dashboard
-            # (Authentication -> Email Templates -> Reset Password) to show
-            # a code instead of a link.
-            try:
-                supabase.auth.reset_password_for_email(recovery_email, {})
-            except AttributeError:
-                # Older gotrue-py naming, kept as a fallback so this doesn't
-                # hard-break on a slightly different installed SDK version.
-                supabase.auth.reset_password_email(recovery_email, {})
 
             recovery_state["identifier"] = identifier
             recovery_state["email"] = recovery_email
+            recovery_state["username"] = None if recovery_email else identifier
+            recovery_state["ticket"] = None
             fp_step1_status.value = ""
             fp_step1.visible = False
             fp_step2.visible = True
@@ -5961,6 +5970,19 @@ We may update these terms; continued use of the app means you accept the changes
             page.update()
 
     def handle_resend_recovery_code(e):
+        if recovery_state.get("username"):
+            status, data = reset_via_username_function({"action": "send", "username": recovery_state["username"]})
+            if status == 200:
+                fp_step2_status.value = "Code resent — check your inbox."
+                fp_step2_status.color = COLOR_SUCCESS
+            elif status == 429:
+                fp_step2_status.value = (data or {}).get("error") or "Too many requests. Please try again in 15 minutes."
+                fp_step2_status.color = COLOR_DANGER
+            else:
+                fp_step2_status.value = "Couldn't resend the code right now. Please try again."
+                fp_step2_status.color = COLOR_DANGER
+            page.update()
+            return
         if not recovery_state.get("email"):
             return
         try:
@@ -5980,6 +6002,31 @@ We may update these terms; continued use of the app means you accept the changes
         code = (input_fp_otp.value or "").strip()
         if not code:
             fp_step2_status.value = "Enter the 6-digit code."
+            fp_step2_status.color = COLOR_DANGER
+            page.update()
+            return
+        if recovery_state.get("username"):
+            # Username flow: the server checks the code and hands back a
+            # short-lived one-time ticket (no session, no email).
+            status, data = reset_via_username_function({
+                "action": "verify",
+                "username": recovery_state["username"],
+                "code": code,
+            })
+            data = data or {}
+            if status == 200 and data.get("ticket"):
+                recovery_state["ticket"] = data["ticket"]
+                fp_step2_status.value = ""
+                fp_step2.visible = False
+                fp_step3.visible = True
+                page.update()
+                return
+            if status == 429:
+                fp_step2_status.value = data.get("error") or "Too many wrong codes. Please try again in 15 minutes."
+            elif status == 401:
+                fp_step2_status.value = "That code is invalid or expired. Tap Resend for a new one."
+            else:
+                fp_step2_status.value = "Verification failed — please try again."
             fp_step2_status.color = COLOR_DANGER
             page.update()
             return
@@ -6032,6 +6079,29 @@ We may update these terms; continued use of the app means you accept the changes
         if new_password != confirm_password:
             fp_step3_status.value = "Passwords do not match."
             fp_step3_status.color = COLOR_DANGER
+            page.update()
+            return
+        if recovery_state.get("ticket"):
+            # Username flow: the server changes the password using the
+            # one-time ticket from the code step.
+            status, data = reset_via_username_function({
+                "action": "reset",
+                "ticket": recovery_state["ticket"],
+                "password": new_password,
+            })
+            data = data or {}
+            if status == 200:
+                recovery_state["ticket"] = None
+                fp_step3_status.value = "Password changed successfully! ✅"
+                fp_step3_status.color = COLOR_SUCCESS
+            else:
+                if status == 401:
+                    fp_step3_status.value = "Your reset session expired. Please go back and start again."
+                elif status == 400:
+                    fp_step3_status.value = data.get("error") or "Couldn't change the password. Please try again."
+                else:
+                    fp_step3_status.value = "Couldn't change the password right now. Please try again."
+                fp_step3_status.color = COLOR_DANGER
             page.update()
             return
         try:
