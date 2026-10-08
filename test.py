@@ -7,6 +7,9 @@ import uuid
 import mimetypes
 import asyncio
 import urllib.parse
+import urllib.request
+import urllib.error
+import json
 from datetime import datetime, timezone
 
 # --- VIDEO PLAYBACK ---
@@ -540,7 +543,7 @@ async def main(page: ft.Page):
                         ft.IconButton(icon=ft.Icons.SEND_ROUNDED, icon_color=COLOR_PRIMARY, on_click=share_to_chat)]),
                 share_status,
                 ft.Divider(color=COLOR_BORDER),
-                ft.ElevatedButton(
+                ft.Button(
                     content=ft.Row([ft.Icon(ft.Icons.SHARE_ROUNDED, color="white", size=16),
                                     ft.Text("Share via WhatsApp", color="white")], spacing=6),
                     bgcolor=COLOR_WHATSAPP, on_click=share_whatsapp
@@ -1112,6 +1115,9 @@ async def main(page: ft.Page):
         "message": (ft.Icons.MAIL, COLOR_SUCCESS),
         "friend_request": (ft.Icons.PERSON_ADD_ALT_1_ROUNDED, COLOR_WARNING),
         "friend_accept": (ft.Icons.CHECK_CIRCLE_ROUNDED, COLOR_SUCCESS),
+        "post_removed": (ft.Icons.DELETE_OUTLINE_ROUNDED, COLOR_DANGER),
+        "report_violation_reporter": (ft.Icons.GAVEL_ROUNDED, COLOR_WARNING),
+        "report_no_violation": (ft.Icons.INFO_OUTLINE_ROUNDED, COLOR_TEXT_MUTED),
     }
 
     def render_notifications_panel():
@@ -2075,7 +2081,7 @@ async def main(page: ft.Page):
             content=ft.Text("Accept to chat freely, or decline the request.", color=COLOR_TEXT_MUTED, size=13),
             actions=[
                 ft.TextButton("Decline", on_click=do_respond(False)),
-                ft.ElevatedButton("Accept", bgcolor=COLOR_SUCCESS, on_click=do_respond(True)),
+                ft.Button("Accept", bgcolor=COLOR_SUCCESS, on_click=do_respond(True)),
                 ft.TextButton("Close", on_click=lambda ev: close_dlg(dlg))
             ]
         )
@@ -3347,7 +3353,7 @@ async def main(page: ft.Page):
             profile_avatar_img,
             ft.Column([
                 profile_username_label,
-                ft.ElevatedButton(
+                ft.Button(
                     content=ft.Text("Change Photo", size=11, color="white"),
                     bgcolor=COLOR_PRIMARY, on_click=handle_upload_avatar, height=32
                 )
@@ -3361,7 +3367,7 @@ async def main(page: ft.Page):
         state_dd,
         lga_dd,
         my_posts_section,
-        ft.ElevatedButton(
+        ft.Button(
             content=ft.Text("Save Profile", color="white"),
             bgcolor=COLOR_PRIMARY, width=300, on_click=handle_save_profile
         ),
@@ -3510,7 +3516,7 @@ async def main(page: ft.Page):
         refresh_friend_button()
         page.update()
 
-    friend_button = ft.ElevatedButton(
+    friend_button = ft.Button(
         content=ft.Row([friend_btn_icon, friend_btn_text], spacing=6,
                        alignment=ft.MainAxisAlignment.CENTER),
         bgcolor=COLOR_PRIMARY, width=280, on_click=handle_friend_button_click, visible=False
@@ -3585,7 +3591,7 @@ async def main(page: ft.Page):
         view_profile_state,
         view_profile_lga,
         friend_button,
-        ft.ElevatedButton(
+        ft.Button(
             content=ft.Text("Send Message", color="white"),
             bgcolor=COLOR_SUCCESS, width=280,
             on_click=lambda e: handle_start_chat_from_profile()
@@ -3949,7 +3955,7 @@ async def main(page: ft.Page):
         ft.Text("For your security, we'll send a verification code to your registered email.",
                 color=COLOR_TEXT_MUTED, size=12),
         pc_email_display,
-        ft.ElevatedButton(content=ft.Text("Send Verification Code", color="white"),
+        ft.Button(content=ft.Text("Send Verification Code", color="white"),
                           bgcolor=COLOR_PRIMARY, on_click=handle_send_password_change_code),
         pc_step1_status,
     ], spacing=10, tight=True)
@@ -3957,7 +3963,7 @@ async def main(page: ft.Page):
     pc_step2 = ft.Column([
         ft.Text("Enter the verification code we sent you.", color=COLOR_TEXT_MUTED, size=12),
         pc_otp_input,
-        ft.ElevatedButton(content=ft.Text("Verify Code", color="white"),
+        ft.Button(content=ft.Text("Verify Code", color="white"),
                           bgcolor=COLOR_PRIMARY, on_click=handle_verify_password_change_code),
         pc_step2_status,
         ft.TextButton(content=ft.Text("Resend code", color=COLOR_TEXT_MUTED, size=12),
@@ -3968,7 +3974,7 @@ async def main(page: ft.Page):
         ft.Text("Choose a new password.", color=COLOR_TEXT_MUTED, size=12),
         pc_new_password,
         pc_confirm_password,
-        ft.ElevatedButton(content=ft.Text("Update Password", color="white"),
+        ft.Button(content=ft.Text("Update Password", color="white"),
                           bgcolor=COLOR_SUCCESS, on_click=handle_update_password_and_logout),
         pc_step3_status,
     ], spacing=10, tight=True, visible=False)
@@ -4125,7 +4131,7 @@ async def main(page: ft.Page):
 
     ce_email_display = ft.Text("", color=COLOR_TEXT_MUTED, size=13, weight=ft.FontWeight.BOLD)
     ce_step1_status = ft.Text("", size=12)
-    ce_send_code_btn = ft.ElevatedButton(content=ft.Text("Send Verification Code", color="white"),
+    ce_send_code_btn = ft.Button(content=ft.Text("Send Verification Code", color="white"),
                                          bgcolor=COLOR_PRIMARY)
 
     ce_otp_input = ft.TextField(label="6-Digit Code", width=280, color="white", max_length=6)
@@ -4135,7 +4141,7 @@ async def main(page: ft.Page):
     ce_new_email_input = ft.TextField(label="New Email", width=280, color="white",
                                       border_color=COLOR_PRIMARY)
     ce_step3_status = ft.Text("", size=12)
-    ce_new_send_btn = ft.ElevatedButton(content=ft.Text("Send Code to New Email", color="white"),
+    ce_new_send_btn = ft.Button(content=ft.Text("Send Code to New Email", color="white"),
                                         bgcolor=COLOR_PRIMARY)
 
     ce_new_otp_input = ft.TextField(label="6-Digit Code", width=280, color="white", max_length=6)
@@ -4406,7 +4412,7 @@ async def main(page: ft.Page):
     ce_step2 = ft.Column([
         ft.Text("Enter the verification code we sent you.", color=COLOR_TEXT_MUTED, size=12),
         ce_otp_input,
-        ft.ElevatedButton(content=ft.Text("Verify Code", color="white"),
+        ft.Button(content=ft.Text("Verify Code", color="white"),
                           bgcolor=COLOR_PRIMARY, on_click=handle_verify_change_email_code),
         ce_step2_status,
         ce_resend_btn,
@@ -4422,7 +4428,7 @@ async def main(page: ft.Page):
     ce_step4 = ft.Column([
         ft.Text("Enter the code sent to your new email.", color=COLOR_TEXT_MUTED, size=12),
         ce_new_otp_input,
-        ft.ElevatedButton(content=ft.Text("Verify Code", color="white"),
+        ft.Button(content=ft.Text("Verify Code", color="white"),
                           bgcolor=COLOR_SUCCESS, on_click=handle_verify_new_email_code),
         ce_step4_status,
         ce_new_resend_btn,
@@ -4497,8 +4503,8 @@ async def main(page: ft.Page):
     mfa_state = {"mode": None, "factor_id": None}
 
     mfa_status_text = ft.Text("", color=COLOR_TEXT_MUTED, size=13)
-    mfa_enable_btn = ft.ElevatedButton(content=ft.Text("Enable", color="white"), bgcolor=COLOR_PRIMARY)
-    mfa_disable_btn = ft.ElevatedButton(content=ft.Text("Disable", color="white"), bgcolor=COLOR_DANGER)
+    mfa_enable_btn = ft.Button(content=ft.Text("Enable", color="white"), bgcolor=COLOR_PRIMARY)
+    mfa_disable_btn = ft.Button(content=ft.Text("Disable", color="white"), bgcolor=COLOR_DANGER)
 
     mfa_summary_step = ft.Column([
         ft.Text("Protect your account with an extra verification code when you log in.",
@@ -4523,14 +4529,14 @@ async def main(page: ft.Page):
     mfa_setup_code_input = ft.TextField(label="6-Digit Code", width=280, color="white", max_length=6)
     mfa_setup_status = ft.Text("", size=12)
 
-    mfa_intro_continue_btn = ft.ElevatedButton(content=ft.Text("Continue", color="white"), bgcolor=COLOR_PRIMARY)
+    mfa_intro_continue_btn = ft.Button(content=ft.Text("Continue", color="white"), bgcolor=COLOR_PRIMARY)
     mfa_intro_step = ft.Column([
         ft.Text("2-Step Verification adds an extra security code when you log in, "
                 "using an authenticator app on your phone.", color=COLOR_TEXT_MUTED, size=12),
         mfa_intro_continue_btn,
     ], spacing=10, tight=True, visible=False)
 
-    mfa_setup_verify_btn = ft.ElevatedButton(content=ft.Text("Verify", color="white"), bgcolor=COLOR_PRIMARY)
+    mfa_setup_verify_btn = ft.Button(content=ft.Text("Verify", color="white"), bgcolor=COLOR_PRIMARY)
     mfa_setup_step = ft.Column([
         ft.Text("Scan this QR code with your authenticator app.", color=COLOR_TEXT_MUTED, size=12),
         mfa_setup_qr_image,
@@ -4543,7 +4549,7 @@ async def main(page: ft.Page):
         mfa_setup_status,
     ], spacing=10, tight=True, visible=False)
 
-    mfa_setup_done_btn = ft.ElevatedButton(content=ft.Text("Done", color="white"), bgcolor=COLOR_PRIMARY)
+    mfa_setup_done_btn = ft.Button(content=ft.Text("Done", color="white"), bgcolor=COLOR_PRIMARY)
     mfa_setup_done_step = ft.Column([
         ft.Text("2-Step Verification is now ON. ✅", color=COLOR_SUCCESS, size=14, weight=ft.FontWeight.BOLD),
         ft.Text("Your account now requires a code from your authenticator app when you log in.",
@@ -4553,7 +4559,7 @@ async def main(page: ft.Page):
 
     # --- Disable sub-flow ---
     mfa_disable_cancel_btn = ft.TextButton(content=ft.Text("Cancel", color=COLOR_TEXT_MUTED))
-    mfa_disable_continue_btn = ft.ElevatedButton(content=ft.Text("Continue", color="white"), bgcolor=COLOR_DANGER)
+    mfa_disable_continue_btn = ft.Button(content=ft.Text("Continue", color="white"), bgcolor=COLOR_DANGER)
     mfa_disable_confirm_step = ft.Column([
         ft.Text("Turn off 2-Step Verification?", color="white", size=14, weight=ft.FontWeight.BOLD),
         ft.Text("Your account will no longer require an authenticator code when logging in.",
@@ -4563,7 +4569,7 @@ async def main(page: ft.Page):
 
     mfa_disable_code_input = ft.TextField(label="6-Digit Code", width=280, color="white", max_length=6)
     mfa_disable_status = ft.Text("", size=12)
-    mfa_disable_verify_btn = ft.ElevatedButton(content=ft.Text("Verify & Disable", color="white"), bgcolor=COLOR_DANGER)
+    mfa_disable_verify_btn = ft.Button(content=ft.Text("Verify & Disable", color="white"), bgcolor=COLOR_DANGER)
     mfa_disable_verify_step = ft.Column([
         ft.Text("Enter your current 6-digit code to confirm it's you before turning this off.",
                 color=COLOR_TEXT_MUTED, size=12),
@@ -4858,21 +4864,367 @@ async def main(page: ft.Page):
         highlight_nav("account_settings")
 
     # ============================================================
-    # --- ADMIN CONSOLE (stub) ------------------------------------
-    # Deliberately minimal for this stage: no moderation actions live
-    # here yet (no bans, suspensions, report review, post removal).
+    # --- ADMIN CONSOLE ---------------------------------------------
     # Access is gated entirely by user_cache["is_admin"], which is set
     # ONLY by refresh_admin_status() calling the am_i_admin() RPC --
     # never by username/email/hardcoded UID. This panel is a fully
     # separate screen from every normal-user panel above; it shares no
     # controls or state with them.
+    #
+    # REPORTS SECTION: the actual admin authorization boundary is
+    # enforced SERVER-SIDE inside the new get_admin_post_reports() /
+    # get_admin_user_reports() RPCs (SECURITY DEFINER, checking
+    # auth.uid() + am_i_admin() internally, mirroring the exact same
+    # pattern already proven by admin_reveal_whisper_author()) -- the
+    # UI gating below is a convenience, not the security boundary.
+    # Reporter/reported-user usernames are resolved via the existing,
+    # already-safe get_public_profiles RPC (same pattern already used
+    # by open_blocked_users_dialog), never a new/invented join.
     # ============================================================
     admin_role_text = ft.Text("", color=COLOR_TEXT_MUTED, size=13)
+    admin_post_reports_subtitle = ft.Text("Tap to view", color=COLOR_TEXT_MUTED, size=11)
+    admin_user_reports_subtitle = ft.Text("Tap to view", color=COLOR_TEXT_MUTED, size=11)
+    admin_reports_state = {"post_loading": False, "user_loading": False}
 
     def close_admin_panel(e):
         panel_admin.visible = False
         set_panel_visibility(feed=True)
         render_public_feed()
+
+    def admin_review_post_report_action(report_id, decision):
+        """Calls the admin_review_post_report RPC. Returns (success, error).
+        Server-side derives status from decision and sets reviewed_by/
+        reviewed_at from auth.uid()/now() -- nothing client-controlled
+        beyond the report_id and the decision itself, and the RPC's own
+        am_i_admin() check is the real authorization boundary, not
+        anything here."""
+        try:
+            result = safe_supabase_call(
+                lambda: supabase.rpc("admin_review_post_report", {
+                    "p_report_id": report_id,
+                    "p_decision": decision
+                }).execute()
+            )
+            if result is None:
+                return False, "Your session expired — please log in again."
+            return True, None
+        except Exception as ex:
+            return False, str(ex)
+
+    def get_admin_post_reports_data():
+        """Returns (rows, error_message). rows is None only on failure --
+        an empty list is a genuine 'no reports' result, never confused
+        with a fetch failure (same distinction this app already makes
+        elsewhere, e.g. get_my_accepted_connections)."""
+        try:
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("get_admin_post_reports", {}).execute()
+            )
+            if resp is None:
+                return None, "Your session expired — please log in again."
+            return (resp.data or []), None
+        except Exception as ex:
+            print(f"get_admin_post_reports error: {ex}")
+            return None, "Couldn't load post reports — try again."
+
+    def get_admin_user_reports_data():
+        try:
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("get_admin_user_reports", {}).execute()
+            )
+            if resp is None:
+                return None, "Your session expired — please log in again."
+            return (resp.data or []), None
+        except Exception as ex:
+            print(f"get_admin_user_reports error: {ex}")
+            return None, "Couldn't load user reports — try again."
+
+    def resolve_usernames(user_ids):
+        """Batched username lookup via the existing get_public_profiles
+        RPC -- the same safe, already-proven mechanism used by
+        open_blocked_users_dialog. Returns {user_id: username}; any ID
+        that fails to resolve is simply absent from the result (callers
+        already fall back to 'Unknown')."""
+        ids = list({uid for uid in user_ids if uid})
+        if not ids:
+            return {}
+        try:
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("get_public_profiles", {"p_user_ids": ids}).execute()
+            )
+            return {u.get("user_id"): u.get("username", "Unknown") for u in ((resp.data if resp else []) or [])}
+        except Exception as ex:
+            print(f"resolve_usernames error: {ex}")
+            return {}
+
+    def open_post_reports_dialog(e):
+        reports_col = ft.Column(spacing=8, scroll=ft.ScrollMode.AUTO, height=380, width=DIALOG_WIDTH)
+        refresh_btn = ft.IconButton(icon=ft.Icons.REFRESH_ROUNDED, icon_color=COLOR_PRIMARY, tooltip="Refresh")
+
+        def load_reports():
+            if admin_reports_state["post_loading"]:
+                return  # a load is already in flight -- ignore repeat taps
+            admin_reports_state["post_loading"] = True
+            refresh_btn.disabled = True
+            reports_col.controls.clear()
+            reports_col.controls.append(
+                ft.Row([ft.ProgressRing(width=16, height=16, stroke_width=2),
+                       ft.Text("Loading post reports...", color=COLOR_TEXT_MUTED, size=12)], spacing=10)
+            )
+            page.update()
+
+            rows, error = get_admin_post_reports_data()
+            reports_col.controls.clear()
+
+            if error:
+                reports_col.controls.append(ft.Text(error, color=COLOR_DANGER, size=12))
+            elif not rows:
+                reports_col.controls.append(ft.Text("No post reports.", color=COLOR_TEXT_MUTED, size=12))
+            else:
+                reporter_names = resolve_usernames([r.get("reporter_id") for r in rows])
+                status_colors = {"pending": COLOR_WARNING, "resolved": COLOR_SUCCESS, "dismissed": COLOR_TEXT_MUTED}
+                for r in rows:
+                    reporter = reporter_names.get(r.get("reporter_id"), "Unknown")
+                    time_label = format_relative_time(r.get("created_at"))
+                    post_exists = r.get("post_exists")
+                    status = r.get("status") or "pending"
+                    status_badge = ft.Container(
+                        content=ft.Text(status.upper(), color="white", size=9, weight=ft.FontWeight.BOLD),
+                        padding=ft.Padding.symmetric(horizontal=8, vertical=2),
+                        bgcolor=status_colors.get(status, COLOR_TEXT_MUTED), border_radius=RADIUS_SM
+                    )
+
+                    # Post content/media -- reuses the exact same image/video
+                    # rendering approach already used in the Feed
+                    # (ft.Image for images, tap-to-play container +
+                    # make_play_video_handler for video), so admins see
+                    # reported content the same way it actually appears
+                    # to users. Whisper Wall posts are handled separately
+                    # and never show media (they never have any -- see
+                    # handle_post_whisper) or reveal the author here;
+                    # admin_reveal_whisper_author() remains the only way
+                    # to reveal a Whisper author, untouched by this change.
+                    post_content_controls = []
+                    if not post_exists:
+                        post_content_controls.append(
+                            ft.Text("Reported post is no longer available.", color=COLOR_DANGER, size=12, italic=True)
+                        )
+                    elif r.get("post_is_anonymous"):
+                        post_content_controls.append(
+                            ft.Text("Anonymous Ghost \U0001F47B post", color=COLOR_TEXT_MUTED, size=12)
+                        )
+                        content_text = (r.get("post_content") or "").strip()
+                        if content_text:
+                            post_content_controls.append(ft.Text(content_text[:200], color=COLOR_TEXT_BODY, size=12))
+                    else:
+                        content_text = (r.get("post_content") or "").strip()
+                        media_url = r.get("post_media_url")
+                        media_type = r.get("post_media_type")
+                        has_media = bool(media_url) and media_type in ("image", "video")
+
+                        if content_text:
+                            post_content_controls.append(ft.Text(content_text[:200], color=COLOR_TEXT_BODY, size=12))
+
+                        if media_url and media_type == "image":
+                            post_content_controls.append(
+                                ft.Image(src=media_url, width=260, height=160, fit=ft.BoxFit.COVER, border_radius=RADIUS_MD)
+                            )
+                        elif media_url and media_type == "video":
+                            report_video_container = ft.Container(
+                                content=ft.Row([ft.Icon(ft.Icons.PLAY_CIRCLE_ROUNDED, color="white"),
+                                                ft.Text("Video attached — tap to play", color="white", size=12)]),
+                                padding=SPACE_MD, bgcolor=COLOR_BORDER, border_radius=RADIUS_SM,
+                            )
+                            report_video_container.on_click = make_play_video_handler(
+                                report_video_container, media_url, 260, 160
+                            )
+                            post_content_controls.append(report_video_container)
+
+                        if not content_text and not has_media:
+                            post_content_controls.append(
+                                ft.Text("This post has no text or media content.", color=COLOR_TEXT_MUTED, size=12, italic=True)
+                            )
+
+                    def make_confirm(prompt, on_yes):
+                        def handler(ev):
+                            def do_confirm(cev):
+                                confirm_dlg.open = False
+                                page.update()
+                                on_yes()
+
+                            def do_cancel(cev):
+                                confirm_dlg.open = False
+                                page.update()
+
+                            confirm_dlg = ft.AlertDialog(
+                                title=ft.Text("Are you sure?", color="white", size=15),
+                                bgcolor=COLOR_CARD,
+                                content=ft.Text(prompt, color=COLOR_TEXT_BODY, size=13),
+                                actions=[
+                                    ft.TextButton("Cancel", on_click=do_cancel),
+                                    ft.TextButton("Confirm", on_click=do_confirm),
+                                ]
+                            )
+                            page.overlay.append(confirm_dlg)
+                            confirm_dlg.open = True
+                            page.update()
+                        return handler
+
+                    def make_review_handler(report_id=r.get("id"), decision=None):
+                        def do_review():
+                            success, review_error = admin_review_post_report_action(report_id, decision)
+                            if not success:
+                                reports_col.controls.insert(
+                                    0, ft.Text(f"Couldn't update report: {review_error}", color=COLOR_DANGER, size=12)
+                                )
+                                page.update()
+                                return
+                            load_reports()  # refresh so the new status/buttons reflect immediately
+                        return do_review
+
+                    action_row = None
+                    if status == "pending":
+                        action_row = ft.Row([
+                            ft.TextButton(
+                                content=ft.Text("Mark Violation", color=COLOR_DANGER, size=12, weight=ft.FontWeight.BOLD),
+                                on_click=make_confirm(
+                                    "Mark this post as a violation? This will resolve the report.",
+                                    make_review_handler(report_id=r.get("id"), decision="violation")
+                                )
+                            ),
+                            ft.TextButton(
+                                content=ft.Text("Dismiss — No Violation", color=COLOR_SUCCESS, size=12, weight=ft.FontWeight.BOLD),
+                                on_click=make_confirm(
+                                    "Dismiss this report as no violation? The post will remain available.",
+                                    make_review_handler(report_id=r.get("id"), decision="no_violation")
+                                )
+                            ),
+                        ], spacing=0)
+
+                    card_children = [
+                        ft.Row([
+                            ft.Text(f"Reported by @{reporter}", color=COLOR_PRIMARY, size=12, weight=ft.FontWeight.BOLD, expand=True),
+                            ft.Text(time_label, color=COLOR_TEXT_FAINT, size=10)
+                        ]),
+                        status_badge,
+                        ft.Text(f"Reason: {r.get('reason') or 'No reason given'}", color=COLOR_TEXT_BODY, size=12),
+                        ft.Column(post_content_controls, spacing=4),
+                        ft.Text(f"Post ID: {r.get('post_id') or 'Unknown'}", color=COLOR_TEXT_FAINT, size=9, selectable=True),
+                        ft.Text(f"Reporter ID: {r.get('reporter_id') or 'Unknown'}", color=COLOR_TEXT_FAINT, size=9, selectable=True),
+                    ]
+                    if action_row is not None:
+                        card_children.append(action_row)
+
+                    reports_col.controls.append(
+                        ft.Container(
+                            content=ft.Column(card_children, spacing=4),
+                            padding=SPACE_MD, bgcolor=COLOR_CARD, border_radius=RADIUS_MD
+                        )
+                    )
+            admin_reports_state["post_loading"] = False
+            refresh_btn.disabled = False
+            page.update()
+
+        refresh_btn.on_click = lambda ev: load_reports()
+
+        def close_dlg(d):
+            d.open = False
+            page.update()
+
+        dlg = ft.AlertDialog(
+            title=ft.Row([ft.Text("Post Reports", color="white", size=16, expand=True), refresh_btn]),
+            bgcolor=COLOR_CARD,
+            content=reports_col,
+            actions=[ft.TextButton("Close", on_click=lambda ev: close_dlg(dlg))]
+        )
+        page.overlay.append(dlg)
+        dlg.open = True
+        load_reports()
+        page.update()
+
+    def open_user_reports_dialog(e):
+        reports_col = ft.Column(spacing=8, scroll=ft.ScrollMode.AUTO, height=380, width=DIALOG_WIDTH)
+        refresh_btn = ft.IconButton(icon=ft.Icons.REFRESH_ROUNDED, icon_color=COLOR_PRIMARY, tooltip="Refresh")
+
+        def load_reports():
+            if admin_reports_state["user_loading"]:
+                return
+            admin_reports_state["user_loading"] = True
+            refresh_btn.disabled = True
+            reports_col.controls.clear()
+            reports_col.controls.append(
+                ft.Row([ft.ProgressRing(width=16, height=16, stroke_width=2),
+                       ft.Text("Loading user reports...", color=COLOR_TEXT_MUTED, size=12)], spacing=10)
+            )
+            page.update()
+
+            rows, error = get_admin_user_reports_data()
+            reports_col.controls.clear()
+
+            if error:
+                reports_col.controls.append(ft.Text(error, color=COLOR_DANGER, size=12))
+            elif not rows:
+                reports_col.controls.append(ft.Text("No user reports.", color=COLOR_TEXT_MUTED, size=12))
+            else:
+                all_ids = [r.get("reporter_id") for r in rows] + [r.get("reported_user_id") for r in rows]
+                names = resolve_usernames(all_ids)
+                status_colors = {"pending": COLOR_WARNING, "resolved": COLOR_SUCCESS, "dismissed": COLOR_TEXT_MUTED}
+                for r in rows:
+                    reporter = names.get(r.get("reporter_id"), "Unknown")
+                    reported = names.get(r.get("reported_user_id"), "Unknown")
+                    time_label = format_relative_time(r.get("created_at"))
+                    status = r.get("status") or "pending"
+                    status_badge = ft.Container(
+                        content=ft.Text(status.upper(), color="white", size=9, weight=ft.FontWeight.BOLD),
+                        padding=ft.Padding.symmetric(horizontal=8, vertical=2),
+                        bgcolor=status_colors.get(status, COLOR_TEXT_MUTED), border_radius=RADIUS_SM
+                    )
+                    reports_col.controls.append(
+                        ft.Container(
+                            content=ft.Column([
+                                ft.Row([
+                                    ft.Text(f"@{reporter} reported @{reported}", color=COLOR_PRIMARY, size=12, weight=ft.FontWeight.BOLD, expand=True),
+                                    ft.Text(time_label, color=COLOR_TEXT_FAINT, size=10)
+                                ]),
+                                status_badge,
+                                ft.Text(f"Reason: {r.get('reason') or 'No reason given'}", color=COLOR_TEXT_BODY, size=12),
+                                ft.Text(f"Reported User ID: {r.get('reported_user_id') or 'Unknown'}", color=COLOR_TEXT_FAINT, size=9, selectable=True),
+                                ft.Text(f"Reporter ID: {r.get('reporter_id') or 'Unknown'}", color=COLOR_TEXT_FAINT, size=9, selectable=True),
+                            ], spacing=4),
+                            padding=SPACE_MD, bgcolor=COLOR_CARD, border_radius=RADIUS_MD
+                        )
+                    )
+            admin_reports_state["user_loading"] = False
+            refresh_btn.disabled = False
+            page.update()
+
+        refresh_btn.on_click = lambda ev: load_reports()
+
+        def close_dlg(d):
+            d.open = False
+            page.update()
+
+        dlg = ft.AlertDialog(
+            title=ft.Row([ft.Text("User Reports", color="white", size=16, expand=True), refresh_btn]),
+            bgcolor=COLOR_CARD,
+            content=reports_col,
+            actions=[ft.TextButton("Close", on_click=lambda ev: close_dlg(dlg))]
+        )
+        page.overlay.append(dlg)
+        dlg.open = True
+        load_reports()
+        page.update()
+
+    def refresh_admin_report_counts():
+        post_rows, post_error = get_admin_post_reports_data()
+        admin_post_reports_subtitle.value = (
+            "Couldn't load count" if post_error else f"{len(post_rows)} report(s) — tap to view"
+        )
+        user_rows, user_error = get_admin_user_reports_data()
+        admin_user_reports_subtitle.value = (
+            "Couldn't load count" if user_error else f"{len(user_rows)} report(s) — tap to view"
+        )
+        page.update()
 
     panel_admin = ft.Column([
         ft.Row([
@@ -4888,13 +5240,43 @@ async def main(page: ft.Page):
             padding=SPACE_LG, bgcolor=COLOR_CARD, border_radius=RADIUS_MD, width=340,
             alignment=ft.Alignment.CENTER
         ),
+        ft.Text("REPORTS", size=12, weight=ft.FontWeight.BOLD, color=COLOR_TEXT_MUTED),
+        ft.Container(
+            content=ft.Row([
+                ft.Icon(ft.Icons.FLAG_ROUNDED, color=COLOR_PRIMARY, size=22),
+                ft.Column([
+                    ft.Text("Post Reports", color="white", size=14, weight=ft.FontWeight.BOLD),
+                    admin_post_reports_subtitle
+                ], spacing=2, expand=True),
+                ft.Icon(ft.Icons.CHEVRON_RIGHT_ROUNDED, color=COLOR_TEXT_FAINT, size=18)
+            ], spacing=SPACE_MD, alignment=ft.MainAxisAlignment.START,
+               vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            padding=SPACE_MD, bgcolor=COLOR_CARD, border_radius=RADIUS_MD, width=340,
+            ink=True, on_click=open_post_reports_dialog
+        ),
+        ft.Container(
+            content=ft.Row([
+                ft.Icon(ft.Icons.PERSON_OFF_ROUNDED, color=COLOR_PRIMARY, size=22),
+                ft.Column([
+                    ft.Text("User Reports", color="white", size=14, weight=ft.FontWeight.BOLD),
+                    admin_user_reports_subtitle
+                ], spacing=2, expand=True),
+                ft.Icon(ft.Icons.CHEVRON_RIGHT_ROUNDED, color=COLOR_TEXT_FAINT, size=18)
+            ], spacing=SPACE_MD, alignment=ft.MainAxisAlignment.START,
+               vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            padding=SPACE_MD, bgcolor=COLOR_CARD, border_radius=RADIUS_MD, width=340,
+            ink=True, on_click=open_user_reports_dialog
+        ),
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=16)
 
     def nav_to_admin(e):
         role_label = (user_cache.get("admin_role") or "Admin").replace("_", " ").title()
         admin_role_text.value = f"Role: {role_label}"
+        admin_post_reports_subtitle.value = "Loading..."
+        admin_user_reports_subtitle.value = "Loading..."
         set_panel_visibility(admin=True)
         highlight_nav("admin")
+        refresh_admin_report_counts()
 
     # ============================================================
     # --- AUTH: LOGIN / REGISTER (email + password, no OTP) ---
@@ -4904,24 +5286,24 @@ async def main(page: ft.Page):
 
     ui_message = ft.Text("", size=14)
 
-    # --- STORAGE COMPATIBILITY SHIM ---
+    # --- STORAGE COMPATIBILITY SHIM (Flet 1.0.x: ft.SharedPreferences) ---
+    # Flet 1.0 removed page.client_storage. Persistent storage is the
+    # ft.SharedPreferences service. Services register themselves with the
+    # current page when constructed (inside main(), ft.context.page is this
+    # session's page), so no page.services / page.overlay registration is used.
+    # One instance per session, created here -- before try_restore_session()
+    # runs at the end of main(). If creation or any storage call fails, the
+    # exception is intentionally NOT caught here so the failure is visible.
+    shared_prefs = ft.SharedPreferences()
+
     async def storage_set(key, value):
-        if hasattr(page, "shared_preferences"):
-            await page.shared_preferences.set(key, value)
-        else:
-            page.client_storage.set(key, value)
+        await shared_prefs.set(key, value)
 
     async def storage_get(key):
-        if hasattr(page, "shared_preferences"):
-            return await page.shared_preferences.get(key)
-        else:
-            return page.client_storage.get(key)
+        return await shared_prefs.get(key)
 
     async def storage_remove(key):
-        if hasattr(page, "shared_preferences"):
-            await page.shared_preferences.remove(key)
-        else:
-            page.client_storage.remove(key)
+        await shared_prefs.remove(key)
 
     async def save_session(session, user=None):
         # Persists the Supabase session so the user stays logged in after restart
@@ -4975,6 +5357,34 @@ async def main(page: ft.Page):
         ui_message.value = ""
         page.update()
 
+    def login_via_username_function(username, password):
+        """Username sign-in runs on the server (Supabase Edge Function
+        'login-with-username'). The server looks up the email, checks the
+        password and applies the 5-tries / 15-minute lockout, then returns
+        a session. The email address never reaches this app.
+        Returns (http_status, parsed_json_body); status 0 = network problem."""
+        request = urllib.request.Request(
+            f"{SUPABASE_URL}/functions/v1/login-with-username",
+            data=json.dumps({"username": username, "password": password}).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "apikey": SUPABASE_KEY,
+                "User-Agent": "UniVasApp/1.0",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                return response.status, json.loads(response.read().decode("utf-8") or "{}")
+        except urllib.error.HTTPError as http_error:
+            try:
+                return http_error.code, json.loads(http_error.read().decode("utf-8") or "{}")
+            except Exception:
+                return http_error.code, {}
+        except Exception as ex:
+            print(f"login function request failed: {type(ex).__name__}")
+            return 0, {}
+
     async def handle_login(e):
         if not input_login_email.value or not input_login_password.value:
             ui_message.value = "Please enter your email/username and password."
@@ -4985,24 +5395,37 @@ async def main(page: ft.Page):
             login_input = input_login_email.value.strip()
             if "@" in login_input:
                 login_email = login_input
+                result = supabase.auth.sign_in_with_password({
+                    "email": login_email,
+                    "password": input_login_password.value
+                })
             else:
-                # Treat as username — resolve to the account's email via the
-                # narrow get_email_for_login RPC (never reads profiles.email
-                # directly; profiles' SELECT policy is now owner-only).
-                lookup = safe_supabase_call(
-                    lambda: supabase.rpc("get_email_for_login", {"p_username": login_input}).execute()
+                # Username login happens on the server (see
+                # login_via_username_function). The app never learns the
+                # account's email address; it only receives a session.
+                login_email = None
+                status, data = await asyncio.to_thread(
+                    login_via_username_function, login_input, input_login_password.value
                 )
-                if not lookup or not lookup.data:
-                    ui_message.value = "No account found for that username."
+                data = data or {}
+                session_data = data.get("session") or {}
+                if status == 200 and session_data.get("access_token") and session_data.get("refresh_token"):
+                    result = supabase.auth.set_session(
+                        session_data["access_token"], session_data["refresh_token"]
+                    )
+                else:
+                    if status == 403 and data.get("code") == "email_not_confirmed":
+                        msg = "Please confirm your email first. To get a new confirmation email, type your email address above and tap Resend below."
+                    elif status == 429:
+                        msg = data.get("error") or "Too many failed attempts. Please try again in 15 minutes."
+                    elif status == 401:
+                        msg = "Invalid username or password."
+                    else:
+                        msg = "Couldn't sign in right now. Please check your connection and try again."
+                    ui_message.value = msg
                     ui_message.color = COLOR_DANGER
                     page.update()
                     return
-                login_email = lookup.data
-
-            result = supabase.auth.sign_in_with_password({
-                "email": login_email,
-                "password": input_login_password.value
-            })
 
             # Check the Authenticator Assurance Level of the session we
             # just got back. get_authenticator_assurance_level() is a
@@ -5171,7 +5594,7 @@ async def main(page: ft.Page):
         ft.Text("Enter the 6-digit code from your authenticator app.",
                 color=COLOR_TEXT_MUTED, size=12),
         mfa_login_code_input,
-        ft.ElevatedButton(content=ft.Text("Verify", color="white"),
+        ft.Button(content=ft.Text("Verify", color="white"),
                           bgcolor=COLOR_PRIMARY, on_click=handle_verify_mfa_login),
         mfa_login_status,
         ft.TextButton(content=ft.Text("Cancel", color=COLOR_TEXT_MUTED, size=12),
@@ -5386,7 +5809,7 @@ We may update these terms; continued use of the app means you accept the changes
             ft.Text("I agree to the", color=COLOR_TEXT_MUTED, size=12),
             ft.TextButton(content=ft.Text("Terms & Privacy Policy", color=COLOR_PRIMARY, size=12), on_click=open_terms_dialog)
         ], spacing=0),
-        ft.ElevatedButton(content=ft.Text("Next", color="white"), on_click=handle_reg_step1_next, width=300, bgcolor=COLOR_SUCCESS),
+        ft.Button(content=ft.Text("Next", color="white"), on_click=handle_reg_step1_next, width=300, bgcolor=COLOR_SUCCESS),
         reg_step1_status,
         ft.TextButton(content=ft.Text("Already have an account? Log in", color=COLOR_TEXT_MUTED), on_click=switch_to_login)
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
@@ -5394,7 +5817,7 @@ We may update these terms; continued use of the app means you accept the changes
     reg_step2 = ft.Column([
         ft.Text("Verify Your Email", size=18, weight=ft.FontWeight.BOLD, color="white"),
         input_reg_otp,
-        ft.ElevatedButton(content=ft.Text("Next", color="white"), on_click=handle_verify_reg_otp, width=300, bgcolor=COLOR_SUCCESS),
+        ft.Button(content=ft.Text("Next", color="white"), on_click=handle_verify_reg_otp, width=300, bgcolor=COLOR_SUCCESS),
         reg_step2_status,
         ft.TextButton(content=ft.Text("Resend code", color=COLOR_TEXT_MUTED, size=12), on_click=handle_resend_reg_otp)
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
@@ -5403,7 +5826,7 @@ We may update these terms; continued use of the app means you accept the changes
         ft.Text("Set Your Password", size=18, weight=ft.FontWeight.BOLD, color="white"),
         input_reg_password,
         input_reg_confirm,
-        ft.ElevatedButton(content=ft.Text("Create Account", color="white"), on_click=handle_finalize_registration, width=300, bgcolor=COLOR_SUCCESS),
+        ft.Button(content=ft.Text("Create Account", color="white"), on_click=handle_finalize_registration, width=300, bgcolor=COLOR_SUCCESS),
         reg_step3_status
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
@@ -5648,7 +6071,7 @@ We may update these terms; continued use of the app means you accept the changes
         ft.Text("Reset Your Password", size=18, weight=ft.FontWeight.BOLD, color="white"),
         ft.Text("Enter your email or username", color=COLOR_TEXT_MUTED, size=12),
         input_fp_identifier,
-        ft.ElevatedButton(content=ft.Text("Send Code", color="white"), on_click=handle_send_recovery_code, width=300, bgcolor=COLOR_SUCCESS),
+        ft.Button(content=ft.Text("Send Code", color="white"), on_click=handle_send_recovery_code, width=300, bgcolor=COLOR_SUCCESS),
         fp_step1_status,
         ft.TextButton(content=ft.Text("Back to Login", color=COLOR_TEXT_MUTED), on_click=back_to_login_from_recovery)
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
@@ -5656,7 +6079,7 @@ We may update these terms; continued use of the app means you accept the changes
     fp_step2 = ft.Column([
         ft.Text("Enter the 6-digit code", size=18, weight=ft.FontWeight.BOLD, color="white"),
         input_fp_otp,
-        ft.ElevatedButton(content=ft.Text("Verify Code", color="white"), on_click=handle_verify_recovery_otp, width=300, bgcolor=COLOR_SUCCESS),
+        ft.Button(content=ft.Text("Verify Code", color="white"), on_click=handle_verify_recovery_otp, width=300, bgcolor=COLOR_SUCCESS),
         fp_step2_status,
         ft.TextButton(content=ft.Text("Resend code", color=COLOR_TEXT_MUTED, size=12), on_click=handle_resend_recovery_code),
         ft.TextButton(content=ft.Text("Back to Login", color=COLOR_TEXT_MUTED), on_click=back_to_login_from_recovery)
@@ -5666,7 +6089,7 @@ We may update these terms; continued use of the app means you accept the changes
         ft.Text("Create New Password", size=18, weight=ft.FontWeight.BOLD, color="white"),
         input_fp_new_password,
         input_fp_confirm_password,
-        ft.ElevatedButton(content=ft.Text("Update Password", color="white"), on_click=handle_reset_password_from_recovery, width=300, bgcolor=COLOR_SUCCESS),
+        ft.Button(content=ft.Text("Update Password", color="white"), on_click=handle_reset_password_from_recovery, width=300, bgcolor=COLOR_SUCCESS),
         fp_step3_status,
         ft.TextButton(content=ft.Text("Back to Login", color=COLOR_TEXT_MUTED), on_click=back_to_login_from_recovery)
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
@@ -5674,7 +6097,7 @@ We may update these terms; continued use of the app means you accept the changes
     layout_login_form = ft.Column([
         input_login_email,
         input_login_password,
-        ft.ElevatedButton(content=ft.Text("Log In", color="white"), on_click=handle_login, width=300, bgcolor=COLOR_PRIMARY),
+        ft.Button(content=ft.Text("Log In", color="white"), on_click=handle_login, width=300, bgcolor=COLOR_PRIMARY),
         ft.TextButton(content=ft.Text("Forgot Password?", color=COLOR_TEXT_MUTED), on_click=switch_to_forgot_password),
         ft.TextButton(content=ft.Text("New here? Create an account", color=COLOR_TEXT_MUTED), on_click=switch_to_register),
         ft.TextButton(content=ft.Text("Resend confirmation email", color=COLOR_TEXT_MUTED, size=12), on_click=handle_resend_confirmation)
@@ -5809,6 +6232,6 @@ We may update these terms; continued use of the app means you accept the changes
 
 if "--web" in sys.argv:
     cloud_port = int(os.environ.get("PORT", 8551))
-    ft.app(target=main, view=ft.AppView.WEB_BROWSER, host="0.0.0.0", port=cloud_port)
+    ft.run(main, view=ft.AppView.WEB_BROWSER, host="0.0.0.0", port=cloud_port)
 else:
-    ft.app(target=main)
+    ft.run(main)
