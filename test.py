@@ -48,7 +48,12 @@ PRIVACY_POLICY_URL = ""
 MEDIA_BUCKET = "post-media"
 AVATARS_BUCKET = "avatars"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm"}
+VIDEO_CONTENT_TYPES = {".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm"}
+MAX_POST_VIDEO_BYTES = 50 * 1024 * 1024    # videos: 50 MB (same as the post-media bucket limit)
+MAX_PICKED_IMAGE_BYTES = 25 * 1024 * 1024  # photos are shrunk before upload, so the picked file may be bigger
+MAX_AVATAR_BYTES = 5 * 1024 * 1024         # profile pictures: 5 MB (same as the avatars bucket limit)
+MIN_PASSWORD_LENGTH = 8                    # shortest password accepted when creating or changing one
 
 COUNTRIES = [
     "Nigeria", "Ghana", "Cameroon", "Benin Republic", "Togo", "Niger",
@@ -663,32 +668,14 @@ async def main(page: ft.Page):
             return url.split(marker, 1)[1]
         return None
 
-    def cleanup_post_media(deleted_post):
-        """Removes the post's media file from storage — but only if no other
-        post (e.g. a repost, which reuses the same file URL) still needs it."""
-        media_url = deleted_post.get("media_url")
-        if not media_url:
-            return
-        try:
-            others = safe_supabase_call(
-                lambda: supabase.table("posts").select("id").eq("media_url", media_url).neq("id", deleted_post["id"]).execute()
-            )
-            if others is None:
-                return
-            if others.data:
-                return  # still referenced by another post (e.g. a repost) — keep the file
-            storage_path = extract_storage_path(media_url, MEDIA_BUCKET)
-            if storage_path:
-                safe_supabase_call(lambda: supabase.storage.from_(MEDIA_BUCKET).remove([storage_path]))
-        except Exception as ex:
-            print(f"Media cleanup error: {ex}")
-
     def handle_delete_post(post):
         user_id = get_cached_user_id()
         if not user_id:
             return
         try:
-            cleanup_post_media(post)
+            # The photo/video file is NOT removed here. The database puts it on
+            # a 30-day trash list when the post row is deleted, and a daily job
+            # removes it permanently afterwards.
             result = safe_supabase_call(
                 lambda: supabase.rpc("delete_own_post", {
                     "p_post_id": post["id"]
@@ -1638,7 +1625,7 @@ async def main(page: ft.Page):
         files = await ft.FilePicker().pick_files(
             allow_multiple=False,
             file_type=ft.FilePickerFileType.CUSTOM,
-            allowed_extensions=["jpg", "jpeg", "png", "gif", "webp", "mp4", "mov", "avi", "mkv", "webm"],
+            allowed_extensions=["jpg", "jpeg", "png", "gif", "webp", "mp4", "mov", "webm"],
             with_data=True
         )
         if not files:
@@ -1648,11 +1635,11 @@ async def main(page: ft.Page):
         f = files[0]
         ext = os.path.splitext(f.name)[1].lower()
         if ext in IMAGE_EXTENSIONS:
-            selected_media["type"] = "image"
+            new_type = "image"
         elif ext in VIDEO_EXTENSIONS:
-            selected_media["type"] = "video"
+            new_type = "video"
         else:
-            media_status_text.value = "Unsupported file type."
+            media_status_text.value = "Unsupported file type. Use a photo (JPG, PNG, GIF, WebP) or a video (MP4, MOV, WebM)."
             media_status_text.color = COLOR_DANGER
             page.update()
             return
@@ -1663,6 +1650,18 @@ async def main(page: ft.Page):
             page.update()
             return
 
+        if new_type == "video" and len(f.bytes) > MAX_POST_VIDEO_BYTES:
+            media_status_text.value = "That video is too large (maximum 50 MB). Please choose a shorter or smaller one."
+            media_status_text.color = COLOR_DANGER
+            page.update()
+            return
+        if new_type == "image" and len(f.bytes) > MAX_PICKED_IMAGE_BYTES:
+            media_status_text.value = "That photo is too large (maximum 25 MB). Please choose a smaller one."
+            media_status_text.color = COLOR_DANGER
+            page.update()
+            return
+
+        selected_media["type"] = new_type
         selected_media["bytes"] = f.bytes
         selected_media["name"] = f.name
         media_status_text.value = ""
@@ -1711,10 +1710,16 @@ async def main(page: ft.Page):
 
                 if selected_media["type"] == "image":
                     file_bytes, content_type = compress_image_for_upload(raw_bytes)
+                    if content_type != "image/jpeg":
+                        set_composer_busy(False)
+                        media_status_text.value = "Couldn't process that photo. Please try a different one."
+                        media_status_text.color = COLOR_DANGER
+                        page.update()
+                        return
                     storage_path = f"{owner_id}/{uuid.uuid4()}.jpg"
                 else:
                     file_bytes = raw_bytes
-                    content_type = mimetypes.guess_type(selected_media["name"] or "")[0] or "application/octet-stream"
+                    content_type = VIDEO_CONTENT_TYPES.get(file_ext.lower(), "application/octet-stream")
                     storage_path = f"{owner_id}/{uuid.uuid4()}{file_ext}"
 
                 upload_with_retry(MEDIA_BUCKET, storage_path, file_bytes, content_type)
@@ -1918,7 +1923,11 @@ async def main(page: ft.Page):
             resp = safe_supabase_call(
                 lambda: supabase.rpc("get_blocked_user_ids", {}).execute()
             )
-            blocked_ids_cache["ids"] = {row["blocked_id"] for row in ((resp.data if resp else []) or [])}
+            if resp is None:
+                # Session problem: keep the list we already know and try
+                # again next time instead of caching an empty list.
+                return blocked_ids_cache["ids"]
+            blocked_ids_cache["ids"] = {row["blocked_id"] for row in (resp.data or [])}
             blocked_ids_cache["loaded"] = True
         except Exception as ex:
             print(f"get_blocked_ids error: {ex}")
@@ -3367,9 +3376,24 @@ async def main(page: ft.Page):
             profile_status_text.color = COLOR_DANGER
             page.update()
             return
+        if len(f.bytes) > MAX_PICKED_IMAGE_BYTES:
+            profile_status_text.value = "That photo is too large (maximum 25 MB). Please choose a smaller one."
+            profile_status_text.color = COLOR_DANGER
+            page.update()
+            return
         try:
             user_id = get_cached_user_id()
             file_bytes, content_type = compress_image_for_upload(f.bytes)
+            if content_type != "image/jpeg":
+                profile_status_text.value = "Couldn't process that photo. Please try a different one."
+                profile_status_text.color = COLOR_DANGER
+                page.update()
+                return
+            if len(file_bytes) > MAX_AVATAR_BYTES:
+                profile_status_text.value = "That picture is still too large (maximum 5 MB). Please choose a smaller one."
+                profile_status_text.color = COLOR_DANGER
+                page.update()
+                return
             storage_path = f"{user_id}/avatar.jpg"
             upload_with_retry(AVATARS_BUCKET, storage_path, file_bytes, content_type, upsert=True)
             avatar_url = safe_supabase_call(
@@ -3984,8 +4008,8 @@ async def main(page: ft.Page):
             pc_step3_status.color = COLOR_DANGER
             page.update()
             return
-        if len(new_password) < 6:
-            pc_step3_status.value = "Password must be at least 6 characters."
+        if len(new_password) < MIN_PASSWORD_LENGTH:
+            pc_step3_status.value = f"Password must be at least {MIN_PASSWORD_LENGTH} characters."
             pc_step3_status.color = COLOR_DANGER
             page.update()
             return
@@ -5769,11 +5793,37 @@ We may update these terms; continued use of the app means you accept the changes
 
     agree_terms_checkbox = ft.Checkbox(label="", value=False)
 
+    def restart_registration(message):
+        """Drops the half-finished sign-up session and returns to step 1."""
+        try:
+            supabase.auth.sign_out({"scope": "local"})
+        except Exception as ex:
+            print(f"sign_out while restarting registration: {ex}")
+        cache_user(None)
+        reg_state["session"] = None
+        input_reg_otp.value = ""
+        reg_step2.visible = False
+        reg_step3.visible = False
+        reg_step1.visible = True
+        reg_step1_status.value = message
+        reg_step1_status.color = COLOR_DANGER
+        page.update()
+
     def handle_reg_step1_next(e):
         username = (input_reg_username.value or "").strip()
         email = (input_reg_email.value or "").strip()
         if not username or not email:
             reg_step1_status.value = "Please fill in both fields."
+            reg_step1_status.color = COLOR_DANGER
+            page.update()
+            return
+        if not re.fullmatch(r"[A-Za-z0-9_]{3,20}", username):
+            reg_step1_status.value = "Username must be 3\u201320 characters: letters, numbers or underscores only."
+            reg_step1_status.color = COLOR_DANGER
+            page.update()
+            return
+        if "@" not in email or "." not in email.split("@")[-1]:
+            reg_step1_status.value = "Please enter a valid email address."
             reg_step1_status.color = COLOR_DANGER
             page.update()
             return
@@ -5783,6 +5833,14 @@ We may update these terms; continued use of the app means you accept the changes
             page.update()
             return
         try:
+            # Ask the database whether the username is free (and allowed)
+            # BEFORE a code is sent, so people don't find out after verifying.
+            availability = supabase.rpc("username_available", {"p_username": username}).execute()
+            if availability.data is not True:
+                reg_step1_status.value = "That username is not available. Please choose another one."
+                reg_step1_status.color = COLOR_DANGER
+                page.update()
+                return
             supabase.auth.sign_in_with_otp({
                 "email": email,
                 "options": {"should_create_user": True}
@@ -5860,6 +5918,12 @@ We may update these terms; continued use of the app means you accept the changes
             page.update()
         except Exception as ex:
             msg = str(ex).lower()
+            if "profiles_username" in msg or "reserved_username" in msg:
+                restart_registration("That username is no longer available. Please choose another one and verify your email again.")
+                return
+            if "profiles_user_id_key" in msg:
+                restart_registration("An account with this email already exists. Please go back and log in instead.")
+                return
             if "expired" in msg or "invalid" in msg:
                 reg_step2_status.value = "That code is invalid or expired. Tap Resend for a new one."
             else:
@@ -5875,6 +5939,11 @@ We may update these terms; continued use of the app means you accept the changes
             return
         if input_reg_password.value != input_reg_confirm.value:
             reg_step3_status.value = "Passwords do not match."
+            reg_step3_status.color = COLOR_DANGER
+            page.update()
+            return
+        if len(input_reg_password.value) < MIN_PASSWORD_LENGTH:
+            reg_step3_status.value = f"Password must be at least {MIN_PASSWORD_LENGTH} characters."
             reg_step3_status.color = COLOR_DANGER
             page.update()
             return
@@ -6161,8 +6230,8 @@ We may update these terms; continued use of the app means you accept the changes
             fp_step3_status.color = COLOR_DANGER
             page.update()
             return
-        if len(new_password) < 6:
-            fp_step3_status.value = "Password must be at least 6 characters."
+        if len(new_password) < MIN_PASSWORD_LENGTH:
+            fp_step3_status.value = f"Password must be at least {MIN_PASSWORD_LENGTH} characters."
             fp_step3_status.color = COLOR_DANGER
             page.update()
             return
