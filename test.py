@@ -30,6 +30,11 @@ except ImportError:
 # --- LIVE DATABASE CONNECTION ---
 SUPABASE_URL = "https://vjvynztrznvlhxqatcsi.supabase.co"
 SUPABASE_KEY = "sb_publishable_CGotNkzRyXY-P7klDoCysw_hFoo-8rq"
+
+# Fill these in before launch. They are shown on the Terms & Privacy screen
+# only when they are not empty, so no placeholder text ever reaches users.
+SUPPORT_EMAIL = ""
+PRIVACY_POLICY_URL = ""
 # NOTE: the actual `supabase` client is created per-session, inside main()
 # below — not here. A client created here would be a single object shared
 # by every browser tab/user connected to the running server process, and
@@ -230,7 +235,7 @@ async def main(page: ft.Page):
     # connections/likes/stats data to leak between accounts.
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-    page.title = "UniVibe - Master Console"
+    page.title = "UniVas Social"
     page.window_width = 400
     page.window_height = 780
     page.window_resizable = True
@@ -592,7 +597,7 @@ async def main(page: ft.Page):
             page.update()
 
         def share_whatsapp(e):
-            text = f"Check this out on UniVibe: {post.get('content') or ''}"
+            text = f"Check this out on UniVas: {post.get('content') or ''}"
             if post.get("media_url"):
                 text += f" {post['media_url']}"
             encoded = urllib.parse.quote(text)
@@ -1405,19 +1410,19 @@ async def main(page: ft.Page):
 
     def open_groups_from_menu(dlg):
         close_menu_dialog(dlg)
-        open_coming_soon_dialog("Groups", "Groups are coming soon to UNiVAS. Stay tuned!")
+        open_coming_soon_dialog("Groups", "Groups are coming soon to UniVas. Stay tuned!")
 
     def open_pages_from_menu(dlg):
         close_menu_dialog(dlg)
-        open_coming_soon_dialog("Pages", "Pages are coming soon to UNiVAS. Stay tuned!")
+        open_coming_soon_dialog("Pages", "Pages are coming soon to UniVas. Stay tuned!")
 
     def open_saved_from_menu(dlg):
         close_menu_dialog(dlg)
-        open_coming_soon_dialog("Saved", "Saved items are coming soon to UNiVAS. Stay tuned!")
+        open_coming_soon_dialog("Saved", "Saved items are coming soon to UniVas. Stay tuned!")
 
     def open_events_from_menu(dlg):
         close_menu_dialog(dlg)
-        open_coming_soon_dialog("Events", "Events are coming soon to UNiVAS. Stay tuned!")
+        open_coming_soon_dialog("Events", "Events are coming soon to UniVas. Stay tuned!")
 
     def open_main_menu(e):
         # Eight primary destinations as a responsive 2-column grid, in the
@@ -1558,7 +1563,7 @@ async def main(page: ft.Page):
 
     top_header_bar = ft.Container(
         content=ft.Row([
-            ft.Text("UNiVAS", size=18, weight=ft.FontWeight.BOLD, color=COLOR_PRIMARY),
+            ft.Text("UniVas", size=18, weight=ft.FontWeight.BOLD, color=COLOR_PRIMARY),
             ft.Row([top_search_btn, top_chats_btn, menu_button], spacing=2)
         ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN, vertical_alignment=ft.CrossAxisAlignment.CENTER),
         padding=ft.Padding.symmetric(horizontal=14, vertical=8),
@@ -2879,7 +2884,7 @@ async def main(page: ft.Page):
         page.update()
 
     def get_share_count(post):
-        """Best-effort share count. UniVibe doesn't have a dedicated shares
+        """Best-effort share count. UniVas doesn't have a dedicated shares
         table — reposts (see handle_repost) reuse the original media_url,
         so counting other posts pointing at the same media file is the
         closest real signal we have."""
@@ -4707,8 +4712,8 @@ async def main(page: ft.Page):
         try:
             result = supabase.auth.mfa.enroll({
                 "factor_type": "totp",
-                "issuer": "UNiVAS",
-                "friendly_name": "UNiVAS Authenticator",
+                "issuer": "UniVas",
+                "friendly_name": "UniVas Authenticator",
             })
             mfa_state["factor_id"] = result.id
             if result.totp:
@@ -4915,7 +4920,7 @@ async def main(page: ft.Page):
         ]),
         ft.Text("ACCOUNT", size=12, weight=ft.FontWeight.BOLD, color=COLOR_TEXT_MUTED),
         build_settings_row(
-            ft.Icons.BADGE_ROUNDED, "Change Username", "Update your UNiVAS username",
+            ft.Icons.BADGE_ROUNDED, "Change Username", "Update your UniVas username",
             lambda e: open_change_username_dialog(e)
         ),
         build_settings_row(
@@ -5309,7 +5314,7 @@ async def main(page: ft.Page):
         ft.Container(
             content=ft.Column([
                 ft.Icon(ft.Icons.ADMIN_PANEL_SETTINGS_ROUNDED, color=COLOR_WARNING, size=48),
-                ft.Text("UNIVAS Admin Console", size=18, weight=ft.FontWeight.BOLD, color="white"),
+                ft.Text("UniVas Admin Console", size=18, weight=ft.FontWeight.BOLD, color="white"),
                 admin_role_text,
             ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=8),
             padding=SPACE_LG, bgcolor=COLOR_CARD, border_radius=RADIUS_MD, width=340,
@@ -5702,7 +5707,7 @@ async def main(page: ft.Page):
     reg_step2_status = ft.Text("", size=12)
     reg_step3_status = ft.Text("", size=12)
 
-    TERMS_TEXT = """UNIVIBE — TERMS OF SERVICE & PRIVACY POLICY (Summary)
+    TERMS_TEXT = """UNIVAS — TERMS OF SERVICE & PRIVACY POLICY (Summary)
 
 By creating an account, you agree to the following:
 
@@ -5716,7 +5721,7 @@ ANONYMOUS POSTS (WHISPER WALL)
 Anonymous posts hide your username from other users, but remain linked to your account internally so we can enforce these rules and investigate abuse reports. Anonymity applies to other users, not to the platform.
 
 CONTENT
-You own what you post. Posting it grants UniVibe permission to display it to other users. You're responsible for what you share.
+You own what you post. Posting it grants UniVas permission to display it to other users. You're responsible for what you share.
 
 MODERATION
 We provide Block and Report tools. Violating these terms may result in content removal or account suspension.
@@ -5730,11 +5735,19 @@ To run the app's features (feed, chat, profiles), send account emails, and inves
 WHO CAN SEE WHAT
 Your username and public posts are visible to other users. Anonymous posts hide your name from other users only. Private messages are visible only to you and the recipient. Blocked users can't see or message you.
 
-YOUR RIGHTS (Nigeria NDPR)
-You can request a copy of your data, request corrections, or request full account deletion at any time by contacting the app developer.
+WHEN YOU DELETE SOMETHING
+When you delete a post, it disappears right away. Photos and videos from deleted posts or deleted accounts are kept in our storage for up to 30 days before they are permanently removed. Reports you filed stay in our moderation records without your name.
+
+YOUR RIGHTS (Nigeria Data Protection Act 2023)
+You can request a copy of your data, request corrections, or request full account deletion at any time by contacting us.
 
 CHANGES
 We may update these terms; continued use of the app means you accept the changes."""
+
+    if SUPPORT_EMAIL:
+        TERMS_TEXT += f"\n\nCONTACT\nQuestions, data requests or reports: {SUPPORT_EMAIL}"
+    if PRIVACY_POLICY_URL:
+        TERMS_TEXT += f"\n\nFULL PRIVACY POLICY\n{PRIVACY_POLICY_URL}"
 
     def open_terms_dialog(e=None):
         def close_dlg(d):
@@ -6251,7 +6264,7 @@ We may update these terms; continued use of the app means you accept the changes
     ], horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
     layout_auth_master = ft.Column([
-        ft.Text("UniVibe", size=36, weight=ft.FontWeight.BOLD, color=COLOR_PRIMARY),
+        ft.Text("UniVas", size=36, weight=ft.FontWeight.BOLD, color=COLOR_PRIMARY),
         layout_login_form,
         mfa_login_step,
         reg_step1,
