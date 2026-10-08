@@ -311,6 +311,74 @@ async def main(page: ft.Page):
         ui_message.color = COLOR_DANGER
         show_auth()
 
+    def friendly_error(ex, fallback="Something went wrong. Please try again."):
+        """Turns any exception into a short, safe message for the screen.
+        The full technical detail is printed to the console only (never shown
+        to the user). Messages written by our own database functions (plain
+        RAISE EXCEPTION, SQLSTATE P0001) are already user-friendly sentences
+        and are passed through."""
+        print(f"[error] {type(ex).__name__}: {ex}")
+        raw_text = str(ex)
+        low = raw_text.lower()
+        code = str(getattr(ex, "code", "") or "")
+        message = getattr(ex, "message", "")
+        message = message if isinstance(message, str) else ""
+
+        # 1) Messages from our own database functions.
+        if code == "P0001" and message:
+            text = message.strip()
+            for prefix in ("BLOCKED:", "CONNECTION_REQUIRED:", "RESERVED_USERNAME:"):
+                if text.startswith(prefix):
+                    text = text[len(prefix):].strip()
+            if text == "Not authenticated":
+                return "Your session expired. Please log in again."
+            if text == "Not authorized":
+                return "You don't have permission to do that."
+            if text.startswith("Invalid notification") or text.startswith("Invalid decision"):
+                return fallback
+            return text
+
+        # 2) No connection / timeouts.
+        error_type = type(ex).__name__.lower()
+        if (any(word in error_type for word in ("connect", "timeout", "network"))
+                or any(word in low for word in ("getaddrinfo", "name or service", "timed out",
+                                                "connection refused", "connection reset",
+                                                "network is unreachable", "temporary failure"))):
+            return "Can't reach the server. Please check your internet connection and try again."
+
+        # 3) Sign-in / account messages from Supabase Auth.
+        if code == "invalid_credentials" or "invalid login credentials" in low:
+            return "Incorrect email or password."
+        if code == "email_not_confirmed" or "email not confirmed" in low:
+            return "Please confirm your email first."
+        if (code in ("over_email_send_rate_limit", "over_request_rate_limit", "over_sms_send_rate_limit")
+                or "rate limit" in low or "too many requests" in low
+                or "for security purposes, you can only request this after" in low):
+            return "Too many attempts. Please wait a minute and try again."
+        if code in ("otp_expired", "otp_disabled") or "token has expired" in low or "otp_expired" in low:
+            return "That code is invalid or expired. Please request a new one."
+        if code == "weak_password" or "password should be at least" in low or "weak password" in low:
+            return "That password is too weak. Please choose a longer, stronger one."
+        if code == "same_password" or "should be different from the old password" in low:
+            return "Your new password must be different from your old one."
+        if code in ("user_already_exists", "email_exists") or "already registered" in low or "already been registered" in low:
+            return "That email is already registered. Try logging in instead."
+        if code in ("session_not_found", "bad_jwt") or "jwt expired" in low or "invalid jwt" in low:
+            return "Your session expired. Please log in again."
+
+        # 4) Database / storage rules.
+        if "row-level security" in low or "permission denied" in low:
+            return "You don't have permission to do that."
+        if "violates check constraint" in low:
+            return "That entry is too long or not allowed. Please shorten it and try again."
+        if "duplicate key" in low or "already exists" in low:
+            return "That is already in use."
+        if ("maximum allowed size" in low or "payload too large" in low
+                or "mime type" in low or "invalid_mime_type" in low):
+            return "That file is too large or not an allowed type."
+
+        return fallback
+
     def safe_supabase_call(fn):
         """fn is a zero-arg callable wrapping a Supabase table/rpc/storage
         chain ending in .execute() — e.g. lambda: supabase.table(...).execute().
@@ -460,7 +528,7 @@ async def main(page: ft.Page):
                 create_notification(post_owner_id, "comment", post_id)
             except Exception as ex:
                 send_btn.disabled = False
-                status.value = f"Couldn't post comment: {str(ex)}"
+                status.value = friendly_error(ex, "Couldn't post comment. Please try again.")
                 status.color = COLOR_DANGER
                 page.update()
 
@@ -1011,7 +1079,7 @@ async def main(page: ft.Page):
                 whisper_status_text.color = COLOR_DANGER
         except Exception as ex:
             print(f"Whisper reveal error: {ex}")
-            whisper_status_text.value = f"Couldn't reveal author: {str(ex)}"
+            whisper_status_text.value = friendly_error(ex, "Couldn't reveal author. Please try again.")
             whisper_status_text.color = COLOR_DANGER
         finally:
             whisper_reveal_inprogress.discard(post_id)
@@ -1047,7 +1115,7 @@ async def main(page: ft.Page):
             page.update()
             render_whisper_feed()
         except Exception as ex:
-            whisper_status_text.value = f"Failed to post: {str(ex)}"
+            whisper_status_text.value = friendly_error(ex, "Failed to post. Please try again.")
             whisper_status_text.color = COLOR_DANGER
             page.update()
 
@@ -1668,7 +1736,7 @@ async def main(page: ft.Page):
             render_public_feed()
         except Exception as ex:
             set_composer_busy(False)
-            media_status_text.value = f"Post failed: {str(ex)}"
+            media_status_text.value = friendly_error(ex, "Post failed. Please try again.")
             media_status_text.color = COLOR_DANGER
             page.update()
 
@@ -1928,7 +1996,7 @@ async def main(page: ft.Page):
                 return None, "Your session expired — please log in again."
             return resp.data, None
         except Exception as ex:
-            return None, f"Couldn't send request: {str(ex)}"
+            return None, friendly_error(ex, "Couldn't send request. Please try again.")
 
     def respond_connection_request(request_id, accept):
         user_id = get_cached_user_id()
@@ -1945,7 +2013,7 @@ async def main(page: ft.Page):
                 return None, "Your session expired — please log in again."
             return resp.data, None
         except Exception as ex:
-            return None, f"Couldn't respond: {str(ex)}"
+            return None, friendly_error(ex, "Couldn't respond. Please try again.")
 
     def get_connection_status(other_user_id):
         """Returns (status, request_id, is_requester) or (None, None, None) if
@@ -2144,9 +2212,9 @@ async def main(page: ft.Page):
             if result.data:
                 return result.data, None
             else:
-                return None, "Couldn't create conversation — check Supabase logs."
+                return None, "Couldn't start the chat. Please try again."
         except Exception as e:
-            return None, f"Couldn't start chat: {str(e)}"
+            return None, friendly_error(e, "Couldn't start chat. Please try again.")
 
     def get_messages(conversation_id):
         try:
@@ -2191,8 +2259,7 @@ async def main(page: ft.Page):
             msg = str(e)
             if "CONNECTION_REQUIRED" in msg:
                 return False, "You've sent your one message — you can chat freely once they accept your connection request."
-            print(f"Error sending message: {e}")
-            return False, None
+            return False, friendly_error(e, "Your message wasn't sent. Please try again.")
 
     def format_relative_time(iso_str):
         """Turns a Postgres timestamptz string into a short relative label
@@ -2786,7 +2853,7 @@ async def main(page: ft.Page):
                 render_my_posts_grid()
                 render_public_feed()
             except Exception as ex:
-                status.value = f"Couldn't update: {str(ex)}"
+                status.value = friendly_error(ex, "Couldn't update. Please try again.")
                 status.color = COLOR_DANGER
                 page.update()
 
@@ -3323,7 +3390,7 @@ async def main(page: ft.Page):
             profile_status_text.color = COLOR_SUCCESS
             page.update()
         except Exception as ex:
-            profile_status_text.value = f"Avatar upload failed: {str(ex)}"
+            profile_status_text.value = friendly_error(ex, "Avatar upload failed. Please try again.")
             profile_status_text.color = COLOR_DANGER
             page.update()
 
@@ -3352,7 +3419,7 @@ async def main(page: ft.Page):
             profile_status_text.color = COLOR_SUCCESS
             page.update()
         except Exception as ex:
-            profile_status_text.value = f"Save failed: {str(ex)}"
+            profile_status_text.value = friendly_error(ex, "Save failed. Please try again.")
             profile_status_text.color = COLOR_DANGER
             page.update()
 
@@ -3727,7 +3794,7 @@ async def main(page: ft.Page):
                 change_username_status.color = COLOR_DANGER
             page.update()
         except Exception as ex:
-            change_username_status.value = f"Couldn't update username: {str(ex)}"
+            change_username_status.value = friendly_error(ex, "Couldn't update username. Please try again.")
             change_username_status.color = COLOR_DANGER
             page.update()
 
@@ -3837,7 +3904,7 @@ async def main(page: ft.Page):
             pc_step2_status.color = COLOR_TEXT_MUTED
             page.update()
         except Exception as ex:
-            pc_step1_status.value = f"Couldn't send code: {str(ex)}"
+            pc_step1_status.value = friendly_error(ex, "Couldn't send code. Please try again.")
             pc_step1_status.color = COLOR_DANGER
             page.update()
 
@@ -3854,7 +3921,7 @@ async def main(page: ft.Page):
             pc_step2_status.color = COLOR_SUCCESS
             page.update()
         except Exception as ex:
-            pc_step2_status.value = f"Couldn't resend: {str(ex)}"
+            pc_step2_status.value = friendly_error(ex, "Couldn't resend. Please try again.")
             pc_step2_status.color = COLOR_DANGER
             page.update()
 
@@ -3899,7 +3966,7 @@ async def main(page: ft.Page):
             if "expired" in msg or "invalid" in msg:
                 pc_step2_status.value = "That code is invalid or expired. Tap Resend for a new one."
             else:
-                pc_step2_status.value = f"Verification failed: {str(ex)}"
+                pc_step2_status.value = friendly_error(ex, "Verification failed. Please try again.")
             pc_step2_status.color = COLOR_DANGER
             page.update()
 
@@ -3955,7 +4022,7 @@ async def main(page: ft.Page):
             # attempting to splice the original session back in.
             page.run_task(handle_logout, None)
         except Exception as ex:
-            pc_step3_status.value = f"Couldn't change password: {str(ex)}"
+            pc_step3_status.value = friendly_error(ex, "Couldn't change password. Please try again.")
             pc_step3_status.color = COLOR_DANGER
             page.update()
 
@@ -4119,7 +4186,7 @@ async def main(page: ft.Page):
                 return True, None
             return False, "Verification failed — check the code and try again."
         except Exception as ex:
-            return False, str(ex)
+            return False, friendly_error(ex, "Verification failed. Please try again.")
 
     change_email_state = {"verified": False, "cooldown_active": False, "pending_new_email": None,
                           "session_token": 0}
@@ -4230,7 +4297,7 @@ async def main(page: ft.Page):
             page.update()
             page.run_task(change_email_cooldown_timer, ce_send_code_btn, ce_resend_btn)
         except Exception as ex:
-            ce_step1_status.value = f"Couldn't send code: {str(ex)}"
+            ce_step1_status.value = friendly_error(ex, "Couldn't send code. Please try again.")
             ce_step1_status.color = COLOR_DANGER
             page.update()
 
@@ -4250,7 +4317,7 @@ async def main(page: ft.Page):
             page.update()
             page.run_task(change_email_cooldown_timer, ce_send_code_btn, ce_resend_btn)
         except Exception as ex:
-            ce_step2_status.value = f"Couldn't resend: {str(ex)}"
+            ce_step2_status.value = friendly_error(ex, "Couldn't resend. Please try again.")
             ce_step2_status.color = COLOR_DANGER
             page.update()
 
@@ -4337,7 +4404,7 @@ async def main(page: ft.Page):
             page.update()
             page.run_task(change_email_cooldown_timer, ce_new_send_btn, ce_new_resend_btn)
         except Exception as ex:
-            ce_step3_status.value = f"Couldn't send code: {str(ex)}"
+            ce_step3_status.value = friendly_error(ex, "Couldn't send code. Please try again.")
             ce_step3_status.color = COLOR_DANGER
             page.update()
 
@@ -4354,7 +4421,7 @@ async def main(page: ft.Page):
             page.update()
             page.run_task(change_email_cooldown_timer, ce_new_send_btn, ce_new_resend_btn)
         except Exception as ex:
-            ce_step4_status.value = f"Couldn't resend: {str(ex)}"
+            ce_step4_status.value = friendly_error(ex, "Couldn't resend. Please try again.")
             ce_step4_status.color = COLOR_DANGER
             page.update()
 
@@ -4682,7 +4749,7 @@ async def main(page: ft.Page):
         except Exception as ex:
             mfa_intro_step.visible = False
             mfa_summary_step.visible = True
-            mfa_status_text.value = f"Couldn't start setup: {str(ex)}"
+            mfa_status_text.value = friendly_error(ex, "Couldn't start setup. Please try again.")
             mfa_status_text.color = COLOR_DANGER
             page.update()
 
@@ -4917,7 +4984,7 @@ async def main(page: ft.Page):
                 return False, "Your session expired — please log in again."
             return True, None
         except Exception as ex:
-            return False, str(ex)
+            return False, friendly_error(ex, "Couldn't save the review. Please try again.")
 
     def get_admin_post_reports_data():
         """Returns (rows, error_message). rows is None only on failure --
@@ -5477,10 +5544,10 @@ async def main(page: ft.Page):
             input_login_password.value = ""
             show_dashboard()
         except Exception as ex:
-            if "not confirmed" in str(ex).lower() or "confirm" in str(ex).lower():
+            if "not confirmed" in str(ex).lower():
                 ui_message.value = "Please confirm your email first. Didn't get it? Tap Resend below."
             else:
-                ui_message.value = f"Login failed: {str(ex)}"
+                ui_message.value = friendly_error(ex, "Login failed. Please try again.")
             ui_message.color = COLOR_DANGER
             page.update()
 
@@ -5496,7 +5563,7 @@ async def main(page: ft.Page):
             ui_message.color = COLOR_SUCCESS
             page.update()
         except Exception as ex:
-            ui_message.value = f"Couldn't resend: {str(ex)}"
+            ui_message.value = friendly_error(ex, "Couldn't resend. Please try again.")
             ui_message.color = COLOR_DANGER
             page.update()
 
@@ -5716,7 +5783,7 @@ We may update these terms; continued use of the app means you accept the changes
             reg_step2_status.color = COLOR_TEXT_MUTED
             page.update()
         except Exception as ex:
-            reg_step1_status.value = f"Couldn't send code: {str(ex)}"
+            reg_step1_status.value = friendly_error(ex, "Couldn't send code. Please try again.")
             reg_step1_status.color = COLOR_DANGER
             page.update()
 
@@ -5732,7 +5799,7 @@ We may update these terms; continued use of the app means you accept the changes
             reg_step2_status.color = COLOR_SUCCESS
             page.update()
         except Exception as ex:
-            reg_step2_status.value = f"Couldn't resend: {str(ex)}"
+            reg_step2_status.value = friendly_error(ex, "Couldn't resend. Please try again.")
             reg_step2_status.color = COLOR_DANGER
             page.update()
 
@@ -5783,7 +5850,7 @@ We may update these terms; continued use of the app means you accept the changes
             if "expired" in msg or "invalid" in msg:
                 reg_step2_status.value = "That code is invalid or expired. Tap Resend for a new one."
             else:
-                reg_step2_status.value = f"Verification failed: {str(ex)}"
+                reg_step2_status.value = friendly_error(ex, "Verification failed. Please try again.")
             reg_step2_status.color = COLOR_DANGER
             page.update()
 
@@ -5816,7 +5883,7 @@ We may update these terms; continued use of the app means you accept the changes
             reg_step3_status.value = ""
             show_dashboard()
         except Exception as ex:
-            reg_step3_status.value = f"Couldn't set password: {str(ex)}"
+            reg_step3_status.value = friendly_error(ex, "Couldn't set password. Please try again.")
             reg_step3_status.color = COLOR_DANGER
             page.update()
 
@@ -5975,7 +6042,7 @@ We may update these terms; continued use of the app means you accept the changes
             fp_step2_status.color = COLOR_TEXT_MUTED
             page.update()
         except Exception as ex:
-            fp_step1_status.value = f"Couldn't send code: {str(ex)}"
+            fp_step1_status.value = friendly_error(ex, "Couldn't send code. Please try again.")
             fp_step1_status.color = COLOR_DANGER
             page.update()
 
@@ -6004,7 +6071,7 @@ We may update these terms; continued use of the app means you accept the changes
             fp_step2_status.color = COLOR_SUCCESS
             page.update()
         except Exception as ex:
-            fp_step2_status.value = f"Couldn't resend: {str(ex)}"
+            fp_step2_status.value = friendly_error(ex, "Couldn't resend. Please try again.")
             fp_step2_status.color = COLOR_DANGER
             page.update()
 
@@ -6069,7 +6136,7 @@ We may update these terms; continued use of the app means you accept the changes
             if "expired" in msg or "invalid" in msg:
                 fp_step2_status.value = "That code is invalid or expired. Tap Resend for a new one."
             else:
-                fp_step2_status.value = f"Verification failed: {str(ex)}"
+                fp_step2_status.value = friendly_error(ex, "Verification failed. Please try again.")
             fp_step2_status.color = COLOR_DANGER
             page.update()
 
@@ -6143,7 +6210,7 @@ We may update these terms; continued use of the app means you accept the changes
             fp_step3_status.color = COLOR_SUCCESS
             page.update()
         except Exception as ex:
-            fp_step3_status.value = f"Couldn't change password: {str(ex)}"
+            fp_step3_status.value = friendly_error(ex, "Couldn't change password. Please try again.")
             fp_step3_status.color = COLOR_DANGER
             page.update()
 
