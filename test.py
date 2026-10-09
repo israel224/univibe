@@ -4937,6 +4937,92 @@ async def main(page: ft.Page):
         page.update()
         refresh_two_factor_summary()
 
+    # ============================================================
+    # --- DELETE ACCOUNT ------------------------------------------
+    # Calls the delete_my_account RPC. The SERVER does the work: it
+    # deletes the person's posts, comments, likes, messages and
+    # profile, keeps the reports they filed (without their name),
+    # queues their photos/videos for permanent removal after 30 days,
+    # and removes the login account. Admin accounts are refused by the
+    # server. The word DELETE must be typed to confirm.
+    # ============================================================
+    delete_account_input = ft.TextField(label="Type DELETE to confirm", width=280, color="white",
+                                        border_color=COLOR_DANGER)
+    delete_account_status = ft.Text("", size=12)
+    delete_account_state = {"busy": False, "dlg": None}
+
+    def close_delete_account_dialog(d):
+        d.open = False
+        page.update()
+
+    async def handle_delete_account(e):
+        if delete_account_state["busy"]:
+            return
+        if (delete_account_input.value or "").strip() != "DELETE":
+            delete_account_status.value = "Type DELETE (capital letters) to confirm."
+            delete_account_status.color = COLOR_DANGER
+            page.update()
+            return
+
+        delete_account_state["busy"] = True
+        delete_account_status.value = "Deleting your account..."
+        delete_account_status.color = COLOR_TEXT_MUTED
+        page.update()
+
+        try:
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("delete_my_account", {"p_confirm": "DELETE"}).execute()
+            )
+            if resp is None:
+                delete_account_status.value = "Your session expired — please log in again."
+                delete_account_status.color = COLOR_DANGER
+                page.update()
+                return
+
+            # Deleted on the server. Leave this device cleanly too.
+            try:
+                supabase.auth.sign_out({"scope": "local"})
+            except Exception as ex:
+                print(f"sign_out after account deletion (expected to fail): {type(ex).__name__}")
+            cache_user(None)
+            await clear_session()
+            if delete_account_state.get("dlg") is not None:
+                delete_account_state["dlg"].open = False
+            show_auth()
+            ui_message.value = "Your account has been deleted."
+            ui_message.color = COLOR_SUCCESS
+            page.update()
+        except Exception as ex:
+            delete_account_status.value = friendly_error(ex, "Couldn't delete your account. Please try again.")
+            delete_account_status.color = COLOR_DANGER
+            page.update()
+        finally:
+            delete_account_state["busy"] = False
+
+    def open_delete_account_dialog(e):
+        delete_account_input.value = ""
+        delete_account_status.value = ""
+        dlg = ft.AlertDialog(
+            title=ft.Text("Delete Account", color=COLOR_DANGER, size=16),
+            bgcolor=COLOR_CARD,
+            content=ft.Column([
+                ft.Text("This permanently deletes your account, posts, comments, likes, messages and profile. "
+                        "It cannot be undone.", color="white", size=12),
+                ft.Text("Photos and videos from your posts are removed from our storage within 30 days. "
+                        "Reports you filed stay, without your name.", color=COLOR_TEXT_MUTED, size=11),
+                delete_account_input,
+                delete_account_status
+            ], tight=True, spacing=10, width=DIALOG_WIDTH),
+            actions=[
+                ft.TextButton(content=ft.Text("Delete My Account", color=COLOR_DANGER), on_click=handle_delete_account),
+                ft.TextButton("Cancel", on_click=lambda ev: close_delete_account_dialog(dlg))
+            ]
+        )
+        delete_account_state["dlg"] = dlg
+        page.overlay.append(dlg)
+        dlg.open = True
+        page.update()
+
     panel_account_settings = ft.Column([
         ft.Row([
             ft.IconButton(icon=ft.Icons.ARROW_BACK_ROUNDED, icon_color=COLOR_PRIMARY, on_click=close_account_settings_panel),
@@ -4960,6 +5046,12 @@ async def main(page: ft.Page):
         build_settings_row(
             ft.Icons.SHIELD_ROUNDED, "2-Step Verification", "Add an extra layer of security to your account",
             lambda e: open_two_factor_dialog(e)
+        ),
+        ft.Divider(height=16, color=COLOR_BORDER),
+        ft.Text("DANGER ZONE", size=12, weight=ft.FontWeight.BOLD, color=COLOR_TEXT_MUTED),
+        build_settings_row(
+            ft.Icons.DELETE_OUTLINE_ROUNDED, "Delete Account", "Permanently delete your account and data",
+            lambda e: open_delete_account_dialog(e)
         ),
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=SPACE_MD)
 
@@ -5763,7 +5855,7 @@ WHEN YOU DELETE SOMETHING
 When you delete a post, it disappears right away. Photos and videos from deleted posts or deleted accounts are kept in our storage for up to 30 days before they are permanently removed. Reports you filed stay in our moderation records without your name.
 
 YOUR RIGHTS (Nigeria Data Protection Act 2023)
-You can request a copy of your data, request corrections, or request full account deletion at any time by contacting us.
+You can delete your account yourself at any time in Settings → Delete Account. You can also request a copy of your data or a correction by contacting us.
 
 CHANGES
 We may update these terms; continued use of the app means you accept the changes."""
