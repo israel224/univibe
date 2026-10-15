@@ -2662,12 +2662,6 @@ async def main(page: ft.Page):
         if inspect.isawaitable(result):
             await result
 
-    async def clipboard_paste():
-        result = app_clipboard.get()
-        if inspect.isawaitable(result):
-            result = await result
-        return result
-
     def is_missing_function_error(ex, function_name):
         m = str(ex).lower()
         return function_name in m and ("could not find" in m or "pgrst202" in m
@@ -2806,7 +2800,7 @@ async def main(page: ft.Page):
     chat_inbox_status = ft.Text("", size=12)
 
     thread_messages_layout = ft.Column(spacing=8, scroll=ft.ScrollMode.ALWAYS, height=260, auto_scroll=True)
-    thread_input_box = ft.TextField(hint_text="Type a message...", width=180, dense=True, color="white")
+    thread_input_box = ft.TextField(hint_text="Type a message...", width=220, dense=True, color="white")
     thread_header_text = ft.Text("", size=16, weight=ft.FontWeight.BOLD, color="white")
     thread_status = ft.Text("", size=11)
 
@@ -3106,25 +3100,6 @@ async def main(page: ft.Page):
             thread_status.color = COLOR_WARNING if send_err else COLOR_DANGER
             page.update()
 
-    async def handle_paste_into_message(e):
-        try:
-            clip_text = await clipboard_paste()
-        except Exception as ex:
-            print(f"Clipboard error: {type(ex).__name__}")
-            clip_text = None
-            thread_status.value = "Couldn't paste from the clipboard."
-            thread_status.color = COLOR_DANGER
-            page.update()
-            return
-        if not clip_text:
-            thread_status.value = "Nothing to paste."
-            thread_status.color = COLOR_TEXT_MUTED
-            page.update()
-            await clear_thread_status_later("Nothing to paste.")
-            return
-        thread_input_box.value = ((thread_input_box.value or "") + clip_text)[:2000]
-        page.update()
-
     panel_chats_inbox = ft.Column([
         ft.Text("Direct Messages \U0001F4AC", size=18, weight=ft.FontWeight.BOLD, color=COLOR_SUCCESS),
         ft.Row([new_chat_input, ft.IconButton(icon=ft.Icons.SEND_ROUNDED, icon_color=COLOR_SUCCESS, on_click=handle_start_new_chat)], alignment=ft.MainAxisAlignment.CENTER),
@@ -3181,8 +3156,6 @@ async def main(page: ft.Page):
         reply_bar,
         ft.Row([
             thread_input_box,
-            ft.IconButton(icon=ft.Icons.CONTENT_PASTE_ROUNDED, icon_color=COLOR_TEXT_MUTED,
-                          tooltip="Paste", on_click=handle_paste_into_message),
             ft.IconButton(icon=ft.Icons.EMOJI_EMOTIONS_ROUNDED, icon_color=COLOR_TEXT_MUTED,
                           tooltip="Emoji", on_click=lambda e: open_emoji_picker(thread_input_box)),
             ft.IconButton(icon=ft.Icons.SEND_ROUNDED, icon_color=COLOR_SUCCESS, on_click=handle_send_thread_message)
