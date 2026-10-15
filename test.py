@@ -579,6 +579,7 @@ async def main(page: ft.Page):
                 return [], "Couldn't load your saved posts. Check your connection and try again."
         # Fallback until that function exists: use the Feed's own function
         # (only the latest 50 posts, so very old saved posts may be missing).
+        print("NOTICE: Supabase function get_saved_posts was not found, so Saved only checks the latest 50 posts.")
         try:
             resp = safe_supabase_call(lambda: supabase.rpc("get_visible_posts", {}).execute())
         except Exception as ex:
@@ -1180,6 +1181,231 @@ async def main(page: ft.Page):
         friends_layout.controls = new_controls
         page.update()
 
+    # =====================================================================
+    # GENERAL SEARCH (its own screen, separate from Friends)
+    # People: existing get_public_profiles search (get_real_users).
+    # Posts:  server function search_posts (see the proposed SQL) which applies
+    #         the same blocking / removed-post / anonymous-author rules as the
+    #         Feed. Until that function exists, the app falls back to searching
+    #         the Feed's own latest posts only. Only text and captions are
+    #         matched, never author names, so anonymous authors cannot be found.
+    # =====================================================================
+    def split_search_terms(query):
+        """Lower-case search words (2+ characters, at most 5, no duplicates)."""
+        terms = []
+        for w in " ".join((query or "").split())[:60].lower().split(" "):
+            if len(w) >= 2 and w not in terms:
+                terms.append(w)
+        return terms[:5]
+
+    def rank_posts_by_terms(rows, terms):
+        """Keeps posts whose text contains at least one word; posts matching
+        more of the words come first, then the newest."""
+        scored = []
+        for r in rows:
+            text = (r.get("content") or "").lower()
+            score = sum(1 for t in terms if t in text)
+            if score > 0:
+                scored.append((score, r.get("created_at") or "", r))
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        return [r for _, _, r in scored]
+
+    def search_posts(query):
+        """Returns a list of matching posts, or None if the search failed."""
+        terms = split_search_terms(query)
+        if not terms:
+            return []
+        clean_query = " ".join(terms)
+        rows = None
+        try:
+            resp = safe_supabase_call(
+                lambda: supabase.rpc("search_posts", {"p_query": clean_query, "p_limit": 30}).execute()
+            )
+            if resp is None:
+                return []
+            rows = resp.data or []
+        except Exception as ex:
+            m = str(ex).lower()
+            if not ("search_posts" in m and ("could not find" in m or "pgrst202" in m
+                                             or "does not exist" in m or "42883" in m)):
+                print(f"post search error: {type(ex).__name__}")
+                return None
+        if rows is None:
+            # Fallback until search_posts exists: only the Feed's latest posts.
+            print("NOTICE: Supabase function search_posts was not found, so search is only looking at the latest 50 posts.")
+            try:
+                resp = safe_supabase_call(lambda: supabase.rpc("get_visible_posts", {}).execute())
+            except Exception as ex:
+                print(f"post search fallback error: {type(ex).__name__}")
+                return None
+            if resp is None:
+                return []
+            rows = rank_posts_by_terms(resp.data or [], terms)
+        blocked = get_blocked_ids()
+        return [r for r in rows if r.get("user_id") not in blocked]
+
+    search_page_state = {"token": 0, "scope": "all"}
+    search_page_input = ft.TextField(hint_text="Search people, posts, #topics...", width=270,
+                                     dense=True, color="white")
+    search_results_layout = ft.Column(spacing=8, width=340)
+    SEARCH_HINT_TEXT = "Search for people, news, topics or #hashtags that people have posted about."
+
+    search_scope_labels = {"all": ft.Text("All", size=13), "people": ft.Text("People", size=13),
+                           "posts": ft.Text("Posts", size=13)}
+
+    def refresh_search_scope_buttons():
+        for key, lbl in search_scope_labels.items():
+            active = key == search_page_state["scope"]
+            lbl.color = COLOR_PRIMARY if active else COLOR_TEXT_MUTED
+            lbl.weight = ft.FontWeight.BOLD if active else ft.FontWeight.NORMAL
+
+    def show_search_hint():
+        search_results_layout.controls = [
+            ft.Container(content=ft.Text(SEARCH_HINT_TEXT, size=12, color=COLOR_TEXT_MUTED,
+                                         text_align=ft.TextAlign.CENTER),
+                         padding=ft.Padding.symmetric(vertical=24), width=340)
+        ]
+
+    def make_search_person_row(u):
+        uname = u.get("username", "Unknown")
+        bio_snippet = (u.get("bio") or "").strip().replace("\n", " ")
+        if len(bio_snippet) > 60:
+            bio_snippet = bio_snippet[:57].rstrip() + "..."
+
+        def open_person(e, name=uname):
+            load_other_profile(name, origin="search")
+        return ft.Container(
+            content=ft.Row([
+                ft.Icon(ft.Icons.ACCOUNT_CIRCLE_ROUNDED, color=COLOR_PRIMARY, size=32),
+                ft.Column([ft.Text(f"@{uname}", color="white", weight="bold", size=13)]
+                          + ([ft.Text(bio_snippet, color=COLOR_TEXT_MUTED, size=11)] if bio_snippet else []),
+                          spacing=2, expand=True),
+                ft.Icon(ft.Icons.CHEVRON_RIGHT_ROUNDED, color=COLOR_TEXT_FAINT, size=18),
+            ], spacing=10),
+            padding=SPACE_MD, bgcolor=COLOR_CARD, border_radius=RADIUS_MD, width=340, on_click=open_person
+        )
+
+    def make_search_post_row(post):
+        is_anon = post.get("is_anonymous", False)
+        who = "Anonymous Ghost \U0001F47B" if is_anon else f"@{post.get('username', 'Unknown')}"
+        text = (post.get("content") or "").strip()
+        if len(text) > 160:
+            text = text[:157].rstrip() + "..."
+        media_url = post.get("media_url")
+        media_type = post.get("media_type")
+        rows = [ft.Row([
+            ft.Icon(ft.Icons.SECURITY_ROUNDED if is_anon else ft.Icons.ACCOUNT_CIRCLE_ROUNDED,
+                    color=COLOR_DANGER if is_anon else COLOR_PRIMARY, size=16),
+            ft.Text(who, color=COLOR_DANGER if is_anon else COLOR_PRIMARY, weight="bold", size=12),
+        ], spacing=6)]
+        if text:
+            rows.append(ft.Text(text, color=COLOR_TEXT_BODY, size=13, max_lines=3))
+        if media_url and media_type == "image":
+            rows.append(ft.Image(src=media_url, width=300, height=160, fit=ft.BoxFit.COVER, border_radius=RADIUS_SM))
+        elif media_url and media_type == "video":
+            rows.append(ft.Row([ft.Icon(ft.Icons.SMART_DISPLAY_OUTLINED, color=COLOR_TEXT_MUTED, size=18),
+                                ft.Text("Video", color=COLOR_TEXT_MUTED, size=12)], spacing=6))
+
+        def open_post(e, pst=post):
+            open_post_viewer(pst)
+        return ft.Container(content=ft.Column(rows, spacing=6), padding=SPACE_MD, bgcolor=COLOR_CARD,
+                            border_radius=RADIUS_MD, width=340, on_click=open_post)
+
+    def render_search_results(query, scope, token):
+        raw = " ".join((query or "").split())
+        if len(raw.lstrip("#@")) < 2:
+            if token == search_page_state["token"]:
+                show_search_hint()
+                page.update()
+            return
+        search_results_layout.controls = [
+            ft.Row([ft.ProgressRing(width=16, height=16, stroke_width=2),
+                    ft.Text("Searching...", color=COLOR_TEXT_MUTED, size=12)],
+                   alignment=ft.MainAxisAlignment.CENTER, spacing=8)
+        ]
+        page.update()
+        people, posts = [], []
+        if scope in ("all", "people") and not raw.startswith("#"):
+            people = get_real_users(raw)          # None = the search failed
+        if scope in ("all", "posts"):
+            posts = search_posts(raw)             # None = the search failed
+        if token != search_page_state["token"]:
+            return   # a newer search started; ignore this old answer
+        controls = []
+        seen = set()
+        shown_people = []
+        for u in (people or []):
+            if u.get("user_id") in seen:
+                continue
+            seen.add(u.get("user_id"))
+            shown_people.append(u)
+        if scope == "all":
+            shown_people = shown_people[:5]
+        if shown_people:
+            controls.append(ft.Text("People", size=13, weight=ft.FontWeight.BOLD, color="white"))
+            controls.extend(make_search_person_row(u) for u in shown_people)
+        if posts:
+            controls.append(ft.Text("Posts", size=13, weight=ft.FontWeight.BOLD, color="white"))
+            controls.extend(make_search_post_row(p_) for p_ in posts)
+        failed = (people is None) or (posts is None)
+        if failed:
+            controls.append(ft.Text("Some results couldn't be loaded. Check your connection and try again.",
+                                    color=COLOR_DANGER, size=12))
+        if not controls:
+            if scope == "people":
+                msg = f'No users found for "{raw}".'
+            elif scope == "posts":
+                msg = f'No posts found yet for "{raw}".'
+            else:
+                msg = f'No results found for "{raw}". As people publish posts about this, they will show up here.'
+            controls.append(ft.Container(content=ft.Text(msg, size=12, color=COLOR_TEXT_MUTED,
+                                                         text_align=ft.TextAlign.CENTER),
+                                         padding=ft.Padding.symmetric(vertical=24), width=340))
+        search_results_layout.controls = controls
+        page.update()
+
+    async def on_search_page_change(e):
+        search_page_state["token"] += 1
+        my_token = search_page_state["token"]
+        await asyncio.sleep(0.4)
+        if my_token != search_page_state["token"]:
+            return   # still typing
+        await asyncio.to_thread(render_search_results, search_page_input.value, search_page_state["scope"], my_token)
+
+    def set_search_scope(scope):
+        def handler(e):
+            search_page_state["scope"] = scope
+            refresh_search_scope_buttons()
+            search_page_state["token"] += 1
+            my_token = search_page_state["token"]
+            page.update()
+            render_search_results(search_page_input.value, scope, my_token)
+        return handler
+
+    def clear_search_page(e):
+        search_page_input.value = ""
+        search_page_state["token"] += 1
+        show_search_hint()
+        page.update()
+
+    search_page_input.on_change = on_search_page_change
+    search_page_input.on_submit = lambda e: set_search_scope(search_page_state["scope"])(e)
+    refresh_search_scope_buttons()
+    show_search_hint()
+
+    panel_search = ft.Column([
+        ft.Row([search_page_input,
+                ft.IconButton(icon=ft.Icons.CLOSE_ROUNDED, icon_color=COLOR_TEXT_MUTED,
+                              tooltip="Clear", on_click=clear_search_page)],
+               alignment=ft.MainAxisAlignment.CENTER),
+        ft.Row([
+            ft.TextButton(content=search_scope_labels["all"], on_click=set_search_scope("all")),
+            ft.TextButton(content=search_scope_labels["people"], on_click=set_search_scope("people")),
+            ft.TextButton(content=search_scope_labels["posts"], on_click=set_search_scope("posts")),
+        ], alignment=ft.MainAxisAlignment.CENTER, spacing=4),
+        search_results_layout,
+    ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=8)
+
     def render_whisper_feed():
         whisper_feed_layout.controls.clear()
         blocked = get_blocked_ids()
@@ -1465,6 +1691,11 @@ async def main(page: ft.Page):
         render_pending_requests_banner()
         highlight_nav("people")
 
+    def nav_to_search(e):
+        # Its own screen. Never sends the user to Friends, Feed or anywhere else.
+        set_panel_visibility(search=True)
+        highlight_nav("search")   # no bottom-bar icon matches, so none is highlighted
+
     def nav_to_reels(e):
         set_panel_visibility(reels=True)
         render_reels_feed()
@@ -1690,7 +1921,7 @@ async def main(page: ft.Page):
         dlg.open = True
         page.update()
 
-    def set_panel_visibility(feed=False, secrets=False, chats=False, people=False, reels=False, notifications=False, profile=False, admin=False, account_settings=False):
+    def set_panel_visibility(feed=False, secrets=False, chats=False, people=False, reels=False, notifications=False, profile=False, admin=False, account_settings=False, search=False):
         if not chats:
             chat_state["polling_active"] = False
             chat_state["inbox_polling_active"] = False
@@ -1698,6 +1929,7 @@ async def main(page: ft.Page):
         panel_whisper_wall.visible   = secrets
         panel_messages.visible       = chats
         panel_people.visible         = people
+        panel_search.visible         = search
         panel_reels.visible          = reels
         panel_notifications.visible  = notifications
         panel_settings.visible       = profile
@@ -1727,11 +1959,10 @@ async def main(page: ft.Page):
                                 icon_size=20, style=NAV_BTN_STYLE, on_click=open_main_menu)
 
     # --- TOP HEADER (branding + Search + Chats + Menu) ---
-    # Search and Chats are second entry points into the SAME existing panels
-    # and handlers used elsewhere (nav_to_people / nav_to_chats) -- no new
-    # search system, no new chat system, no change to chat/inbox polling.
+    # Search opens its own Search screen (nav_to_search). Chats is a second
+    # entry point into the existing chat panels (nav_to_chats).
     top_search_btn = ft.IconButton(icon=ft.Icons.SEARCH_ROUNDED, icon_color=NAV_INACTIVE, tooltip="Search",
-                                   icon_size=20, style=NAV_BTN_STYLE, on_click=nav_to_people)
+                                   icon_size=20, style=NAV_BTN_STYLE, on_click=nav_to_search)
     top_chats_btn = ft.IconButton(icon=ft.Icons.CHAT_BUBBLE_ROUNDED, icon_color=NAV_INACTIVE, tooltip="Chats",
                                   icon_size=20, style=NAV_BTN_STYLE, on_click=nav_to_chats)
 
@@ -2421,8 +2652,66 @@ async def main(page: ft.Page):
         except Exception as e:
             return None, friendly_error(e, "Couldn't start chat. Please try again.")
 
+    # --- CLIPBOARD (Flet 1.0.2: ft.Clipboard service with set / get) ---
+    import inspect
+    app_clipboard = ft.Clipboard()
+    page.services.append(app_clipboard)
+
+    async def clipboard_copy(text):
+        result = app_clipboard.set(text)
+        if inspect.isawaitable(result):
+            await result
+
+    async def clipboard_paste():
+        result = app_clipboard.get()
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+
+    def is_missing_function_error(ex, function_name):
+        m = str(ex).lower()
+        return function_name in m and ("could not find" in m or "pgrst202" in m
+                                       or "does not exist" in m or "42883" in m)
+
+    def available_message_actions(m, my_id, thread_v2):
+        """Which actions the long-press menu offers for one message."""
+        is_deleted = bool(m.get("is_deleted"))
+        has_text = bool((m.get("content") or "").strip())
+        actions = []
+        if has_text and not is_deleted:
+            actions.append("copy")
+            if thread_v2:
+                actions.append("reply")
+        if thread_v2:
+            actions.append("delete")
+        return actions
+
+    def available_delete_choices(m, my_id):
+        """Delete for me is always offered. Delete for everyone only for your own,
+        not-yet-deleted messages (the database enforces this too)."""
+        choices = ["me"]
+        if m.get("sender_id") == my_id and not m.get("is_deleted"):
+            choices.append("everyone")
+        return choices
+
     def get_messages(conversation_id):
+        """Prefers get_chat_thread (hides messages you deleted for yourself, marks
+        deleted ones, includes reply quotes). Falls back to the older function
+        if get_chat_thread does not exist yet."""
         try:
+            if chat_state.get("thread_v2", True):
+                try:
+                    resp = safe_supabase_call(
+                        lambda: supabase.rpc("get_chat_thread", {
+                            "p_conversation_id": conversation_id
+                        }).execute()
+                    )
+                    return (resp.data if resp else []) or []
+                except Exception as e:
+                    if not is_missing_function_error(e, "get_chat_thread"):
+                        raise
+                    chat_state["thread_v2"] = False
+                    print("NOTICE: Supabase function get_chat_thread was not found, so chat is using the older loader (no delete or reply).")
             resp = safe_supabase_call(
                 lambda: supabase.rpc("get_conversation_messages", {
                     "p_conversation_id": conversation_id
@@ -2430,19 +2719,23 @@ async def main(page: ft.Page):
             )
             return (resp.data if resp else []) or []
         except Exception as e:
-            print(f"Error fetching messages: {e}")
+            print(f"Error fetching messages: {type(e).__name__}")
             return []
 
-    def send_message(conversation_id, content):
+    def send_message(conversation_id, content, reply_to_id=None):
         user_id = get_cached_user_id()
         if not user_id or not content.strip():
             return False, None
         try:
+            if reply_to_id:
+                rpc_name = "send_chat_reply"
+                rpc_params = {"p_conversation_id": conversation_id,
+                              "p_content": content.strip(), "p_reply_to": reply_to_id}
+            else:
+                rpc_name = "send_chat_message"
+                rpc_params = {"p_conversation_id": conversation_id, "p_content": content.strip()}
             result = safe_supabase_call(
-                lambda: supabase.rpc("send_chat_message", {
-                    "p_conversation_id": conversation_id,
-                    "p_content": content.strip()
-                }).execute()
+                lambda: supabase.rpc(rpc_name, rpc_params).execute()
             )
             if result is None:
                 return False, "Your session expired — please log in again."
@@ -2462,6 +2755,8 @@ async def main(page: ft.Page):
             return True, None
         except Exception as e:
             msg = str(e)
+            if reply_to_id and is_missing_function_error(e, "send_chat_reply"):
+                return False, "Replying isn't available yet. Please try again later."
             if "CONNECTION_REQUIRED" in msg:
                 return False, "You've sent your one message — you can chat freely once they accept your connection request."
             return False, friendly_error(e, "Your message wasn't sent. Please try again.")
@@ -2503,14 +2798,15 @@ async def main(page: ft.Page):
         )
 
     chat_state = {"conversation_id": None, "other_username": None, "polling_active": False, "last_rendered_count": -1,
-                  "inbox_polling_active": False, "last_inbox_signature": None}
+                  "inbox_polling_active": False, "last_inbox_signature": None,
+                  "reply_to": None, "thread_v2": True}
 
     conversations_layout = ft.Column(spacing=8, scroll=ft.ScrollMode.ALWAYS, height=260)
     new_chat_input = ft.TextField(hint_text="Start a chat (enter username)", width=220, dense=True, color="white")
     chat_inbox_status = ft.Text("", size=12)
 
     thread_messages_layout = ft.Column(spacing=8, scroll=ft.ScrollMode.ALWAYS, height=260, auto_scroll=True)
-    thread_input_box = ft.TextField(hint_text="Type a message...", width=220, dense=True, color="white")
+    thread_input_box = ft.TextField(hint_text="Type a message...", width=180, dense=True, color="white")
     thread_header_text = ft.Text("", size=16, weight=ft.FontWeight.BOLD, color="white")
     thread_status = ft.Text("", size=11)
 
@@ -2570,25 +2866,186 @@ async def main(page: ft.Page):
         render_conversations_list()
         open_thread(conv_id, target)
 
+    reply_bar_text = ft.Text("", size=11, color=COLOR_TEXT_BODY, max_lines=1, expand=True)
+
+    def cancel_reply(e=None):
+        chat_state["reply_to"] = None
+        reply_bar.visible = False
+        page.update()
+
+    reply_bar = ft.Container(
+        content=ft.Row([
+            ft.Icon(ft.Icons.REPLY_ROUNDED, size=16, color=COLOR_SUCCESS),
+            reply_bar_text,
+            ft.IconButton(icon=ft.Icons.CLOSE_ROUNDED, icon_size=16, icon_color=COLOR_TEXT_MUTED,
+                          tooltip="Cancel reply", on_click=cancel_reply),
+        ], spacing=6),
+        padding=ft.Padding.symmetric(horizontal=8), bgcolor=COLOR_CARD,
+        border_radius=RADIUS_MD, width=300, visible=False
+    )
+
+    async def clear_thread_status_later(expected_text):
+        await asyncio.sleep(2)
+        if thread_status.value == expected_text:
+            thread_status.value = ""
+            page.update()
+
+    def run_message_delete(message_id, everyone):
+        fn = "delete_message_for_everyone" if everyone else "hide_message_for_me"
+        thread_status.value = "Deleting..."
+        thread_status.color = COLOR_TEXT_MUTED
+        page.update()
+        try:
+            result = safe_supabase_call(
+                lambda: supabase.rpc(fn, {"p_message_id": message_id}).execute()
+            )
+            if result is None:
+                thread_status.value = "Your session expired. Please log in again."
+                thread_status.color = COLOR_DANGER
+                page.update()
+                return
+            thread_status.value = ""
+            chat_state["last_rendered_count"] = -1   # force a fresh redraw
+            render_thread_messages()
+        except Exception as e:
+            if is_missing_function_error(e, fn):
+                thread_status.value = "Deleting messages isn't available yet. Please try again later."
+            else:
+                thread_status.value = friendly_error(e, "Couldn't delete the message. Check your connection and try again.")
+            thread_status.color = COLOR_DANGER
+            page.update()
+
+    def open_delete_choice(m):
+        my_id = get_cached_user_id()
+        message_id = m.get("id")
+        choices = available_delete_choices(m, my_id)
+        dlg = ft.AlertDialog(title=ft.Text("Delete message?", color="white", size=14), bgcolor=COLOR_CARD)
+
+        def close(e=None):
+            dlg.open = False
+            page.update()
+
+        def choose(everyone):
+            def handler(e):
+                close()
+                run_message_delete(message_id, everyone)
+            return handler
+
+        buttons = [ft.TextButton(content=ft.Text("Delete for me", color="white"), on_click=choose(False))]
+        if "everyone" in choices:
+            buttons.append(ft.TextButton(content=ft.Text("Delete for everyone", color=COLOR_DANGER),
+                                         on_click=choose(True)))
+        buttons.append(ft.TextButton(content=ft.Text("Cancel", color=COLOR_TEXT_MUTED), on_click=close))
+        hint = ("Delete for me removes it only from your chat. Delete for everyone removes it for both of you."
+                if "everyone" in choices else
+                "Delete for me removes it only from your chat. The other person can still see it.")
+        dlg.content = ft.Column([ft.Text(hint, size=12, color=COLOR_TEXT_BODY)] + buttons,
+                                tight=True, spacing=4, width=DIALOG_WIDTH)
+        page.overlay.append(dlg)
+        dlg.open = True
+        page.update()
+
+    def open_message_actions(m):
+        my_id = get_cached_user_id()
+        actions = available_message_actions(m, my_id, chat_state.get("thread_v2", True))
+        text = (m.get("content") or "").strip()
+        dlg = ft.AlertDialog(title=ft.Text("Message", color="white", size=14), bgcolor=COLOR_CARD)
+
+        def close(e=None):
+            dlg.open = False
+            page.update()
+
+        async def do_copy(e):
+            close()
+            try:
+                await clipboard_copy(text)
+                thread_status.value = "Message copied."
+                thread_status.color = COLOR_SUCCESS
+            except Exception as ex:
+                print(f"Clipboard error: {type(ex).__name__}")
+                thread_status.value = "Couldn't copy the message."
+                thread_status.color = COLOR_DANGER
+            page.update()
+            await clear_thread_status_later(thread_status.value)
+
+        def do_reply(e):
+            close()
+            who = "yourself" if m.get("sender_id") == my_id else (chat_state.get("other_username") or "them")
+            preview = text if len(text) <= 80 else text[:77].rstrip() + "..."
+            chat_state["reply_to"] = {"id": m.get("id")}
+            reply_bar_text.value = f"Replying to {who}: {preview}"
+            reply_bar.visible = True
+            page.update()
+
+        def do_delete(e):
+            close()
+            open_delete_choice(m)
+
+        def action_row(icon, label, handler, color="white"):
+            return ft.TextButton(
+                content=ft.Row([ft.Icon(icon, size=18, color=color), ft.Text(label, color=color)], spacing=10),
+                on_click=handler)
+
+        buttons = []
+        if "copy" in actions:
+            buttons.append(action_row(ft.Icons.CONTENT_COPY_ROUNDED, "Copy", do_copy))
+        if "reply" in actions:
+            buttons.append(action_row(ft.Icons.REPLY_ROUNDED, "Reply", do_reply))
+        if "delete" in actions:
+            buttons.append(action_row(ft.Icons.DELETE_OUTLINE_ROUNDED, "Delete", do_delete, COLOR_DANGER))
+        buttons.append(action_row(ft.Icons.CLOSE_ROUNDED, "Cancel", close, COLOR_TEXT_MUTED))
+        dlg.content = ft.Column(buttons, tight=True, spacing=0, width=DIALOG_WIDTH)
+        page.overlay.append(dlg)
+        dlg.open = True
+        page.update()
+
+    def thread_signature(messages):
+        return tuple((m.get("id"), bool(m.get("is_deleted"))) for m in messages)
+
     def render_thread_messages():
         messages = get_messages(chat_state["conversation_id"])
-        if len(messages) == chat_state["last_rendered_count"]:
+        sig = thread_signature(messages)
+        if sig == chat_state["last_rendered_count"]:
             return
-        chat_state["last_rendered_count"] = len(messages)
+        chat_state["last_rendered_count"] = sig
 
         thread_messages_layout.controls.clear()
         my_id = get_cached_user_id()
         for m in messages:
             is_mine = m.get("sender_id") == my_id
-            bubble_color = COLOR_PRIMARY if is_mine else COLOR_CARD
+            is_deleted = bool(m.get("is_deleted"))
+            bubble_color = COLOR_CARD if is_deleted else (COLOR_PRIMARY if is_mine else COLOR_CARD)
             align = ft.MainAxisAlignment.END if is_mine else ft.MainAxisAlignment.START
             time_label = format_relative_time(m.get("created_at"))
+
+            parts = []
+            if m.get("reply_to_id"):
+                quote_who = "You" if m.get("reply_sender_id") == my_id else (chat_state.get("other_username") or "Them")
+                quote_gone = bool(m.get("reply_is_deleted")) or not m.get("reply_preview")
+                parts.append(ft.Container(
+                    content=ft.Column([
+                        ft.Text(quote_who, size=10, weight=ft.FontWeight.BOLD, color=COLOR_TEXT_MUTED),
+                        ft.Text("Original message was deleted" if quote_gone else m.get("reply_preview"),
+                                size=11, max_lines=2, italic=quote_gone, color=COLOR_TEXT_BODY),
+                    ], spacing=1),
+                    padding=6, bgcolor=COLOR_BG, border_radius=RADIUS_SM))
+            if is_deleted:
+                parts.append(ft.Text("This message was deleted", italic=True, color=COLOR_TEXT_MUTED, size=12))
+            else:
+                parts.append(ft.Text(m.get("content") or "", color="white", size=13))
+
+            def make_long_press(msg):
+                def handler(e):
+                    open_message_actions(msg)
+                return handler
+
             thread_messages_layout.controls.append(
                 ft.Row([
                     ft.Column([
                         ft.Container(
-                            content=ft.Text(m.get("content", ""), color="white", size=13),
-                            padding=SPACE_MD, bgcolor=bubble_color, border_radius=RADIUS_LG, width=220
+                            content=ft.Column(parts, spacing=6),
+                            padding=SPACE_MD, bgcolor=bubble_color, border_radius=RADIUS_LG, width=220,
+                            on_long_press=make_long_press(m)
                         ),
                         ft.Text(time_label, color=COLOR_TEXT_FAINT, size=9)
                     ], spacing=2,
@@ -2609,6 +3066,8 @@ async def main(page: ft.Page):
         chat_state["conversation_id"] = conversation_id
         chat_state["other_username"] = other_username
         chat_state["last_rendered_count"] = -1
+        chat_state["reply_to"] = None
+        reply_bar.visible = False
         thread_header_text.value = other_username
         thread_status.value = ""
         panel_chats_inbox.visible = False
@@ -2632,16 +3091,39 @@ async def main(page: ft.Page):
         content = thread_input_box.value or ""
         if not content.strip():
             return
-        sent_ok, send_err = send_message(chat_state["conversation_id"], content)
+        reply_target = chat_state.get("reply_to")
+        sent_ok, send_err = send_message(chat_state["conversation_id"], content,
+                                         reply_target.get("id") if reply_target else None)
         if sent_ok:
             thread_input_box.value = ""
             thread_status.value = ""
+            chat_state["reply_to"] = None
+            reply_bar.visible = False
             page.update()
             render_thread_messages()
         else:
             thread_status.value = send_err or "Message failed to send."
             thread_status.color = COLOR_WARNING if send_err else COLOR_DANGER
             page.update()
+
+    async def handle_paste_into_message(e):
+        try:
+            clip_text = await clipboard_paste()
+        except Exception as ex:
+            print(f"Clipboard error: {type(ex).__name__}")
+            clip_text = None
+            thread_status.value = "Couldn't paste from the clipboard."
+            thread_status.color = COLOR_DANGER
+            page.update()
+            return
+        if not clip_text:
+            thread_status.value = "Nothing to paste."
+            thread_status.color = COLOR_TEXT_MUTED
+            page.update()
+            await clear_thread_status_later("Nothing to paste.")
+            return
+        thread_input_box.value = ((thread_input_box.value or "") + clip_text)[:2000]
+        page.update()
 
     panel_chats_inbox = ft.Column([
         ft.Text("Direct Messages \U0001F4AC", size=18, weight=ft.FontWeight.BOLD, color=COLOR_SUCCESS),
@@ -2696,8 +3178,11 @@ async def main(page: ft.Page):
         ], alignment=ft.MainAxisAlignment.START),
         thread_messages_layout,
         thread_status,
+        reply_bar,
         ft.Row([
             thread_input_box,
+            ft.IconButton(icon=ft.Icons.CONTENT_PASTE_ROUNDED, icon_color=COLOR_TEXT_MUTED,
+                          tooltip="Paste", on_click=handle_paste_into_message),
             ft.IconButton(icon=ft.Icons.EMOJI_EMOTIONS_ROUNDED, icon_color=COLOR_TEXT_MUTED,
                           tooltip="Emoji", on_click=lambda e: open_emoji_picker(thread_input_box)),
             ft.IconButton(icon=ft.Icons.SEND_ROUNDED, icon_color=COLOR_SUCCESS, on_click=handle_send_thread_message)
@@ -3817,7 +4302,10 @@ async def main(page: ft.Page):
 
     viewed_profile_state = {"user_id": None, "username": None}
 
-    def load_other_profile(username):
+    profile_origin = {"from": "feed"}
+
+    def load_other_profile(username, origin="feed"):
+        profile_origin["from"] = origin
         try:
             resp = safe_supabase_call(
                 lambda: supabase.rpc("get_public_profiles", {"p_username_exact": username}).execute()
@@ -3841,6 +4329,7 @@ async def main(page: ft.Page):
             panel_whisper_wall.visible = False
             panel_messages.visible     = False
             panel_people.visible       = False
+            panel_search.visible       = False
             panel_reels.visible        = False
             panel_notifications.visible = False
             page.update()
@@ -3850,6 +4339,10 @@ async def main(page: ft.Page):
 
     def close_profile_view(e):
         panel_view_profile.visible = False
+        if profile_origin["from"] == "search":
+            profile_origin["from"] = "feed"
+            nav_to_search(None)   # back to the search results the person was looking at
+            return
         set_panel_visibility(feed=True)
         render_public_feed()
 
@@ -6810,6 +7303,7 @@ We may update these terms; continued use of the app means you accept the changes
         panel_whisper_wall,
         panel_messages,
         panel_people,
+        panel_search,
         panel_reels,
         panel_notifications,
         panel_settings,
