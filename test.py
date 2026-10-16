@@ -15,6 +15,8 @@ import time
 import io
 import wave
 import tempfile
+import array
+import math
 try:
     import flet_audio as fta
     import flet_audio_recorder as ftr
@@ -64,6 +66,9 @@ VOICE_SAMPLE_RATE = 16000              # voice quality; 16 kHz mono, 16-bit
 VOICE_CHANNELS = 1
 VOICE_BYTES_PER_SECOND = VOICE_SAMPLE_RATE * VOICE_CHANNELS * 2
 VOICE_MAX_BYTES = 5 * 1024 * 1024      # 120 s is about 3.8 MB (bucket limit raised to 5 MB by SQL 5)
+VOICE_RAW_CAP = 26 * 1024 * 1024       # safety cap for raw audio held in memory while recording
+# Formats a browser/device may really deliver, even though 16 kHz mono is requested:
+VOICE_RATE_CANDIDATES = ((16000, 1), (44100, 1), (48000, 1), (44100, 2), (48000, 2))
 AVATARS_BUCKET = "avatars"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm"}
@@ -3030,17 +3035,26 @@ async def main(page: ft.Page):
     # Playback uses short-lived signed links (1 hour).
     # =====================================================================
     voice_state = {"recording": False, "capturing": False, "busy": False, "started": 0.0, "token": 0,
-                   "playing_id": None, "paused": False, "player": None, "fallback_path": None}
+                   "playing_id": None, "paused": False, "player": None, "fallback_path": None,
+                   "pending": None, "raw_bytes": 0, "conv": None}
     voice_play_buttons = {}
-    voice_buffer = bytearray()
+    voice_chunks = {}          # sequence number -> raw audio bytes
 
-    def voice_stream_handler(e):
-        """Receives raw audio chunks while a recording is running."""
-        if voice_state["capturing"] and len(voice_buffer) < VOICE_MAX_BYTES:
-            try:
-                voice_buffer.extend(e.chunk)
-            except Exception as ex:
-                print(f"Voice chunk error: {type(ex).__name__}")
+    async def voice_stream_handler(e):
+        """Receives raw audio chunks while recording. This handler is async ON PURPOSE:
+        Flet runs a sync handler in a brand-new thread for every event, which can
+        reorder chunks and slow the whole app down when chunks arrive many times a second."""
+        if not voice_state["capturing"] or voice_state["raw_bytes"] >= VOICE_RAW_CAP:
+            return
+        try:
+            data = bytes(e.chunk)
+            seq = getattr(e, "sequence", None)
+            key = seq if isinstance(seq, int) else len(voice_chunks)
+            if key not in voice_chunks:
+                voice_chunks[key] = data
+                voice_state["raw_bytes"] += len(data)
+        except Exception as ex:
+            print(f"Voice chunk error: {type(ex).__name__}")
 
     voice_recorder = None
     if VOICE_PACKAGES_OK:
@@ -3063,13 +3077,51 @@ async def main(page: ft.Page):
             seconds = 0
         return f"{seconds // 60}:{seconds % 60:02d}"
 
-    def pcm_to_wav_bytes(pcm):
-        """Wraps raw 16-bit audio into a normal WAV file (in memory)."""
+    def assemble_voice_chunks(chunks):
+        """Puts the chunks back in order by their sequence number.
+        Returns (audio_bytes, number_of_missing_chunks)."""
+        if not chunks:
+            return b"", 0
+        keys = sorted(chunks)
+        missing = (keys[-1] - keys[0] + 1) - len(keys)
+        return b"".join(chunks[k] for k in keys), max(0, missing)
+
+    def guess_voice_format(num_bytes, elapsed):
+        """Which (sample rate, channels) really produced this audio? A browser may ignore
+        the requested 16 kHz mono, so compare the real amount of audio with the real time."""
+        if elapsed < 1.0 or num_bytes <= 0:
+            return VOICE_SAMPLE_RATE, VOICE_CHANNELS
+        samples_per_second = (num_bytes / 2) / elapsed
+        return min(VOICE_RATE_CANDIDATES,
+                   key=lambda rc: abs(math.log(samples_per_second / (rc[0] * rc[1]))))
+
+    def normalize_voice_pcm(pcm, rate, channels):
+        """Returns (mono 16-bit audio, output rate). Mixes stereo down to mono and averages
+        groups of samples to bring the rate down to about 16 kHz, so the file stays small
+        and the WAV header tells the truth about the speed."""
+        samples = array.array("h")
+        samples.frombytes(pcm[: len(pcm) // 2 * 2])
+        if sys.byteorder == "big":
+            samples.byteswap()
+        if channels == 2:
+            n = len(samples) // 2 * 2
+            samples = array.array("h", [(l + r) // 2 for l, r in zip(samples[0:n:2], samples[1:n:2])])
+        factor = max(1, int(round(rate / VOICE_SAMPLE_RATE)))
+        if factor > 1:
+            n = len(samples) // factor * factor
+            parts = [samples[i:n:factor] for i in range(factor)]
+            samples = array.array("h", [sum(t) // factor for t in zip(*parts)])
+        if sys.byteorder == "big":
+            samples.byteswap()
+        return samples.tobytes(), rate // factor
+
+    def pcm_to_wav_bytes(pcm, rate=VOICE_SAMPLE_RATE):
+        """Wraps mono 16-bit audio into a normal WAV file (in memory)."""
         out = io.BytesIO()
         with wave.open(out, "wb") as w:
-            w.setnchannels(VOICE_CHANNELS)
+            w.setnchannels(1)
             w.setsampwidth(2)
-            w.setframerate(VOICE_SAMPLE_RATE)
+            w.setframerate(rate)
             w.writeframes(pcm)
         return out.getvalue()
 
@@ -3084,9 +3136,16 @@ async def main(page: ft.Page):
 
     voice_timer_text = ft.Text("0:00", color="white", size=14, weight=ft.FontWeight.BOLD)
 
-    def set_recording_ui(is_recording):
-        recording_bar.visible = is_recording
-        composer_row.visible = not is_recording
+    def set_voice_bar(mode, label=""):
+        """mode: 'idle' (normal composer), 'recording', 'sending' or 'pending' (not sent yet)."""
+        recording_bar.visible = mode != "idle"
+        composer_row.visible = mode == "idle"
+        voice_dot.visible = mode == "recording"
+        voice_timer_text.visible = mode == "recording"
+        voice_bar_spinner.visible = mode == "sending"
+        voice_send_btn.disabled = mode == "sending"
+        voice_cancel_btn.disabled = mode == "sending"
+        voice_bar_label.value = label
         page.update()
 
     def show_voice_status(text, error=False):
@@ -3095,18 +3154,23 @@ async def main(page: ft.Page):
         page.update()
 
     async def voice_timer_loop(token):
+        """Shows elapsed time from the real clock (never from the number of chunks)."""
+        last_text = None
         while voice_state["recording"] and voice_state["token"] == token:
             elapsed = int(time.monotonic() - voice_state["started"])
-            voice_timer_text.value = format_voice_duration(elapsed)
-            page.update()
+            text = format_voice_duration(elapsed)
+            if text != last_text:
+                voice_timer_text.value = text
+                page.update()
+                last_text = text
             if elapsed >= VOICE_MAX_SECONDS:
                 show_voice_status("2 minute limit reached. Sending your voice note...")
                 await send_voice_recording(None)
                 return
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.25)
 
     async def start_voice_recording(e):
-        if voice_state["recording"] or voice_state["busy"] or not chat_state.get("conversation_id"):
+        if voice_state["recording"] or voice_state["busy"] or voice_state["pending"] or not chat_state.get("conversation_id"):
             return
         if voice_recorder is None:
             show_voice_status("Voice notes aren't available in this version of the app.", True)
@@ -3127,7 +3191,8 @@ async def main(page: ft.Page):
             config = ftr.AudioRecorderConfiguration(
                 encoder=ftr.AudioEncoder.PCM16BITS, channels=VOICE_CHANNELS, sample_rate=VOICE_SAMPLE_RATE
             )
-            voice_buffer.clear()
+            voice_chunks.clear()
+            voice_state["raw_bytes"] = 0
             remove_voice_fallback_file()
             voice_state["capturing"] = True
             try:
@@ -3146,33 +3211,42 @@ async def main(page: ft.Page):
                 return
             await stop_voice_playback()
             voice_state["recording"] = True
+            voice_state["conv"] = chat_state.get("conversation_id")
             voice_state["started"] = time.monotonic()
             voice_state["token"] += 1
             voice_timer_text.value = "0:00"
             thread_status.value = ""
-            set_recording_ui(True)
+            set_voice_bar("recording", "Recording...")
             page.run_task(voice_timer_loop, voice_state["token"])
         except Exception as ex:
             voice_state["capturing"] = False
-            # Full detail goes to the terminal (no private content in it).
+            # Full detail goes to the terminal / server log (no private content in it).
             print(f"Voice recording start error: {type(ex).__name__}: {ex}")
             show_voice_status("Couldn't start recording. Check the microphone permission and try again.", True)
         finally:
             voice_state["busy"] = False
 
     async def cancel_voice_recording(e=None):
-        if not voice_state["recording"]:
+        """Cancels a running recording, or throws away a voice note that failed to send."""
+        if voice_state["busy"]:
+            return
+        was_recording = voice_state["recording"]
+        if not was_recording and not voice_state["pending"]:
             return
         voice_state["recording"] = False
         voice_state["capturing"] = False
         voice_state["token"] += 1
-        try:
-            await maybe_await(voice_recorder.cancel_recording())
-        except Exception as ex:
-            print(f"Voice recording cancel error: {type(ex).__name__}")
-        voice_buffer.clear()
+        voice_state["pending"] = None
+        if was_recording:
+            try:
+                await maybe_await(voice_recorder.cancel_recording())
+            except Exception as ex:
+                print(f"Voice recording cancel error: {type(ex).__name__}")
+        voice_chunks.clear()
+        voice_state["raw_bytes"] = 0
         remove_voice_fallback_file()
-        set_recording_ui(False)
+        set_voice_bar("idle")
+        show_voice_status("")
 
     def notify_voice_recipients(conversation_id, user_id):
         try:
@@ -3230,55 +3304,99 @@ async def main(page: ft.Page):
                 return False, "Your session expired — please log in again."
             return False, friendly_error(e, "Your voice note wasn't sent. Check your connection and try again.")
 
+    async def finish_voice_capture():
+        """Stops the recorder and turns what was captured into a ready-to-send WAV
+        (stored in voice_state['pending']). Returns an error text, or None on success."""
+        elapsed = time.monotonic() - voice_state["started"]
+        try:
+            await maybe_await(voice_recorder.stop_recording())
+        except Exception as ex:
+            print(f"Voice recording stop error: {type(ex).__name__}: {ex}")
+        # Wait until the last audio chunks have arrived (they stop growing).
+        waited, last_count = 0.0, len(voice_chunks)
+        while waited < 1.5:
+            await asyncio.sleep(0.15)
+            waited += 0.15
+            if len(voice_chunks) == last_count:
+                break
+            last_count = len(voice_chunks)
+        voice_state["capturing"] = False
+        pcm, missing = assemble_voice_chunks(voice_chunks)
+        total_chunks = len(voice_chunks)
+        voice_chunks.clear()
+        voice_state["raw_bytes"] = 0
+        rate, channels = guess_voice_format(len(pcm), elapsed)
+        fallback = voice_state.get("fallback_path")
+        if not pcm and fallback:                # backup: the recorder wrote a file instead
+            try:
+                with open(fallback, "rb") as fh:
+                    pcm = fh.read()
+                rate, channels = VOICE_SAMPLE_RATE, VOICE_CHANNELS
+            except Exception as ex:
+                print(f"Voice fallback read error: {type(ex).__name__}")
+        if not pcm:
+            return "That recording was empty or too short."
+        if missing > max(2, total_chunks // 10):
+            print(f"Voice recording incomplete: {missing} of {total_chunks + missing} chunks missing")
+            return "The recording was interrupted. Please record it again."
+        mono, out_rate = await asyncio.to_thread(normalize_voice_pcm, pcm, rate, channels)
+        seconds = int(round(len(mono) / (out_rate * 2)))
+        print(f"Voice stats: chunks={total_chunks} missing={missing} bytes={len(pcm)} clock={elapsed:.2f}s "
+              f"detected={rate}Hz x{channels} saved={out_rate}Hz length={seconds}s")
+        if seconds < 1:
+            return "That recording was too short."
+        if seconds > VOICE_MAX_SECONDS:
+            seconds = VOICE_MAX_SECONDS
+            mono = mono[:VOICE_MAX_SECONDS * out_rate * 2]
+        voice_state["pending"] = {"wav": pcm_to_wav_bytes(mono, out_rate), "seconds": seconds,
+                                  "conv": voice_state.get("conv") or chat_state.get("conversation_id")}
+        return None
+
     async def send_voice_recording(e):
-        if not voice_state["recording"] or voice_state["busy"]:
+        """Send arrow. If a recording is running it is finished first; if an earlier
+        send failed, the SAME recording is sent again (no need to record twice)."""
+        if voice_state["busy"]:
+            show_voice_status("Still working on your voice note... please wait.")
+            return
+        if not voice_state["recording"] and not voice_state["pending"]:
             return
         voice_state["busy"] = True
+        was_recording = voice_state["recording"]
         voice_state["recording"] = False
         voice_state["token"] += 1
-        conversation_id = chat_state.get("conversation_id")
-        user_id = get_cached_user_id()
         try:
-            try:
-                await maybe_await(voice_recorder.stop_recording())
-            except Exception as ex:
-                print(f"Voice recording stop error: {type(ex).__name__}: {ex}")
-            await asyncio.sleep(0.3)               # let the last audio chunks arrive
-            voice_state["capturing"] = False
-            set_recording_ui(False)
-            pcm = bytes(voice_buffer)
-            voice_buffer.clear()
-            fallback = voice_state.get("fallback_path")
-            if not pcm and fallback:                # backup: the recorder wrote a file instead
-                try:
-                    with open(fallback, "rb") as fh:
-                        pcm = fh.read()
-                except Exception as ex:
-                    print(f"Voice fallback read error: {type(ex).__name__}")
-            seconds = int(round(len(pcm) / VOICE_BYTES_PER_SECOND))
-            if seconds < 1:
-                show_voice_status("That recording was too short.", True)
-                return
-            if seconds > VOICE_MAX_SECONDS:
-                seconds = VOICE_MAX_SECONDS
-                pcm = pcm[:VOICE_MAX_SECONDS * VOICE_BYTES_PER_SECOND]
-            show_voice_status("Sending voice note...")
-            wav_bytes = pcm_to_wav_bytes(pcm)
-            ok, err = await asyncio.to_thread(upload_and_send_voice, conversation_id, user_id, wav_bytes, seconds)
+            set_voice_bar("sending", "Finishing recording..." if was_recording else "Sending...")
+            if was_recording:
+                err = await finish_voice_capture()
+                if err:
+                    set_voice_bar("idle")
+                    show_voice_status(err, True)
+                    return
+            pending = voice_state["pending"]
+            set_voice_bar("sending", "Sending...")
+            show_voice_status("")
+            ok, err = await asyncio.to_thread(
+                upload_and_send_voice, pending["conv"], get_cached_user_id(), pending["wav"], pending["seconds"])
             if ok:
+                voice_state["pending"] = None
+                set_voice_bar("idle")
                 show_voice_status("")
                 chat_state["last_rendered_count"] = -1
                 await asyncio.to_thread(render_thread_messages)
             else:
+                set_voice_bar("pending", f"Not sent ({format_voice_duration(pending['seconds'])}). Tap send to try again.")
                 show_voice_status(err, True)
         except Exception as ex:
             print(f"Voice send error: {type(ex).__name__}: {ex}")
+            if voice_state["pending"]:
+                set_voice_bar("pending", "Not sent. Tap send to try again.")
+            else:
+                set_voice_bar("idle")
             show_voice_status("Your voice note wasn't sent. Please try again.", True)
         finally:
             voice_state["busy"] = False
             voice_state["capturing"] = False
             remove_voice_fallback_file()
-            set_recording_ui(False)
 
     def voice_signed_url(storage_path):
         res = safe_supabase_call(
@@ -3368,21 +3486,25 @@ async def main(page: ft.Page):
 
     def stop_voice_activity():
         """Called when leaving a chat: cancel any recording, stop any playback."""
-        if voice_state["recording"]:
+        if voice_state["recording"] or voice_state["pending"]:
             page.run_task(cancel_voice_recording)
         if voice_state.get("player") is not None:
             page.run_task(stop_voice_playback)
 
     voice_cancel_btn = ft.IconButton(icon=ft.Icons.DELETE_OUTLINE_ROUNDED, icon_color=COLOR_DANGER,
-                                     tooltip="Cancel recording", on_click=cancel_voice_recording)
+                                     tooltip="Discard voice note", on_click=cancel_voice_recording)
     voice_send_btn = ft.IconButton(icon=ft.Icons.SEND_ROUNDED, icon_color=COLOR_SUCCESS,
                                    tooltip="Send voice note", on_click=send_voice_recording)
+    voice_dot = ft.Icon(ft.Icons.CIRCLE, size=12, color=COLOR_DANGER)
+    voice_bar_label = ft.Text("", size=12, color=COLOR_TEXT_MUTED, expand=True)
+    voice_bar_spinner = ft.ProgressRing(width=16, height=16, stroke_width=2, visible=False)
     recording_bar = ft.Container(
         content=ft.Row([
             voice_cancel_btn,
-            ft.Icon(ft.Icons.CIRCLE, size=12, color=COLOR_DANGER),
+            voice_dot,
             voice_timer_text,
-            ft.Text("Recording...", size=12, color=COLOR_TEXT_MUTED, expand=True),
+            voice_bar_label,
+            voice_bar_spinner,
             voice_send_btn,
         ], spacing=6),
         padding=ft.Padding.symmetric(horizontal=8), bgcolor=COLOR_CARD,
