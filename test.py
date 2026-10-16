@@ -12,6 +12,9 @@ import urllib.error
 import json
 from datetime import datetime, timezone
 import time
+import io
+import wave
+import tempfile
 try:
     import flet_audio as fta
     import flet_audio_recorder as ftr
@@ -57,7 +60,10 @@ PRIVACY_POLICY_URL = ""
 MEDIA_BUCKET = "post-media"
 VOICE_BUCKET = "chat-voice"            # PRIVATE bucket (created by the voice-notes SQL)
 VOICE_MAX_SECONDS = 120
-VOICE_MAX_BYTES = 3 * 1024 * 1024
+VOICE_SAMPLE_RATE = 16000              # voice quality; 16 kHz mono, 16-bit
+VOICE_CHANNELS = 1
+VOICE_BYTES_PER_SECOND = VOICE_SAMPLE_RATE * VOICE_CHANNELS * 2
+VOICE_MAX_BYTES = 5 * 1024 * 1024      # 120 s is about 3.8 MB (bucket limit raised to 5 MB by SQL 5)
 AVATARS_BUCKET = "avatars"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm"}
@@ -3015,23 +3021,34 @@ async def main(page: ft.Page):
     # =====================================================================
     # VOICE NOTES
     # Recording: flet-audio-recorder.  Playback: flet-audio.
-    # Files go to the PRIVATE bucket chat-voice (never a public link) and the
-    # message is created by the database function send_voice_note, which applies
-    # the same blocking / connection / rate-limit rules as normal messages.
+    # The recorder STREAMS raw 16-bit audio chunks (on_stream) to Python. This is
+    # the documented way that works the same on Windows, phones AND the browser:
+    # there is no file path and no browser Blob URL to deal with. Python wraps
+    # the chunks into a WAV file in memory and uploads it to the PRIVATE bucket
+    # chat-voice; the message is created by the database function send_voice_note
+    # (same blocking / connection / rate-limit rules as normal messages).
     # Playback uses short-lived signed links (1 hour).
-    # This version records in the phone and desktop apps. The browser preview
-    # is not supported yet (the person is told so, nothing breaks).
     # =====================================================================
-    voice_state = {"recording": False, "busy": False, "started": 0.0, "token": 0,
-                   "playing_id": None, "paused": False, "player": None}
+    voice_state = {"recording": False, "capturing": False, "busy": False, "started": 0.0, "token": 0,
+                   "playing_id": None, "paused": False, "player": None, "fallback_path": None}
     voice_play_buttons = {}
+    voice_buffer = bytearray()
+
+    def voice_stream_handler(e):
+        """Receives raw audio chunks while a recording is running."""
+        if voice_state["capturing"] and len(voice_buffer) < VOICE_MAX_BYTES:
+            try:
+                voice_buffer.extend(e.chunk)
+            except Exception as ex:
+                print(f"Voice chunk error: {type(ex).__name__}")
+
     voice_recorder = None
     if VOICE_PACKAGES_OK:
         try:
-            voice_recorder = ftr.AudioRecorder()
+            voice_recorder = ftr.AudioRecorder(on_stream=voice_stream_handler)
             page.services.append(voice_recorder)
         except Exception as ex:
-            print(f"Voice recorder setup error: {type(ex).__name__}")
+            print(f"Voice recorder setup error: {type(ex).__name__}: {ex}")
             voice_recorder = None
 
     async def maybe_await(value):
@@ -3045,6 +3062,25 @@ async def main(page: ft.Page):
         except (TypeError, ValueError):
             seconds = 0
         return f"{seconds // 60}:{seconds % 60:02d}"
+
+    def pcm_to_wav_bytes(pcm):
+        """Wraps raw 16-bit audio into a normal WAV file (in memory)."""
+        out = io.BytesIO()
+        with wave.open(out, "wb") as w:
+            w.setnchannels(VOICE_CHANNELS)
+            w.setsampwidth(2)
+            w.setframerate(VOICE_SAMPLE_RATE)
+            w.writeframes(pcm)
+        return out.getvalue()
+
+    def remove_voice_fallback_file():
+        path = voice_state.get("fallback_path")
+        voice_state["fallback_path"] = None
+        if path:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
 
     voice_timer_text = ft.Text("0:00", color="white", size=14, weight=ft.FontWeight.BOLD)
 
@@ -3075,26 +3111,37 @@ async def main(page: ft.Page):
         if voice_recorder is None:
             show_voice_status("Voice notes aren't available in this version of the app.", True)
             return
-        if getattr(page, "web", False):
-            show_voice_status("Voice notes work in the phone and desktop apps. They aren't available in the browser preview yet.", True)
-            return
         voice_state["busy"] = True
         try:
+            # has_permission() asks the device / browser for microphone access if needed.
             if not await maybe_await(voice_recorder.has_permission()):
-                show_voice_status("Microphone access is off. Allow it in your device settings to send voice notes.", True)
+                show_voice_status("Microphone access is off. Allow it in your device or browser settings to send voice notes.", True)
                 return
             try:
-                supported = await maybe_await(voice_recorder.is_supported_encoder(ftr.AudioEncoder.AACLC))
+                supported = await maybe_await(voice_recorder.is_supported_encoder(ftr.AudioEncoder.PCM16BITS))
             except Exception:
                 supported = True
             if not supported:
-                show_voice_status("This device can't record voice notes in a format UniVas supports.", True)
+                show_voice_status("This device can't record voice notes.", True)
                 return
             config = ftr.AudioRecorderConfiguration(
-                encoder=ftr.AudioEncoder.AACLC, channels=1, sample_rate=44100, bit_rate=64000
+                encoder=ftr.AudioEncoder.PCM16BITS, channels=VOICE_CHANNELS, sample_rate=VOICE_SAMPLE_RATE
             )
-            started = await maybe_await(voice_recorder.start_recording(configuration=config))
+            voice_buffer.clear()
+            remove_voice_fallback_file()
+            voice_state["capturing"] = True
+            try:
+                started = await maybe_await(voice_recorder.start_recording(configuration=config))
+            except ValueError as ve:
+                # Older recorder builds insist on an output file outside the browser.
+                # Give it one; the audio is still taken from the stream (file is the backup).
+                if "output_path" not in str(ve):
+                    raise
+                fallback = os.path.join(tempfile.gettempdir(), f"univas_voice_{uuid.uuid4().hex}.pcm")
+                voice_state["fallback_path"] = fallback
+                started = await maybe_await(voice_recorder.start_recording(output_path=fallback, configuration=config))
             if not started:
+                voice_state["capturing"] = False
                 show_voice_status("Couldn't start recording. Please try again.", True)
                 return
             await stop_voice_playback()
@@ -3106,7 +3153,9 @@ async def main(page: ft.Page):
             set_recording_ui(True)
             page.run_task(voice_timer_loop, voice_state["token"])
         except Exception as ex:
-            print(f"Voice recording start error: {type(ex).__name__}")
+            voice_state["capturing"] = False
+            # Full detail goes to the terminal (no private content in it).
+            print(f"Voice recording start error: {type(ex).__name__}: {ex}")
             show_voice_status("Couldn't start recording. Check the microphone permission and try again.", True)
         finally:
             voice_state["busy"] = False
@@ -3115,11 +3164,14 @@ async def main(page: ft.Page):
         if not voice_state["recording"]:
             return
         voice_state["recording"] = False
+        voice_state["capturing"] = False
         voice_state["token"] += 1
         try:
             await maybe_await(voice_recorder.cancel_recording())
         except Exception as ex:
             print(f"Voice recording cancel error: {type(ex).__name__}")
+        voice_buffer.clear()
+        remove_voice_fallback_file()
         set_recording_ui(False)
 
     def notify_voice_recipients(conversation_id, user_id):
@@ -3136,23 +3188,17 @@ async def main(page: ft.Page):
         except Exception as notif_ex:
             print(f"Voice note notification error: {type(notif_ex).__name__}")
 
-    def upload_and_send_voice(conversation_id, user_id, local_path, seconds):
+    def upload_and_send_voice(conversation_id, user_id, wav_bytes, seconds):
         """Runs in a background thread. Returns (ok, error_text). The note is
         only reported as sent after the database confirms it."""
-        try:
-            with open(local_path, "rb") as fh:
-                data = fh.read()
-        except Exception as ex:
-            print(f"Voice file read error: {type(ex).__name__}")
-            return False, "Couldn't read the recording. Please try again."
-        if not data:
+        if not wav_bytes:
             return False, "The recording was empty. Please try again."
-        if len(data) > VOICE_MAX_BYTES:
+        if len(wav_bytes) > VOICE_MAX_BYTES:
             return False, "That voice note is too large. Please record a shorter one."
-        object_path = f"{conversation_id}/{user_id}/{uuid.uuid4()}.m4a"
+        object_path = f"{conversation_id}/{user_id}/{uuid.uuid4()}.wav"
         uploaded = False
         try:
-            upload_with_retry(VOICE_BUCKET, object_path, data, "audio/mp4")
+            upload_with_retry(VOICE_BUCKET, object_path, wav_bytes, "audio/wav")
             uploaded = True
             result = safe_supabase_call(
                 lambda: supabase.rpc("send_voice_note", {
@@ -3173,8 +3219,11 @@ async def main(page: ft.Page):
                     print(f"Voice cleanup error: {type(cleanup_ex).__name__}")
             msg = str(e)
             low = msg.lower()
+            print(f"Voice send error: {type(e).__name__}: {msg[:200]}")
             if is_missing_function_error(e, "send_voice_note") or "bucket not found" in low:
                 return False, "Voice notes aren't available yet. Please try again later."
+            if "mime type" in low or "not supported" in low or "unsupported" in low:
+                return False, "Voice notes aren't set up for this audio format yet."
             if "CONNECTION_REQUIRED" in msg:
                 return False, "You've sent your one message — you can chat freely once they accept your connection request."
             if "session expired" in low:
@@ -3187,19 +3236,35 @@ async def main(page: ft.Page):
         voice_state["busy"] = True
         voice_state["recording"] = False
         voice_state["token"] += 1
-        elapsed = time.monotonic() - voice_state["started"]
         conversation_id = chat_state.get("conversation_id")
         user_id = get_cached_user_id()
-        local_path = None
         try:
-            local_path = await maybe_await(voice_recorder.stop_recording())
+            try:
+                await maybe_await(voice_recorder.stop_recording())
+            except Exception as ex:
+                print(f"Voice recording stop error: {type(ex).__name__}: {ex}")
+            await asyncio.sleep(0.3)               # let the last audio chunks arrive
+            voice_state["capturing"] = False
             set_recording_ui(False)
-            seconds = min(int(round(elapsed)), VOICE_MAX_SECONDS)
-            if seconds < 1 or not local_path:
+            pcm = bytes(voice_buffer)
+            voice_buffer.clear()
+            fallback = voice_state.get("fallback_path")
+            if not pcm and fallback:                # backup: the recorder wrote a file instead
+                try:
+                    with open(fallback, "rb") as fh:
+                        pcm = fh.read()
+                except Exception as ex:
+                    print(f"Voice fallback read error: {type(ex).__name__}")
+            seconds = int(round(len(pcm) / VOICE_BYTES_PER_SECOND))
+            if seconds < 1:
                 show_voice_status("That recording was too short.", True)
                 return
+            if seconds > VOICE_MAX_SECONDS:
+                seconds = VOICE_MAX_SECONDS
+                pcm = pcm[:VOICE_MAX_SECONDS * VOICE_BYTES_PER_SECOND]
             show_voice_status("Sending voice note...")
-            ok, err = await asyncio.to_thread(upload_and_send_voice, conversation_id, user_id, local_path, seconds)
+            wav_bytes = pcm_to_wav_bytes(pcm)
+            ok, err = await asyncio.to_thread(upload_and_send_voice, conversation_id, user_id, wav_bytes, seconds)
             if ok:
                 show_voice_status("")
                 chat_state["last_rendered_count"] = -1
@@ -3207,16 +3272,13 @@ async def main(page: ft.Page):
             else:
                 show_voice_status(err, True)
         except Exception as ex:
-            print(f"Voice send error: {type(ex).__name__}")
+            print(f"Voice send error: {type(ex).__name__}: {ex}")
             show_voice_status("Your voice note wasn't sent. Please try again.", True)
         finally:
             voice_state["busy"] = False
+            voice_state["capturing"] = False
+            remove_voice_fallback_file()
             set_recording_ui(False)
-            if local_path:
-                try:
-                    os.remove(local_path)
-                except Exception:
-                    pass
 
     def voice_signed_url(storage_path):
         res = safe_supabase_call(
