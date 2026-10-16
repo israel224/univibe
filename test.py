@@ -11,6 +11,15 @@ import urllib.request
 import urllib.error
 import json
 from datetime import datetime, timezone
+import time
+try:
+    import flet_audio as fta
+    import flet_audio_recorder as ftr
+    VOICE_PACKAGES_OK = True
+except Exception:   # packages not installed: the app runs normally, without voice notes
+    fta = None
+    ftr = None
+    VOICE_PACKAGES_OK = False
 
 # --- VIDEO PLAYBACK ---
 # In Flet 0.70+ the Video control was split out of core `flet` into the
@@ -46,6 +55,9 @@ PRIVACY_POLICY_URL = ""
 # private client so logins can never bleed into each other.
 
 MEDIA_BUCKET = "post-media"
+VOICE_BUCKET = "chat-voice"            # PRIVATE bucket (created by the voice-notes SQL)
+VOICE_MAX_SECONDS = 120
+VOICE_MAX_BYTES = 3 * 1024 * 1024
 AVATARS_BUCKET = "avatars"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm"}
@@ -1925,6 +1937,10 @@ async def main(page: ft.Page):
         if not chats:
             chat_state["polling_active"] = False
             chat_state["inbox_polling_active"] = False
+            try:
+                stop_voice_activity()   # leaving the chat: cancel recording, stop playback
+            except NameError:
+                pass
         panel_home_feed.visible      = feed
         panel_whisper_wall.visible   = secrets
         panel_messages.visible       = chats
@@ -2671,11 +2687,14 @@ async def main(page: ft.Page):
         """Which actions the long-press menu offers for one message."""
         is_deleted = bool(m.get("is_deleted"))
         has_text = bool((m.get("content") or "").strip())
+        is_voice = (m.get("media_type") == "audio") and not is_deleted
         actions = []
         if has_text and not is_deleted:
             actions.append("copy")
             if thread_v2:
                 actions.append("reply")
+        elif is_voice and thread_v2:
+            actions.append("reply")
         if thread_v2:
             actions.append("delete")
         return actions
@@ -2800,7 +2819,7 @@ async def main(page: ft.Page):
     chat_inbox_status = ft.Text("", size=12)
 
     thread_messages_layout = ft.Column(spacing=8, scroll=ft.ScrollMode.ALWAYS, height=260, auto_scroll=True)
-    thread_input_box = ft.TextField(hint_text="Type a message...", width=220, dense=True, color="white")
+    thread_input_box = ft.TextField(hint_text="Type a message...", width=190, dense=True, color="white")
     thread_header_text = ft.Text("", size=16, weight=ft.FontWeight.BOLD, color="white")
     thread_status = ft.Text("", size=11)
 
@@ -2965,7 +2984,7 @@ async def main(page: ft.Page):
         def do_reply(e):
             close()
             who = "yourself" if m.get("sender_id") == my_id else (chat_state.get("other_username") or "them")
-            preview = text if len(text) <= 80 else text[:77].rstrip() + "..."
+            preview = "Voice message" if not text else (text if len(text) <= 80 else text[:77].rstrip() + "...")
             chat_state["reply_to"] = {"id": m.get("id")}
             reply_bar_text.value = f"Replying to {who}: {preview}"
             reply_bar.visible = True
@@ -2993,6 +3012,324 @@ async def main(page: ft.Page):
         dlg.open = True
         page.update()
 
+    # =====================================================================
+    # VOICE NOTES
+    # Recording: flet-audio-recorder.  Playback: flet-audio.
+    # Files go to the PRIVATE bucket chat-voice (never a public link) and the
+    # message is created by the database function send_voice_note, which applies
+    # the same blocking / connection / rate-limit rules as normal messages.
+    # Playback uses short-lived signed links (1 hour).
+    # This version records in the phone and desktop apps. The browser preview
+    # is not supported yet (the person is told so, nothing breaks).
+    # =====================================================================
+    voice_state = {"recording": False, "busy": False, "started": 0.0, "token": 0,
+                   "playing_id": None, "paused": False, "player": None}
+    voice_play_buttons = {}
+    voice_recorder = None
+    if VOICE_PACKAGES_OK:
+        try:
+            voice_recorder = ftr.AudioRecorder()
+            page.services.append(voice_recorder)
+        except Exception as ex:
+            print(f"Voice recorder setup error: {type(ex).__name__}")
+            voice_recorder = None
+
+    async def maybe_await(value):
+        if inspect.isawaitable(value):
+            return await value
+        return value
+
+    def format_voice_duration(seconds):
+        try:
+            seconds = max(0, int(seconds))
+        except (TypeError, ValueError):
+            seconds = 0
+        return f"{seconds // 60}:{seconds % 60:02d}"
+
+    voice_timer_text = ft.Text("0:00", color="white", size=14, weight=ft.FontWeight.BOLD)
+
+    def set_recording_ui(is_recording):
+        recording_bar.visible = is_recording
+        composer_row.visible = not is_recording
+        page.update()
+
+    def show_voice_status(text, error=False):
+        thread_status.value = text
+        thread_status.color = COLOR_DANGER if error else COLOR_TEXT_MUTED
+        page.update()
+
+    async def voice_timer_loop(token):
+        while voice_state["recording"] and voice_state["token"] == token:
+            elapsed = int(time.monotonic() - voice_state["started"])
+            voice_timer_text.value = format_voice_duration(elapsed)
+            page.update()
+            if elapsed >= VOICE_MAX_SECONDS:
+                show_voice_status("2 minute limit reached. Sending your voice note...")
+                await send_voice_recording(None)
+                return
+            await asyncio.sleep(0.5)
+
+    async def start_voice_recording(e):
+        if voice_state["recording"] or voice_state["busy"] or not chat_state.get("conversation_id"):
+            return
+        if voice_recorder is None:
+            show_voice_status("Voice notes aren't available in this version of the app.", True)
+            return
+        if getattr(page, "web", False):
+            show_voice_status("Voice notes work in the phone and desktop apps. They aren't available in the browser preview yet.", True)
+            return
+        voice_state["busy"] = True
+        try:
+            if not await maybe_await(voice_recorder.has_permission()):
+                show_voice_status("Microphone access is off. Allow it in your device settings to send voice notes.", True)
+                return
+            try:
+                supported = await maybe_await(voice_recorder.is_supported_encoder(ftr.AudioEncoder.AACLC))
+            except Exception:
+                supported = True
+            if not supported:
+                show_voice_status("This device can't record voice notes in a format UniVas supports.", True)
+                return
+            config = ftr.AudioRecorderConfiguration(
+                encoder=ftr.AudioEncoder.AACLC, channels=1, sample_rate=44100, bit_rate=64000
+            )
+            started = await maybe_await(voice_recorder.start_recording(configuration=config))
+            if not started:
+                show_voice_status("Couldn't start recording. Please try again.", True)
+                return
+            await stop_voice_playback()
+            voice_state["recording"] = True
+            voice_state["started"] = time.monotonic()
+            voice_state["token"] += 1
+            voice_timer_text.value = "0:00"
+            thread_status.value = ""
+            set_recording_ui(True)
+            page.run_task(voice_timer_loop, voice_state["token"])
+        except Exception as ex:
+            print(f"Voice recording start error: {type(ex).__name__}")
+            show_voice_status("Couldn't start recording. Check the microphone permission and try again.", True)
+        finally:
+            voice_state["busy"] = False
+
+    async def cancel_voice_recording(e=None):
+        if not voice_state["recording"]:
+            return
+        voice_state["recording"] = False
+        voice_state["token"] += 1
+        try:
+            await maybe_await(voice_recorder.cancel_recording())
+        except Exception as ex:
+            print(f"Voice recording cancel error: {type(ex).__name__}")
+        set_recording_ui(False)
+
+    def notify_voice_recipients(conversation_id, user_id):
+        try:
+            parts = safe_supabase_call(
+                lambda: supabase.rpc("get_conversation_participant_ids", {
+                    "p_conversation_id": conversation_id
+                }).execute()
+            )
+            for part in (parts.data if parts else []) or []:
+                other_id = part.get("user_id")
+                if other_id and other_id != user_id:
+                    create_notification(other_id, "message")
+        except Exception as notif_ex:
+            print(f"Voice note notification error: {type(notif_ex).__name__}")
+
+    def upload_and_send_voice(conversation_id, user_id, local_path, seconds):
+        """Runs in a background thread. Returns (ok, error_text). The note is
+        only reported as sent after the database confirms it."""
+        try:
+            with open(local_path, "rb") as fh:
+                data = fh.read()
+        except Exception as ex:
+            print(f"Voice file read error: {type(ex).__name__}")
+            return False, "Couldn't read the recording. Please try again."
+        if not data:
+            return False, "The recording was empty. Please try again."
+        if len(data) > VOICE_MAX_BYTES:
+            return False, "That voice note is too large. Please record a shorter one."
+        object_path = f"{conversation_id}/{user_id}/{uuid.uuid4()}.m4a"
+        uploaded = False
+        try:
+            upload_with_retry(VOICE_BUCKET, object_path, data, "audio/mp4")
+            uploaded = True
+            result = safe_supabase_call(
+                lambda: supabase.rpc("send_voice_note", {
+                    "p_conversation_id": conversation_id,
+                    "p_storage_path": object_path,
+                    "p_duration_seconds": seconds
+                }).execute()
+            )
+            if result is None:
+                raise RuntimeError("session expired")
+            notify_voice_recipients(conversation_id, user_id)
+            return True, None
+        except Exception as e:
+            if uploaded:   # do not leave an orphan file behind
+                try:
+                    supabase.storage.from_(VOICE_BUCKET).remove([object_path])
+                except Exception as cleanup_ex:
+                    print(f"Voice cleanup error: {type(cleanup_ex).__name__}")
+            msg = str(e)
+            low = msg.lower()
+            if is_missing_function_error(e, "send_voice_note") or "bucket not found" in low:
+                return False, "Voice notes aren't available yet. Please try again later."
+            if "CONNECTION_REQUIRED" in msg:
+                return False, "You've sent your one message — you can chat freely once they accept your connection request."
+            if "session expired" in low:
+                return False, "Your session expired — please log in again."
+            return False, friendly_error(e, "Your voice note wasn't sent. Check your connection and try again.")
+
+    async def send_voice_recording(e):
+        if not voice_state["recording"] or voice_state["busy"]:
+            return
+        voice_state["busy"] = True
+        voice_state["recording"] = False
+        voice_state["token"] += 1
+        elapsed = time.monotonic() - voice_state["started"]
+        conversation_id = chat_state.get("conversation_id")
+        user_id = get_cached_user_id()
+        local_path = None
+        try:
+            local_path = await maybe_await(voice_recorder.stop_recording())
+            set_recording_ui(False)
+            seconds = min(int(round(elapsed)), VOICE_MAX_SECONDS)
+            if seconds < 1 or not local_path:
+                show_voice_status("That recording was too short.", True)
+                return
+            show_voice_status("Sending voice note...")
+            ok, err = await asyncio.to_thread(upload_and_send_voice, conversation_id, user_id, local_path, seconds)
+            if ok:
+                show_voice_status("")
+                chat_state["last_rendered_count"] = -1
+                await asyncio.to_thread(render_thread_messages)
+            else:
+                show_voice_status(err, True)
+        except Exception as ex:
+            print(f"Voice send error: {type(ex).__name__}")
+            show_voice_status("Your voice note wasn't sent. Please try again.", True)
+        finally:
+            voice_state["busy"] = False
+            set_recording_ui(False)
+            if local_path:
+                try:
+                    os.remove(local_path)
+                except Exception:
+                    pass
+
+    def voice_signed_url(storage_path):
+        res = safe_supabase_call(
+            lambda: supabase.storage.from_(VOICE_BUCKET).create_signed_url(storage_path, 3600)
+        )
+        if not res:
+            return None
+        url = (res.get("signedURL") or res.get("signedUrl")) if isinstance(res, dict) else getattr(res, "signed_url", None)
+        if not url:
+            return None
+        if url.startswith("/storage/v1"):
+            url = SUPABASE_URL + url
+        elif url.startswith("/"):
+            url = SUPABASE_URL + "/storage/v1" + url
+        return url
+
+    def set_play_icons(playing_id, is_playing):
+        for mid, btn in voice_play_buttons.items():
+            btn.icon = ft.Icons.PAUSE_ROUNDED if (mid == playing_id and is_playing) else ft.Icons.PLAY_ARROW_ROUNDED
+            btn.tooltip = "Pause" if (mid == playing_id and is_playing) else "Play"
+        page.update()
+
+    async def stop_voice_playback():
+        player = voice_state.get("player")
+        if player is not None:
+            try:
+                await maybe_await(player.release())
+            except Exception as ex:
+                print(f"Voice player release error: {type(ex).__name__}")
+            try:
+                page.services.remove(player)
+            except ValueError:
+                pass
+        voice_state["player"] = None
+        voice_state["playing_id"] = None
+        voice_state["paused"] = False
+        set_play_icons(None, False)
+
+    async def toggle_voice_playback(msg):
+        message_id = msg.get("id")
+        storage_path = msg.get("media_url")
+        if not message_id or not storage_path:
+            return
+        player = voice_state.get("player")
+        if voice_state["playing_id"] == message_id and player is not None:
+            try:
+                if voice_state["paused"]:
+                    await maybe_await(player.resume())
+                    voice_state["paused"] = False
+                    set_play_icons(message_id, True)
+                else:
+                    await maybe_await(player.pause())
+                    voice_state["paused"] = True
+                    set_play_icons(message_id, False)
+            except Exception as ex:
+                print(f"Voice playback toggle error: {type(ex).__name__}")
+                show_voice_status("Couldn't play the voice note.", True)
+            return
+        await stop_voice_playback()
+        show_voice_status("Loading voice note...")
+        try:
+            url = await asyncio.to_thread(voice_signed_url, storage_path)
+        except Exception as ex:
+            print(f"Voice link error: {type(ex).__name__}")
+            url = None
+        if not url:
+            show_voice_status("Couldn't load the voice note. Check your connection and try again.", True)
+            return
+
+        def on_state(ev):
+            if ev.state in (fta.AudioState.COMPLETED, fta.AudioState.STOPPED):
+                voice_state["playing_id"] = None
+                voice_state["paused"] = False
+                set_play_icons(None, False)
+
+        try:
+            player = fta.Audio(src=url, autoplay=True, on_state_change=on_state)
+            page.services.append(player)
+            voice_state["player"] = player
+            voice_state["playing_id"] = message_id
+            voice_state["paused"] = False
+            show_voice_status("")
+            set_play_icons(message_id, True)
+        except Exception as ex:
+            print(f"Voice playback start error: {type(ex).__name__}")
+            show_voice_status("Couldn't play the voice note.", True)
+
+    def stop_voice_activity():
+        """Called when leaving a chat: cancel any recording, stop any playback."""
+        if voice_state["recording"]:
+            page.run_task(cancel_voice_recording)
+        if voice_state.get("player") is not None:
+            page.run_task(stop_voice_playback)
+
+    voice_cancel_btn = ft.IconButton(icon=ft.Icons.DELETE_OUTLINE_ROUNDED, icon_color=COLOR_DANGER,
+                                     tooltip="Cancel recording", on_click=cancel_voice_recording)
+    voice_send_btn = ft.IconButton(icon=ft.Icons.SEND_ROUNDED, icon_color=COLOR_SUCCESS,
+                                   tooltip="Send voice note", on_click=send_voice_recording)
+    recording_bar = ft.Container(
+        content=ft.Row([
+            voice_cancel_btn,
+            ft.Icon(ft.Icons.CIRCLE, size=12, color=COLOR_DANGER),
+            voice_timer_text,
+            ft.Text("Recording...", size=12, color=COLOR_TEXT_MUTED, expand=True),
+            voice_send_btn,
+        ], spacing=6),
+        padding=ft.Padding.symmetric(horizontal=8), bgcolor=COLOR_CARD,
+        border_radius=RADIUS_LG, width=300, visible=False
+    )
+    voice_mic_btn = ft.IconButton(icon=ft.Icons.MIC_ROUNDED, icon_color=COLOR_TEXT_MUTED,
+                                  tooltip="Record a voice note", on_click=start_voice_recording,
+                                  visible=voice_recorder is not None)
+
     def thread_signature(messages):
         return tuple((m.get("id"), bool(m.get("is_deleted"))) for m in messages)
 
@@ -3004,6 +3341,7 @@ async def main(page: ft.Page):
         chat_state["last_rendered_count"] = sig
 
         thread_messages_layout.controls.clear()
+        voice_play_buttons.clear()
         my_id = get_cached_user_id()
         for m in messages:
             is_mine = m.get("sender_id") == my_id
@@ -3023,8 +3361,27 @@ async def main(page: ft.Page):
                                 size=11, max_lines=2, italic=quote_gone, color=COLOR_TEXT_BODY),
                     ], spacing=1),
                     padding=6, bgcolor=COLOR_BG, border_radius=RADIUS_SM))
+            is_voice = (not is_deleted) and m.get("media_type") == "audio" and bool(m.get("media_url"))
             if is_deleted:
                 parts.append(ft.Text("This message was deleted", italic=True, color=COLOR_TEXT_MUTED, size=12))
+            elif is_voice:
+                def make_voice_click(msg):
+                    async def handler(e):
+                        await toggle_voice_playback(msg)
+                    return handler
+                is_this_playing = voice_state["playing_id"] == m.get("id") and not voice_state["paused"]
+                play_btn = ft.IconButton(
+                    icon=ft.Icons.PAUSE_ROUNDED if is_this_playing else ft.Icons.PLAY_ARROW_ROUNDED,
+                    icon_color="white", icon_size=28, tooltip="Pause" if is_this_playing else "Play",
+                    on_click=make_voice_click(m))
+                voice_play_buttons[m.get("id")] = play_btn
+                parts.append(ft.Row([
+                    play_btn,
+                    ft.Column([
+                        ft.Text("Voice message", size=12, color="white"),
+                        ft.Text(format_voice_duration(m.get("media_duration_seconds")), size=11, color=COLOR_TEXT_BODY),
+                    ], spacing=0),
+                ], spacing=4))
             else:
                 parts.append(ft.Text(m.get("content") or "", color="white", size=13))
 
@@ -3072,6 +3429,7 @@ async def main(page: ft.Page):
         page.run_task(poll_messages_loop)
 
     def close_thread(e):
+        stop_voice_activity()
         chat_state["polling_active"] = False
         chat_state["conversation_id"] = None
         panel_chats_thread.visible = False
@@ -3146,6 +3504,14 @@ async def main(page: ft.Page):
         dlg.open = True
         page.update()
 
+    composer_row = ft.Row([
+        thread_input_box,
+        ft.IconButton(icon=ft.Icons.EMOJI_EMOTIONS_ROUNDED, icon_color=COLOR_TEXT_MUTED,
+                      tooltip="Emoji", on_click=lambda e: open_emoji_picker(thread_input_box)),
+        voice_mic_btn,
+        ft.IconButton(icon=ft.Icons.SEND_ROUNDED, icon_color=COLOR_SUCCESS, on_click=handle_send_thread_message)
+    ], alignment=ft.MainAxisAlignment.CENTER)
+
     panel_chats_thread = ft.Column([
         ft.Row([
             ft.IconButton(icon=ft.Icons.ARROW_BACK_ROUNDED, icon_color=COLOR_SUCCESS, on_click=close_thread),
@@ -3154,12 +3520,8 @@ async def main(page: ft.Page):
         thread_messages_layout,
         thread_status,
         reply_bar,
-        ft.Row([
-            thread_input_box,
-            ft.IconButton(icon=ft.Icons.EMOJI_EMOTIONS_ROUNDED, icon_color=COLOR_TEXT_MUTED,
-                          tooltip="Emoji", on_click=lambda e: open_emoji_picker(thread_input_box)),
-            ft.IconButton(icon=ft.Icons.SEND_ROUNDED, icon_color=COLOR_SUCCESS, on_click=handle_send_thread_message)
-        ], alignment=ft.MainAxisAlignment.CENTER)
+        composer_row,
+        recording_bar,
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
     panel_messages = ft.Column([panel_chats_inbox, panel_chats_thread], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
