@@ -69,6 +69,8 @@ VOICE_MAX_BYTES = 5 * 1024 * 1024      # 120 s is about 3.8 MB (bucket limit rai
 VOICE_RAW_CAP = 26 * 1024 * 1024       # safety cap for raw audio held in memory while recording
 # Formats a browser/device may really deliver, even though 16 kHz mono is requested:
 VOICE_RATE_CANDIDATES = ((16000, 1), (44100, 1), (48000, 1), (44100, 2), (48000, 2))
+VOICE_FINALIZE_MAX_WAIT = 15.0         # longest wait for the last audio to arrive after Stop
+VOICE_DEBUG = os.environ.get("UNIVAS_VOICE_DEBUG") == "1"   # shows timing numbers under the chat
 AVATARS_BUCKET = "avatars"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm"}
@@ -2722,6 +2724,7 @@ async def main(page: ft.Page):
         """Prefers get_chat_thread (hides messages you deleted for yourself, marks
         deleted ones, includes reply quotes). Falls back to the older function
         if get_chat_thread does not exist yet."""
+        chat_state["last_fetch_failed"] = False
         try:
             if chat_state.get("thread_v2", True):
                 try:
@@ -2744,6 +2747,7 @@ async def main(page: ft.Page):
             return (resp.data if resp else []) or []
         except Exception as e:
             print(f"Error fetching messages: {type(e).__name__}")
+            chat_state["last_fetch_failed"] = True
             return []
 
     def send_message(conversation_id, content, reply_to_id=None):
@@ -3036,9 +3040,12 @@ async def main(page: ft.Page):
     # =====================================================================
     voice_state = {"recording": False, "capturing": False, "busy": False, "started": 0.0, "token": 0,
                    "playing_id": None, "paused": False, "player": None, "fallback_path": None,
-                   "pending": None, "raw_bytes": 0, "conv": None}
+                   "pending": None, "raw_bytes": 0, "conv": None,
+                   "stop_requested": False, "stopped_seen": False}
     voice_play_buttons = {}
     voice_chunks = {}          # sequence number -> raw audio bytes
+    # Measurements for finding where time goes (printed to the log after every voice note):
+    voice_trace = {"ticks": [], "update_ms": [], "max_gap": 0.0, "last": None, "max_loop_lag": 0.0}
 
     async def voice_stream_handler(e):
         """Receives raw audio chunks while recording. This handler is async ON PURPOSE:
@@ -3047,6 +3054,10 @@ async def main(page: ft.Page):
         if not voice_state["capturing"] or voice_state["raw_bytes"] >= VOICE_RAW_CAP:
             return
         try:
+            now = time.monotonic()
+            if voice_trace["last"] is not None:
+                voice_trace["max_gap"] = max(voice_trace["max_gap"], now - voice_trace["last"])
+            voice_trace["last"] = now
             data = bytes(e.chunk)
             seq = getattr(e, "sequence", None)
             key = seq if isinstance(seq, int) else len(voice_chunks)
@@ -3056,10 +3067,18 @@ async def main(page: ft.Page):
         except Exception as ex:
             print(f"Voice chunk error: {type(ex).__name__}")
 
+    async def voice_state_handler(e):
+        """The recorder tells us when it has really stopped (used to finish sooner)."""
+        try:
+            if voice_state["stop_requested"] and e.state == ftr.AudioRecorderState.STOPPED:
+                voice_state["stopped_seen"] = True
+        except Exception:
+            pass
+
     voice_recorder = None
     if VOICE_PACKAGES_OK:
         try:
-            voice_recorder = ftr.AudioRecorder(on_stream=voice_stream_handler)
+            voice_recorder = ftr.AudioRecorder(on_stream=voice_stream_handler, on_state_change=voice_state_handler)
             page.services.append(voice_recorder)
         except Exception as ex:
             print(f"Voice recorder setup error: {type(ex).__name__}: {ex}")
@@ -3153,20 +3172,42 @@ async def main(page: ft.Page):
         thread_status.color = COLOR_DANGER if error else COLOR_TEXT_MUTED
         page.update()
 
+    def voice_trace_summary():
+        ticks = voice_trace["ticks"]
+        ups = voice_trace["update_ms"]
+        return {
+            "kb_per_second": [round((y - x) / 1024) for x, y in zip(ticks, ticks[1:])],
+            "max_chunk_gap_s": round(voice_trace["max_gap"], 2),
+            "max_server_stall_s": round(voice_trace["max_loop_lag"], 2),
+            "timer_update_ms_avg": round(sum(ups) / len(ups), 1) if ups else 0.0,
+            "timer_update_ms_max": round(max(ups), 1) if ups else 0.0,
+        }
+
     async def voice_timer_loop(token):
-        """Shows elapsed time from the real clock (never from the number of chunks)."""
+        """Shows elapsed time from the real clock (never from the number of chunks).
+        Only the timer text is updated (not the whole page), once per displayed second."""
         last_text = None
+        expected = time.monotonic()
         while voice_state["recording"] and voice_state["token"] == token:
-            elapsed = int(time.monotonic() - voice_state["started"])
+            now = time.monotonic()
+            voice_trace["max_loop_lag"] = max(voice_trace["max_loop_lag"], now - expected)
+            elapsed = int(now - voice_state["started"])
             text = format_voice_duration(elapsed)
             if text != last_text:
+                voice_trace["ticks"].append(voice_state["raw_bytes"])
+                t0 = time.perf_counter()
                 voice_timer_text.value = text
-                page.update()
+                try:
+                    voice_timer_text.update()
+                except Exception:
+                    page.update()
+                voice_trace["update_ms"].append((time.perf_counter() - t0) * 1000)
                 last_text = text
             if elapsed >= VOICE_MAX_SECONDS:
                 show_voice_status("2 minute limit reached. Sending your voice note...")
                 await send_voice_recording(None)
                 return
+            expected = time.monotonic() + 0.25
             await asyncio.sleep(0.25)
 
     async def start_voice_recording(e):
@@ -3193,6 +3234,9 @@ async def main(page: ft.Page):
             )
             voice_chunks.clear()
             voice_state["raw_bytes"] = 0
+            voice_state["stop_requested"] = False
+            voice_state["stopped_seen"] = False
+            voice_trace.update(ticks=[], update_ms=[], max_gap=0.0, last=None, max_loop_lag=0.0)
             remove_voice_fallback_file()
             voice_state["capturing"] = True
             try:
@@ -3263,17 +3307,21 @@ async def main(page: ft.Page):
             print(f"Voice note notification error: {type(notif_ex).__name__}")
 
     def upload_and_send_voice(conversation_id, user_id, wav_bytes, seconds):
-        """Runs in a background thread. Returns (ok, error_text). The note is
+        """Runs in a background thread. Returns (ok, error_text, timings). The note is
         only reported as sent after the database confirms it."""
+        timings = {}
         if not wav_bytes:
-            return False, "The recording was empty. Please try again."
+            return False, "The recording was empty. Please try again.", timings
         if len(wav_bytes) > VOICE_MAX_BYTES:
-            return False, "That voice note is too large. Please record a shorter one."
+            return False, "That voice note is too large. Please record a shorter one.", timings
         object_path = f"{conversation_id}/{user_id}/{uuid.uuid4()}.wav"
         uploaded = False
         try:
+            t0 = time.perf_counter()
             upload_with_retry(VOICE_BUCKET, object_path, wav_bytes, "audio/wav")
+            timings["upload"] = time.perf_counter() - t0
             uploaded = True
+            t1 = time.perf_counter()
             result = safe_supabase_call(
                 lambda: supabase.rpc("send_voice_note", {
                     "p_conversation_id": conversation_id,
@@ -3281,10 +3329,10 @@ async def main(page: ft.Page):
                     "p_duration_seconds": seconds
                 }).execute()
             )
+            timings["database"] = time.perf_counter() - t1
             if result is None:
                 raise RuntimeError("session expired")
-            notify_voice_recipients(conversation_id, user_id)
-            return True, None
+            return True, None, timings
         except Exception as e:
             if uploaded:   # do not leave an orphan file behind
                 try:
@@ -3295,39 +3343,65 @@ async def main(page: ft.Page):
             low = msg.lower()
             print(f"Voice send error: {type(e).__name__}: {msg[:200]}")
             if is_missing_function_error(e, "send_voice_note") or "bucket not found" in low:
-                return False, "Voice notes aren't available yet. Please try again later."
+                return False, "Voice notes aren't available yet. Please try again later.", timings
             if "mime type" in low or "not supported" in low or "unsupported" in low:
-                return False, "Voice notes aren't set up for this audio format yet."
+                return False, "Voice notes aren't set up for this audio format yet.", timings
             if "CONNECTION_REQUIRED" in msg:
-                return False, "You've sent your one message — you can chat freely once they accept your connection request."
+                return False, "You've sent your one message — you can chat freely once they accept your connection request.", timings
             if "session expired" in low:
-                return False, "Your session expired — please log in again."
-            return False, friendly_error(e, "Your voice note wasn't sent. Check your connection and try again.")
+                return False, "Your session expired — please log in again.", timings
+            return False, friendly_error(e, "Your voice note wasn't sent. Check your connection and try again."), timings
 
-    async def finish_voice_capture():
-        """Stops the recorder and turns what was captured into a ready-to-send WAV
-        (stored in voice_state['pending']). Returns an error text, or None on success."""
-        elapsed = time.monotonic() - voice_state["started"]
+    def prepare_voice_wav(pcm, rate, channels):
+        """Heavy audio work, run in a background thread (never on the screen's thread).
+        Returns (wav_bytes or None, seconds)."""
+        mono, out_rate = normalize_voice_pcm(pcm, rate, channels)
+        seconds = int(round(len(mono) / (out_rate * 2)))
+        if seconds < 1:
+            return None, seconds
+        if seconds > VOICE_MAX_SECONDS:
+            seconds = VOICE_MAX_SECONDS
+            mono = mono[:VOICE_MAX_SECONDS * out_rate * 2]
+        return pcm_to_wav_bytes(mono, out_rate), seconds
+
+    async def finish_voice_capture(stop_task, timings):
+        """Waits for the recorder to stop and for the last audio to arrive, then builds the
+        WAV (stored in voice_state['pending']). Returns an error text, or None on success.
+        Audio is never silently dropped: if the last audio can't arrive, the user is told."""
+        started = voice_state["started"]
+        t0 = time.perf_counter()
         try:
-            await maybe_await(voice_recorder.stop_recording())
+            await stop_task
         except Exception as ex:
             print(f"Voice recording stop error: {type(ex).__name__}: {ex}")
-        # Wait until the last audio chunks have arrived (they stop growing).
-        waited, last_count = 0.0, len(voice_chunks)
-        while waited < 1.5:
-            await asyncio.sleep(0.15)
-            waited += 0.15
-            if len(voice_chunks) == last_count:
+        timings["stop"] = time.perf_counter() - t0
+        elapsed = time.monotonic() - started      # clock time covered by the audio
+        # The last chunks may still be on their way: wait until none arrive any more.
+        t1 = time.perf_counter()
+        last_count, last_change, too_slow = len(voice_chunks), time.monotonic(), False
+        while True:
+            await asyncio.sleep(0.05)
+            now = time.monotonic()
+            if len(voice_chunks) != last_count:
+                last_count, last_change = len(voice_chunks), now
+            quiet_needed = 0.25 if voice_state["stopped_seen"] else 0.4
+            if now - last_change >= quiet_needed:
                 break
-            last_count = len(voice_chunks)
+            if time.perf_counter() - t1 > VOICE_FINALIZE_MAX_WAIT:
+                too_slow = True
+                break
+        timings["last_audio"] = time.perf_counter() - t1
         voice_state["capturing"] = False
         pcm, missing = assemble_voice_chunks(voice_chunks)
         total_chunks = len(voice_chunks)
         voice_chunks.clear()
         voice_state["raw_bytes"] = 0
+        if too_slow:
+            print("Voice recording: the last audio kept arriving for too long")
+            return "Your connection was too slow to finish this recording. Please try again."
         rate, channels = guess_voice_format(len(pcm), elapsed)
         fallback = voice_state.get("fallback_path")
-        if not pcm and fallback:                # backup: the recorder wrote a file instead
+        if not pcm and fallback:                    # backup: the recorder wrote a file instead
             try:
                 with open(fallback, "rb") as fh:
                     pcm = fh.read()
@@ -3339,22 +3413,28 @@ async def main(page: ft.Page):
         if missing > max(2, total_chunks // 10):
             print(f"Voice recording incomplete: {missing} of {total_chunks + missing} chunks missing")
             return "The recording was interrupted. Please record it again."
-        mono, out_rate = await asyncio.to_thread(normalize_voice_pcm, pcm, rate, channels)
-        seconds = int(round(len(mono) / (out_rate * 2)))
+        t2 = time.perf_counter()
+        wav, seconds = await asyncio.to_thread(prepare_voice_wav, pcm, rate, channels)
+        timings["build"] = time.perf_counter() - t2
         print(f"Voice stats: chunks={total_chunks} missing={missing} bytes={len(pcm)} clock={elapsed:.2f}s "
-              f"detected={rate}Hz x{channels} saved={out_rate}Hz length={seconds}s")
-        if seconds < 1:
+              f"detected={rate}Hz x{channels} length={seconds}s")
+        print(f"Voice stream: {voice_trace_summary()}")
+        if wav is None:
             return "That recording was too short."
-        if seconds > VOICE_MAX_SECONDS:
-            seconds = VOICE_MAX_SECONDS
-            mono = mono[:VOICE_MAX_SECONDS * out_rate * 2]
-        voice_state["pending"] = {"wav": pcm_to_wav_bytes(mono, out_rate), "seconds": seconds,
+        voice_state["pending"] = {"wav": wav, "seconds": seconds,
                                   "conv": voice_state.get("conv") or chat_state.get("conversation_id")}
         return None
 
+    def voice_timing_text(timings):
+        names = (("stop", "stop"), ("last_audio", "last audio"), ("build", "build"),
+                 ("upload", "upload"), ("database", "database"), ("refresh", "refresh"), ("total", "total"))
+        return " · ".join(f"{label} {timings[key]:.2f}s" for key, label in names if key in timings)
+
     async def send_voice_recording(e):
-        """Send arrow. If a recording is running it is finished first; if an earlier
+        """Send arrow. The recording stops at once; the rest (finishing, building, uploading)
+        continues in the background while the bar shows what is happening. If an earlier
         send failed, the SAME recording is sent again (no need to record twice)."""
+        t_click = time.perf_counter()
         if voice_state["busy"]:
             show_voice_status("Still working on your voice note... please wait.")
             return
@@ -3364,28 +3444,43 @@ async def main(page: ft.Page):
         was_recording = voice_state["recording"]
         voice_state["recording"] = False
         voice_state["token"] += 1
+        timings = {}
         try:
-            set_voice_bar("sending", "Finishing recording..." if was_recording else "Sending...")
             if was_recording:
-                err = await finish_voice_capture()
+                # 1) Send the STOP command first, before any screen update.
+                voice_state["stop_requested"] = True
+                voice_state["stopped_seen"] = False
+                stop_task = asyncio.ensure_future(maybe_await(voice_recorder.stop_recording()))
+                await asyncio.sleep(0)
+                # 2) Show straight away that recording has ended.
+                set_voice_bar("sending", "Recording stopped. Processing your voice note...")
+                err = await finish_voice_capture(stop_task, timings)
                 if err:
                     set_voice_bar("idle")
                     show_voice_status(err, True)
                     return
             pending = voice_state["pending"]
-            set_voice_bar("sending", "Sending...")
+            set_voice_bar("sending", "Sending your voice note...")
             show_voice_status("")
-            ok, err = await asyncio.to_thread(
+            ok, err, upload_timings = await asyncio.to_thread(
                 upload_and_send_voice, pending["conv"], get_cached_user_id(), pending["wav"], pending["seconds"])
+            timings.update(upload_timings)
             if ok:
                 voice_state["pending"] = None
                 set_voice_bar("idle")
                 show_voice_status("")
-                chat_state["last_rendered_count"] = -1
-                await asyncio.to_thread(render_thread_messages)
+                # Notifying the other person must not delay this screen: do it in the background.
+                asyncio.ensure_future(asyncio.to_thread(notify_voice_recipients, pending["conv"], get_cached_user_id()))
+                t3 = time.perf_counter()
+                await refresh_thread_messages_async()
+                timings["refresh"] = time.perf_counter() - t3
             else:
                 set_voice_bar("pending", f"Not sent ({format_voice_duration(pending['seconds'])}). Tap send to try again.")
                 show_voice_status(err, True)
+            timings["total"] = time.perf_counter() - t_click
+            print("Voice timing: " + voice_timing_text(timings))
+            if VOICE_DEBUG:
+                show_voice_status(voice_timing_text(timings), not ok)
         except Exception as ex:
             print(f"Voice send error: {type(ex).__name__}: {ex}")
             if voice_state["pending"]:
@@ -3517,84 +3612,104 @@ async def main(page: ft.Page):
     def thread_signature(messages):
         return tuple((m.get("id"), bool(m.get("is_deleted"))) for m in messages)
 
-    def render_thread_messages():
-        messages = get_messages(chat_state["conversation_id"])
+    def build_message_bubble(m, my_id):
+        """Builds the controls for ONE message."""
+        is_mine = m.get("sender_id") == my_id
+        is_deleted = bool(m.get("is_deleted"))
+        bubble_color = COLOR_CARD if is_deleted else (COLOR_PRIMARY if is_mine else COLOR_CARD)
+        align = ft.MainAxisAlignment.END if is_mine else ft.MainAxisAlignment.START
+        time_label = format_relative_time(m.get("created_at"))
+
+        parts = []
+        if m.get("reply_to_id"):
+            quote_who = "You" if m.get("reply_sender_id") == my_id else (chat_state.get("other_username") or "Them")
+            quote_gone = bool(m.get("reply_is_deleted")) or not m.get("reply_preview")
+            parts.append(ft.Container(
+                content=ft.Column([
+                    ft.Text(quote_who, size=10, weight=ft.FontWeight.BOLD, color=COLOR_TEXT_MUTED),
+                    ft.Text("Original message was deleted" if quote_gone else m.get("reply_preview"),
+                            size=11, max_lines=2, italic=quote_gone, color=COLOR_TEXT_BODY),
+                ], spacing=1),
+                padding=6, bgcolor=COLOR_BG, border_radius=RADIUS_SM))
+        is_voice = (not is_deleted) and m.get("media_type") == "audio" and bool(m.get("media_url"))
+        if is_deleted:
+            parts.append(ft.Text("This message was deleted", italic=True, color=COLOR_TEXT_MUTED, size=12))
+        elif is_voice:
+            def make_voice_click(msg):
+                async def handler(e):
+                    await toggle_voice_playback(msg)
+                return handler
+            is_this_playing = voice_state["playing_id"] == m.get("id") and not voice_state["paused"]
+            play_btn = ft.IconButton(
+                icon=ft.Icons.PAUSE_ROUNDED if is_this_playing else ft.Icons.PLAY_ARROW_ROUNDED,
+                icon_color="white", icon_size=28, tooltip="Pause" if is_this_playing else "Play",
+                on_click=make_voice_click(m))
+            voice_play_buttons[m.get("id")] = play_btn
+            parts.append(ft.Row([
+                play_btn,
+                ft.Column([
+                    ft.Text("Voice message", size=12, color="white"),
+                    ft.Text(format_voice_duration(m.get("media_duration_seconds")), size=11, color=COLOR_TEXT_BODY),
+                ], spacing=0),
+            ], spacing=4))
+        else:
+            parts.append(ft.Text(m.get("content") or "", color="white", size=13))
+
+        def make_long_press(msg):
+            def handler(e):
+                open_message_actions(msg)
+            return handler
+
+        return ft.Row([
+                ft.Column([
+                    ft.Container(
+                        content=ft.Column(parts, spacing=6),
+                        padding=SPACE_MD, bgcolor=bubble_color, border_radius=RADIUS_LG, width=220,
+                        on_long_press=make_long_press(m)
+                    ),
+                    ft.Text(time_label, color=COLOR_TEXT_FAINT, size=9)
+                ], spacing=2,
+                   horizontal_alignment=ft.CrossAxisAlignment.END if is_mine else ft.CrossAxisAlignment.START)
+            ], alignment=align)
+
+    def apply_thread_messages(messages):
+        """Shows the messages. If the only change is new messages at the end, just add those;
+        otherwise (a message was deleted or hidden) rebuild the list."""
+        if not messages and chat_state.get("last_fetch_failed"):
+            return   # the refresh failed: keep showing the chat as it is
         sig = thread_signature(messages)
-        if sig == chat_state["last_rendered_count"]:
+        old_sig = chat_state["last_rendered_count"]
+        if sig == old_sig:
             return
         chat_state["last_rendered_count"] = sig
-
-        thread_messages_layout.controls.clear()
-        voice_play_buttons.clear()
         my_id = get_cached_user_id()
-        for m in messages:
-            is_mine = m.get("sender_id") == my_id
-            is_deleted = bool(m.get("is_deleted"))
-            bubble_color = COLOR_CARD if is_deleted else (COLOR_PRIMARY if is_mine else COLOR_CARD)
-            align = ft.MainAxisAlignment.END if is_mine else ft.MainAxisAlignment.START
-            time_label = format_relative_time(m.get("created_at"))
-
-            parts = []
-            if m.get("reply_to_id"):
-                quote_who = "You" if m.get("reply_sender_id") == my_id else (chat_state.get("other_username") or "Them")
-                quote_gone = bool(m.get("reply_is_deleted")) or not m.get("reply_preview")
-                parts.append(ft.Container(
-                    content=ft.Column([
-                        ft.Text(quote_who, size=10, weight=ft.FontWeight.BOLD, color=COLOR_TEXT_MUTED),
-                        ft.Text("Original message was deleted" if quote_gone else m.get("reply_preview"),
-                                size=11, max_lines=2, italic=quote_gone, color=COLOR_TEXT_BODY),
-                    ], spacing=1),
-                    padding=6, bgcolor=COLOR_BG, border_radius=RADIUS_SM))
-            is_voice = (not is_deleted) and m.get("media_type") == "audio" and bool(m.get("media_url"))
-            if is_deleted:
-                parts.append(ft.Text("This message was deleted", italic=True, color=COLOR_TEXT_MUTED, size=12))
-            elif is_voice:
-                def make_voice_click(msg):
-                    async def handler(e):
-                        await toggle_voice_playback(msg)
-                    return handler
-                is_this_playing = voice_state["playing_id"] == m.get("id") and not voice_state["paused"]
-                play_btn = ft.IconButton(
-                    icon=ft.Icons.PAUSE_ROUNDED if is_this_playing else ft.Icons.PLAY_ARROW_ROUNDED,
-                    icon_color="white", icon_size=28, tooltip="Pause" if is_this_playing else "Play",
-                    on_click=make_voice_click(m))
-                voice_play_buttons[m.get("id")] = play_btn
-                parts.append(ft.Row([
-                    play_btn,
-                    ft.Column([
-                        ft.Text("Voice message", size=12, color="white"),
-                        ft.Text(format_voice_duration(m.get("media_duration_seconds")), size=11, color=COLOR_TEXT_BODY),
-                    ], spacing=0),
-                ], spacing=4))
-            else:
-                parts.append(ft.Text(m.get("content") or "", color="white", size=13))
-
-            def make_long_press(msg):
-                def handler(e):
-                    open_message_actions(msg)
-                return handler
-
-            thread_messages_layout.controls.append(
-                ft.Row([
-                    ft.Column([
-                        ft.Container(
-                            content=ft.Column(parts, spacing=6),
-                            padding=SPACE_MD, bgcolor=bubble_color, border_radius=RADIUS_LG, width=220,
-                            on_long_press=make_long_press(m)
-                        ),
-                        ft.Text(time_label, color=COLOR_TEXT_FAINT, size=9)
-                    ], spacing=2,
-                       horizontal_alignment=ft.CrossAxisAlignment.END if is_mine else ft.CrossAxisAlignment.START)
-                ], alignment=align)
-            )
+        if isinstance(old_sig, tuple) and 0 < len(old_sig) < len(sig) and sig[:len(old_sig)] == old_sig:
+            for m in messages[len(old_sig):]:
+                thread_messages_layout.controls.append(build_message_bubble(m, my_id))
+        else:
+            thread_messages_layout.controls.clear()
+            voice_play_buttons.clear()
+            for m in messages:
+                thread_messages_layout.controls.append(build_message_bubble(m, my_id))
         page.update()
+
+    def render_thread_messages():
+        apply_thread_messages(get_messages(chat_state["conversation_id"]))
+
+    async def refresh_thread_messages_async():
+        """Fetches messages in a background thread so the screen keeps responding."""
+        conversation_id = chat_state["conversation_id"]
+        messages = await asyncio.to_thread(get_messages, conversation_id)
+        if conversation_id != chat_state["conversation_id"]:
+            return
+        apply_thread_messages(messages)
 
     async def poll_messages_loop():
         while chat_state["polling_active"]:
             await asyncio.sleep(2.5)
             if not chat_state["polling_active"]:
                 break
-            render_thread_messages()
+            await refresh_thread_messages_async()
 
     def open_thread(conversation_id, other_username):
         chat_state["inbox_polling_active"] = False
