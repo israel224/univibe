@@ -70,7 +70,6 @@ VOICE_RAW_CAP = 26 * 1024 * 1024       # safety cap for raw audio held in memory
 # Formats a browser/device may really deliver, even though 16 kHz mono is requested:
 VOICE_RATE_CANDIDATES = ((16000, 1), (44100, 1), (48000, 1), (44100, 2), (48000, 2))
 VOICE_FINALIZE_MAX_WAIT = 15.0         # longest wait for the last audio to arrive after Stop
-VOICE_DEBUG = os.environ.get("UNIVAS_VOICE_DEBUG") == "1"   # shows timing numbers under the chat
 AVATARS_BUCKET = "avatars"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm"}
@@ -3204,7 +3203,7 @@ async def main(page: ft.Page):
                 voice_trace["update_ms"].append((time.perf_counter() - t0) * 1000)
                 last_text = text
             if elapsed >= VOICE_MAX_SECONDS:
-                show_voice_status("2 minute limit reached. Sending your voice note...")
+                show_voice_status("2 minute limit reached.")
                 await send_voice_recording(None)
                 return
             expected = time.monotonic() + 0.25
@@ -3436,7 +3435,7 @@ async def main(page: ft.Page):
         send failed, the SAME recording is sent again (no need to record twice)."""
         t_click = time.perf_counter()
         if voice_state["busy"]:
-            show_voice_status("Still working on your voice note... please wait.")
+            show_voice_status("Still sending...")
             return
         if not voice_state["recording"] and not voice_state["pending"]:
             return
@@ -3453,14 +3452,14 @@ async def main(page: ft.Page):
                 stop_task = asyncio.ensure_future(maybe_await(voice_recorder.stop_recording()))
                 await asyncio.sleep(0)
                 # 2) Show straight away that recording has ended.
-                set_voice_bar("sending", "Recording stopped. Processing your voice note...")
+                set_voice_bar("sending", "Sending...")
                 err = await finish_voice_capture(stop_task, timings)
                 if err:
                     set_voice_bar("idle")
                     show_voice_status(err, True)
                     return
             pending = voice_state["pending"]
-            set_voice_bar("sending", "Sending your voice note...")
+            set_voice_bar("sending", "Sending...")
             show_voice_status("")
             ok, err, upload_timings = await asyncio.to_thread(
                 upload_and_send_voice, pending["conv"], get_cached_user_id(), pending["wav"], pending["seconds"])
@@ -3478,9 +3477,7 @@ async def main(page: ft.Page):
                 set_voice_bar("pending", f"Not sent ({format_voice_duration(pending['seconds'])}). Tap send to try again.")
                 show_voice_status(err, True)
             timings["total"] = time.perf_counter() - t_click
-            print("Voice timing: " + voice_timing_text(timings))
-            if VOICE_DEBUG:
-                show_voice_status(voice_timing_text(timings), not ok)
+            print("Voice timing: " + voice_timing_text(timings))   # server log only, never shown in the chat
         except Exception as ex:
             print(f"Voice send error: {type(ex).__name__}: {ex}")
             if voice_state["pending"]:
