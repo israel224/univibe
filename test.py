@@ -4106,17 +4106,121 @@ async def main(page: ft.Page):
         finally:
             chat_media["busy"] = False
 
-    def open_chat_image(url):
-        dlg = ft.AlertDialog(bgcolor=COLOR_CARD, content=ft.Image(src=url, width=DIALOG_WIDTH, height=360,
-                                                                  fit=ft.BoxFit.CONTAIN))
+    def open_chat_image(url, m=None):
+        """Full-size picture. For pictures received from the other person it also offers Save.
+        In a browser it also offers 'Open picture' (the picture in its own tab), which is the
+        dependable way to keep a picture in Photos on some phones if the download is blocked."""
+        picture = ft.Image(src=url, width=DIALOG_WIDTH, height=360, fit=ft.BoxFit.CONTAIN)
+        show_save = m is not None and is_received_picture(m)
+        show_open = show_save and bool(getattr(page, "web", False))
+        content = picture
+        if show_open:
+            content = ft.Column([picture, ft.Text("If it didn't download, tap Open picture and save it from there.",
+                                                   size=11, color=COLOR_TEXT_MUTED)],
+                                spacing=6, tight=True)
+        dlg = ft.AlertDialog(bgcolor=COLOR_CARD, content=content)
 
         def close(e=None):
             dlg.open = False
             page.update()
-        dlg.actions = [ft.TextButton(content=ft.Text("Close", color=COLOR_PRIMARY), on_click=close)]
+
+        async def save_from_viewer(e):
+            await save_chat_picture(m)
+
+        actions = []
+        if show_save:
+            actions.append(ft.TextButton(
+                content=ft.Row([ft.Icon(ft.Icons.DOWNLOAD, size=18, color=COLOR_PRIMARY),
+                                ft.Text("Save", color=COLOR_PRIMARY)], spacing=6),
+                on_click=save_from_viewer))
+        if show_open:
+            # Uses the viewing link this picture is already shown with (no new link is created).
+            actions.append(ft.TextButton(content=ft.Text("Open picture", color=COLOR_PRIMARY),
+                                         on_click=lambda e, u=url: page.launch_url(u)))
+        actions.append(ft.TextButton(content=ft.Text("Close", color=COLOR_PRIMARY), on_click=close))
+        dlg.actions = actions
         page.overlay.append(dlg)
         dlg.open = True
         page.update()
+
+    # --- SAVE A RECEIVED PICTURE ---------------------------------------------
+    # The picture is downloaded with the person's OWN login from the private chat-media bucket
+    # (the same storage rule that lets them view it applies; no link is created or shown), then
+    # handed to Flet's FilePicker.save_file: in a browser this starts a download, in the desktop
+    # and phone apps it opens the system "save" dialog.
+    chat_picture_saving = set()
+
+    def is_received_picture(m):
+        return (m.get("media_type") == "image" and bool(m.get("media_url"))
+                and not m.get("is_deleted") and m.get("sender_id") != get_cached_user_id())
+
+    def download_chat_picture_bytes(storage_path):
+        data = safe_supabase_call(lambda: supabase.storage.from_(CHAT_MEDIA_BUCKET).download(storage_path))
+        return bytes(data) if isinstance(data, (bytes, bytearray)) and len(data) > 0 else None
+
+    async def save_chat_picture(m):
+        path = m.get("media_url")
+        if path in chat_picture_saving:
+            return                                   # already saving this one
+        if not is_received_picture(m) or not valid_chat_media_path(path, chat_state.get("conversation_id")):
+            show_media_status("That picture can't be saved.", True)
+            await clear_thread_status_later("That picture can't be saved.")
+            return
+        chat_picture_saving.add(path)
+        message, is_error = "", False
+        try:
+            data = await asyncio.to_thread(download_chat_picture_bytes, path)
+            if not data:
+                message, is_error = "Couldn't save the picture. Please try again.", True
+            else:
+                file_name = datetime.now().strftime("UniVas_%Y%m%d_%H%M%S.jpg")
+                saved_path = await ft.FilePicker().save_file(file_name=file_name, src_bytes=data)
+                if getattr(page, "web", False):
+                    message = "Your browser is downloading the picture. Check your Downloads."
+                elif saved_path:
+                    try:   # make sure the file really holds the picture (desktop)
+                        if not os.path.exists(saved_path) or os.path.getsize(saved_path) != len(data):
+                            with open(saved_path, "wb") as fh:
+                                fh.write(data)
+                    except Exception as write_ex:
+                        print(f"Picture save write error: {type(write_ex).__name__}")
+                        message, is_error = "Couldn't save the picture. Please try again.", True
+                    if not is_error:
+                        message = "Picture saved."
+                # (no saved_path and not web = the person cancelled the save window: say nothing)
+        except Exception as ex:
+            low = str(ex).lower()
+            print(f"Picture save error: {type(ex).__name__}: {str(ex)[:150]}")
+            if "not found" in low or "404" in low:
+                message = "That picture isn't available any more."
+            else:
+                message = "Couldn't save the picture. Check your connection and try again."
+            is_error = True
+        finally:
+            chat_picture_saving.discard(path)
+        if message:
+            show_media_status(message, is_error)
+            await clear_thread_status_later(message)
+
+    def make_picture_save_control(m):
+        """The round download button on a received picture; turns into a spinner while saving."""
+        ring = ft.ProgressRing(width=18, height=18, stroke_width=2)
+        holder = ft.Container(width=36, height=36, bgcolor=COLOR_CARD, border_radius=18,
+                              alignment=ft.Alignment.CENTER)
+
+        async def on_save(e):
+            holder.content = ring
+            page.update()
+            try:
+                await save_chat_picture(m)
+            finally:
+                holder.content = save_btn
+                page.update()
+
+        save_btn = ft.IconButton(icon=ft.Icons.DOWNLOAD, icon_color="white", icon_size=20,
+                                 tooltip="Save picture", on_click=on_save)
+        holder.content = save_btn
+        return holder
 
     def open_chat_video(url):
         holder = ft.Container(content=build_inline_video_player(url, DIALOG_WIDTH, 240, True),
@@ -4155,9 +4259,16 @@ async def main(page: ft.Page):
                 width=196, height=110, bgcolor=COLOR_BG, border_radius=RADIUS_MD,
                 alignment=ft.Alignment.CENTER, on_click=retry)
         if kind == "image":
-            return ft.Container(
+            thumbnail = ft.Container(
                 content=ft.Image(src=src, width=196, height=196, fit=ft.BoxFit.COVER, border_radius=RADIUS_MD),
-                on_click=lambda e, u=src: open_chat_image(u))
+                on_click=lambda e, u=src, mm=m: open_chat_image(u, mm))
+            if is_received_picture(m):
+                return ft.Stack([
+                    thumbnail,
+                    ft.Container(content=make_picture_save_control(m), alignment=ft.Alignment.TOP_RIGHT,
+                                 width=196, height=196, padding=6),
+                ], width=196, height=196)
+            return thumbnail
         return ft.Container(
             content=ft.Column([
                 ft.Icon(ft.Icons.PLAY_CIRCLE_ROUNDED, size=44, color="white"),
