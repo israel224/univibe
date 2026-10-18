@@ -60,6 +60,10 @@ PRIVACY_POLICY_URL = ""
 # private client so logins can never bleed into each other.
 
 MEDIA_BUCKET = "post-media"
+CHAT_MEDIA_BUCKET = "chat-media"        # PRIVATE bucket for chat photos and videos
+CHAT_VIDEO_MAX_BYTES = 25 * 1024 * 1024 # same as the chat-media bucket limit
+CHAT_MEDIA_URL_SECONDS = 3600           # signed viewing links last 1 hour
+CHAT_MEDIA_URL_KEEP_SECONDS = 3000      # reuse a link for 50 minutes before asking for a new one
 VOICE_BUCKET = "chat-voice"            # PRIVATE bucket (created by the voice-notes SQL)
 VOICE_MAX_SECONDS = 120
 VOICE_SAMPLE_RATE = 16000              # voice quality; 16 kHz mono, 16-bit
@@ -1951,6 +1955,7 @@ async def main(page: ft.Page):
             chat_state["inbox_polling_active"] = False
             try:
                 stop_voice_activity()   # leaving the chat: cancel recording, stop playback
+                stop_media_activity()   # ... and drop a photo/video that was chosen but not sent
             except NameError:
                 pass
         panel_home_feed.visible      = feed
@@ -2700,12 +2705,13 @@ async def main(page: ft.Page):
         is_deleted = bool(m.get("is_deleted"))
         has_text = bool((m.get("content") or "").strip())
         is_voice = (m.get("media_type") == "audio") and not is_deleted
+        is_photo_video = (m.get("media_type") in ("image", "video")) and not is_deleted
         actions = []
         if has_text and not is_deleted:
             actions.append("copy")
             if thread_v2:
                 actions.append("reply")
-        elif is_voice and thread_v2:
+        elif (is_voice or is_photo_video) and thread_v2:
             actions.append("reply")
         if thread_v2:
             actions.append("delete")
@@ -2719,7 +2725,96 @@ async def main(page: ft.Page):
             choices.append("everyone")
         return choices
 
+    # --- Private photo/video viewing links -------------------------------
+    # Files in the private chat-media bucket can only be opened through a signed link.
+    # Links are requested in ONE batch for the messages that need them, kept for 50
+    # minutes, and requested here (in a background thread), never on the screen's thread.
+    chat_media_urls = {}      # storage path -> (signed link, keep until)
+    CHAT_MEDIA_PATH = re.compile(r"^[0-9a-fA-F-]{36}/[0-9a-fA-F-]{36}/[^/]+\.(jpg|mp4|mov|webm)$")
+
+    def valid_chat_media_path(path, conversation_id):
+        return bool(path) and bool(conversation_id) and path.startswith(f"{conversation_id}/") \
+            and bool(CHAT_MEDIA_PATH.match(path))
+
+    def absolute_signed_url(url):
+        if url.startswith("/storage/v1"):
+            return SUPABASE_URL + url
+        if url.startswith("/"):
+            return SUPABASE_URL + "/storage/v1" + url
+        return url
+
+    def sign_chat_media_paths(paths):
+        """Returns {path: link}. One request for all paths; falls back to one-by-one only if the
+        batch answer is incomplete (and never when the connection itself failed)."""
+        out = {}
+        if not paths:
+            return out
+        batch_failed = False
+        try:
+            res = safe_supabase_call(
+                lambda: supabase.storage.from_(CHAT_MEDIA_BUCKET).create_signed_urls(list(paths), CHAT_MEDIA_URL_SECONDS)
+            )
+        except Exception as ex:
+            batch_failed = True
+            res = None
+            print(f"Chat media link error: {type(ex).__name__}")
+        for item in (res or []):
+            if not isinstance(item, dict) or item.get("error"):
+                continue
+            url = item.get("signedURL") or item.get("signedUrl") or item.get("signed_url")
+            if url and item.get("path"):
+                out[item["path"]] = absolute_signed_url(url)
+        if not batch_failed:
+            for path in [x for x in paths if x not in out][:10]:
+                try:
+                    r = safe_supabase_call(
+                        lambda pp=path: supabase.storage.from_(CHAT_MEDIA_BUCKET).create_signed_url(pp, CHAT_MEDIA_URL_SECONDS)
+                    )
+                    url = (r.get("signedURL") or r.get("signedUrl")) if isinstance(r, dict) else None
+                    if url:
+                        out[path] = absolute_signed_url(url)
+                except Exception as ex:
+                    print(f"Chat media link error: {type(ex).__name__}")
+        return out
+
+    def attach_chat_media_urls(messages, conversation_id):
+        """Adds m['_media_src'] (viewing link) to photo/video messages. Files that are not in
+        this conversation's own folder of the private bucket are marked 'unsupported' and are
+        never loaded from the network."""
+        now = time.monotonic()
+        need = []
+        for m in messages:
+            if m.get("is_deleted") or m.get("media_type") not in ("image", "video"):
+                continue
+            path = m.get("media_url")
+            if not valid_chat_media_path(path, conversation_id):
+                m["_media_state"] = "unsupported"
+                continue
+            cached = chat_media_urls.get(path)
+            if cached and cached[1] > now:
+                m["_media_src"] = cached[0]
+            else:
+                need.append(path)
+        if need:
+            got = sign_chat_media_paths(list(dict.fromkeys(need)))
+            if len(chat_media_urls) > 500:
+                chat_media_urls.clear()
+            for path, url in got.items():
+                chat_media_urls[path] = (url, now + CHAT_MEDIA_URL_KEEP_SECONDS)
+            for m in messages:
+                if m.get("_media_src") is None and m.get("media_url") in got:
+                    m["_media_src"] = got[m["media_url"]]
+
     def get_messages(conversation_id):
+        messages = get_messages_core(conversation_id)
+        if any((not m.get("is_deleted")) and m.get("media_type") in ("image", "video") for m in messages):
+            try:
+                attach_chat_media_urls(messages, conversation_id)
+            except Exception as ex:
+                print(f"Chat media links error: {type(ex).__name__}")
+        return messages
+
+    def get_messages_core(conversation_id):
         """Prefers get_chat_thread (hides messages you deleted for yourself, marks
         deleted ones, includes reply quotes). Falls back to the older function
         if get_chat_thread does not exist yet."""
@@ -2833,7 +2928,7 @@ async def main(page: ft.Page):
     chat_inbox_status = ft.Text("", size=12)
 
     thread_messages_layout = ft.Column(spacing=8, scroll=ft.ScrollMode.ALWAYS, height=260, auto_scroll=True)
-    thread_input_box = ft.TextField(hint_text="Type a message...", width=190, dense=True, color="white")
+    thread_input_box = ft.TextField(hint_text="Type a message...", width=150, dense=True, color="white")
     thread_header_text = ft.Text("", size=16, weight=ft.FontWeight.BOLD, color="white")
     thread_status = ft.Text("", size=11)
 
@@ -2998,7 +3093,8 @@ async def main(page: ft.Page):
         def do_reply(e):
             close()
             who = "yourself" if m.get("sender_id") == my_id else (chat_state.get("other_username") or "them")
-            preview = "Voice message" if not text else (text if len(text) <= 80 else text[:77].rstrip() + "...")
+            media_label = {"audio": "Voice message", "image": "Photo", "video": "Video"}.get(m.get("media_type"))
+            preview = media_label if (not text and media_label) else (text if len(text) <= 80 else text[:77].rstrip() + "...")
             chat_state["reply_to"] = {"id": m.get("id")}
             reply_bar_text.value = f"Replying to {who}: {preview}"
             reply_bar.visible = True
@@ -3629,8 +3725,11 @@ async def main(page: ft.Page):
                 ], spacing=1),
                 padding=6, bgcolor=COLOR_BG, border_radius=RADIUS_SM))
         is_voice = (not is_deleted) and m.get("media_type") == "audio" and bool(m.get("media_url"))
+        is_chat_media = (not is_deleted) and m.get("media_type") in ("image", "video") and bool(m.get("media_url"))
         if is_deleted:
             parts.append(ft.Text("This message was deleted", italic=True, color=COLOR_TEXT_MUTED, size=12))
+        elif is_chat_media:
+            parts.append(build_chat_media_content(m))
         elif is_voice:
             def make_voice_click(msg):
                 async def handler(e):
@@ -3726,6 +3825,7 @@ async def main(page: ft.Page):
 
     def close_thread(e):
         stop_voice_activity()
+        stop_media_activity()
         chat_state["polling_active"] = False
         chat_state["conversation_id"] = None
         panel_chats_thread.visible = False
@@ -3800,11 +3900,300 @@ async def main(page: ft.Page):
         dlg.open = True
         page.update()
 
+    # =====================================================================
+    # PHOTOS AND VIDEOS IN CHAT
+    # Pick -> preview -> send. Files go to the PRIVATE chat-media bucket and the message is
+    # created by the database function send_chat_media (same blocking / connection /
+    # rate-limit rules as every other message). No captions. Viewing uses short-lived signed
+    # links. If a send fails, the same selection stays so it can be retried.
+    # =====================================================================
+    chat_media = {"pending": None, "busy": False}
+
+    def format_file_size(num_bytes):
+        if num_bytes < 1024 * 1024:
+            return f"{max(1, round(num_bytes / 1024))} KB"
+        return f"{num_bytes / (1024 * 1024):.1f} MB"
+
+    def show_media_status(text, error=False):
+        thread_status.value = text
+        thread_status.color = COLOR_DANGER if error else COLOR_TEXT_MUTED
+        page.update()
+
+    def prepare_chat_photo(file_bytes, max_dimension=1080, quality=80):
+        """Makes a chat-ready JPEG: upright (camera rotation applied), at most 1080 px, location
+        data removed. Kept separate from the post helper so posts and avatars are not affected.
+        Returns (jpeg_bytes, None) or (None, error_text)."""
+        try:
+            from PIL import Image, ImageOps
+        except ImportError:
+            print("Pillow is not installed: chat photos cannot be prepared")
+            return None, "Photos can't be sent right now."
+        try:
+            img = Image.open(io.BytesIO(file_bytes))
+            img = ImageOps.exif_transpose(img)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            img.thumbnail((max_dimension, max_dimension))
+            out = io.BytesIO()
+            img.save(out, format="JPEG", quality=quality, optimize=True)
+            return out.getvalue(), None
+        except Exception as ex:
+            print(f"Chat photo error: {type(ex).__name__}")
+            return None, "Couldn't prepare that photo. Please try another one."
+
+    def set_media_bar(mode, sub_text=None):
+        """mode: 'idle' (normal composer), 'ready', 'sending' or 'failed'."""
+        pending = chat_media["pending"]
+        media_bar.visible = mode != "idle"
+        composer_row.visible = mode == "idle"
+        media_spinner.visible = mode == "sending"
+        media_send_btn.disabled = mode == "sending"
+        media_cancel_btn.disabled = mode == "sending"
+        if pending:
+            media_title.value = "Photo" if pending["type"] == "image" else "Video"
+            media_sub.value = sub_text if sub_text is not None else format_file_size(len(pending["bytes"]))
+        page.update()
+
+    def show_chat_media_selection(pending):
+        if pending["type"] == "image":
+            try:
+                import base64
+                media_thumb.content = ft.Image(src=base64.b64encode(pending["bytes"]).decode("utf-8"),
+                                               width=48, height=48, fit=ft.BoxFit.COVER, border_radius=RADIUS_SM)
+            except Exception as ex:
+                print(f"Chat preview error: {type(ex).__name__}")
+                media_thumb.content = ft.Icon(ft.Icons.IMAGE_ROUNDED, size=28, color=COLOR_PRIMARY)
+        else:
+            media_thumb.content = ft.Icon(ft.Icons.PLAY_CIRCLE_ROUNDED, size=28, color="white")
+        set_media_bar("ready")
+
+    async def open_chat_media_picker(e):
+        if (chat_media["busy"] or chat_media["pending"] or not chat_state.get("conversation_id")
+                or voice_state["recording"] or voice_state["pending"] or voice_state["busy"]):
+            return
+        conversation_id = chat_state.get("conversation_id")
+        files = await ft.FilePicker().pick_files(
+            allow_multiple=False,
+            file_type=ft.FilePickerFileType.CUSTOM,
+            allowed_extensions=["jpg", "jpeg", "png", "gif", "webp", "mp4", "mov", "webm"],
+            with_data=True
+        )
+        if not files:
+            return
+        f = files[0]
+        ext = os.path.splitext(f.name or "")[1].lower()
+        if ext in IMAGE_EXTENSIONS:
+            kind = "image"
+        elif ext in VIDEO_EXTENSIONS:
+            kind = "video"
+        else:
+            show_media_status("Unsupported file type. Choose a photo or a video (MP4, MOV or WebM).", True)
+            return
+        data = f.bytes
+        if not data:
+            show_media_status("Couldn't read that file. Please try again.", True)
+            return
+        if kind == "video":
+            if len(data) > CHAT_VIDEO_MAX_BYTES:
+                show_media_status("That video is too large (maximum 25 MB). Please choose a shorter or smaller one.", True)
+                return
+            pending = {"type": "video", "bytes": data, "ext": ext,
+                       "content_type": VIDEO_CONTENT_TYPES[ext], "name": f.name}
+        else:
+            if len(data) > MAX_PICKED_IMAGE_BYTES:
+                show_media_status("That photo is too large (maximum 25 MB). Please choose a smaller one.", True)
+                return
+            show_media_status("Preparing photo...")
+            jpeg, err = await asyncio.to_thread(prepare_chat_photo, data)
+            if not jpeg:
+                show_media_status(err, True)
+                return
+            pending = {"type": "image", "bytes": jpeg, "ext": ".jpg",
+                       "content_type": "image/jpeg", "name": f.name}
+        if chat_state.get("conversation_id") != conversation_id:
+            return   # the person left this chat while the photo was being prepared
+        pending["conv"] = conversation_id
+        chat_media["pending"] = pending
+        show_media_status("")
+        show_chat_media_selection(pending)
+
+    def cancel_chat_media(e=None):
+        if chat_media["busy"]:
+            return
+        chat_media["pending"] = None
+        set_media_bar("idle")
+        show_media_status("")
+
+    def stop_media_activity():
+        """Called when leaving a chat: throw away a photo/video that was chosen but not sent."""
+        if chat_media["pending"] and not chat_media["busy"]:
+            cancel_chat_media()
+
+    def upload_and_send_chat_media(conversation_id, user_id, pending):
+        """Runs in a background thread. Returns (ok, error_text). Reported as sent only after
+        the database confirms it; the uploaded file is removed again if the send fails."""
+        object_path = f"{conversation_id}/{user_id}/{uuid.uuid4()}{pending['ext']}"
+        uploaded = False
+        try:
+            upload_with_retry(CHAT_MEDIA_BUCKET, object_path, pending["bytes"], pending["content_type"])
+            uploaded = True
+            result = safe_supabase_call(
+                lambda: supabase.rpc("send_chat_media", {
+                    "p_conversation_id": conversation_id,
+                    "p_storage_path": object_path,
+                    "p_media_type": pending["type"]
+                }).execute()
+            )
+            if result is None:
+                raise RuntimeError("session expired")
+            return True, None
+        except Exception as e:
+            if uploaded:
+                try:
+                    supabase.storage.from_(CHAT_MEDIA_BUCKET).remove([object_path])
+                except Exception as cleanup_ex:
+                    print(f"Chat media cleanup error: {type(cleanup_ex).__name__}")
+            msg = str(e)
+            low = msg.lower()
+            print(f"Chat media send error: {type(e).__name__}: {msg[:200]}")
+            if is_missing_function_error(e, "send_chat_media") or "bucket not found" in low:
+                return False, "Photos and videos aren't available yet. Please try again later."
+            if "CONNECTION_REQUIRED" in msg:
+                return False, "You've sent your one message — you can chat freely once they accept your connection request."
+            if "BLOCKED" in msg:
+                return False, "You can't send messages to this user."
+            if "too fast" in low:
+                return False, "You're sending too fast. Please wait a moment and try again."
+            if "maximum allowed size" in low or "too large" in low or "413" in low or "payload" in low:
+                return False, "That file is too large (maximum 25 MB)."
+            if "mime" in low or "not a valid" in low or "invalid" in low:
+                return False, "That file type isn't supported."
+            if "session expired" in low:
+                return False, "Your session expired — please log in again."
+            return False, friendly_error(e, "Your photo or video wasn't sent. Check your connection and try again.")
+
+    async def send_chat_media_pending(e):
+        if chat_media["busy"]:
+            show_media_status("Still sending...")
+            return
+        pending = chat_media["pending"]
+        if not pending:
+            return
+        chat_media["busy"] = True
+        t0 = time.perf_counter()
+        try:
+            set_media_bar("sending", "Sending...")
+            show_media_status("")
+            ok, err = await asyncio.to_thread(upload_and_send_chat_media, pending["conv"], get_cached_user_id(), pending)
+            if ok:
+                chat_media["pending"] = None
+                set_media_bar("idle")
+                show_media_status("")
+                # Notifying the other person must not delay this screen.
+                asyncio.ensure_future(asyncio.to_thread(notify_voice_recipients, pending["conv"], get_cached_user_id()))
+                await refresh_thread_messages_async()
+            else:
+                set_media_bar("failed", "Not sent. Tap send to try again.")
+                show_media_status(err, True)
+            print(f"Chat media timing: total {time.perf_counter() - t0:.2f}s ok={ok}")   # server log only
+        except Exception as ex:
+            print(f"Chat media send error: {type(ex).__name__}: {ex}")
+            if chat_media["pending"]:
+                set_media_bar("failed", "Not sent. Tap send to try again.")
+            else:
+                set_media_bar("idle")
+            show_media_status("Your photo or video wasn't sent. Please try again.", True)
+        finally:
+            chat_media["busy"] = False
+
+    def open_chat_image(url):
+        dlg = ft.AlertDialog(bgcolor=COLOR_CARD, content=ft.Image(src=url, width=DIALOG_WIDTH, height=360,
+                                                                  fit=ft.BoxFit.CONTAIN))
+
+        def close(e=None):
+            dlg.open = False
+            page.update()
+        dlg.actions = [ft.TextButton(content=ft.Text("Close", color=COLOR_PRIMARY), on_click=close)]
+        page.overlay.append(dlg)
+        dlg.open = True
+        page.update()
+
+    def open_chat_video(url):
+        holder = ft.Container(content=build_inline_video_player(url, DIALOG_WIDTH, 240, True),
+                              width=DIALOG_WIDTH, height=240)
+        dlg = ft.AlertDialog(bgcolor=COLOR_CARD, content=holder)
+
+        def close(e=None):
+            holder.content = None   # removing the player stops the video
+            dlg.open = False
+            page.update()
+        dlg.actions = [ft.TextButton(content=ft.Text("Close", color=COLOR_PRIMARY), on_click=close)]
+        page.overlay.append(dlg)
+        dlg.open = True
+        page.update()
+
+    def build_chat_media_content(m):
+        """The photo thumbnail or video tile shown inside a chat bubble."""
+        kind = m.get("media_type")
+        src = m.get("_media_src")
+        if m.get("_media_state") == "unsupported":
+            return ft.Container(content=ft.Text("Unsupported attachment", size=12, italic=True,
+                                                color=COLOR_TEXT_MUTED), padding=6)
+
+        def retry(e):
+            chat_state["last_rendered_count"] = -1     # forces a fresh load of the links
+            page.run_task(refresh_thread_messages_async)
+
+        if not src:
+            return ft.Container(
+                content=ft.Column([
+                    ft.Icon(ft.Icons.IMAGE_ROUNDED if kind == "image" else ft.Icons.PLAY_CIRCLE_ROUNDED,
+                            size=28, color=COLOR_TEXT_MUTED),
+                    ft.Text("Couldn't load. Tap to retry.", size=11, color=COLOR_TEXT_MUTED,
+                            text_align=ft.TextAlign.CENTER),
+                ], alignment=ft.MainAxisAlignment.CENTER, horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=4),
+                width=196, height=110, bgcolor=COLOR_BG, border_radius=RADIUS_MD,
+                alignment=ft.Alignment.CENTER, on_click=retry)
+        if kind == "image":
+            return ft.Container(
+                content=ft.Image(src=src, width=196, height=196, fit=ft.BoxFit.COVER, border_radius=RADIUS_MD),
+                on_click=lambda e, u=src: open_chat_image(u))
+        return ft.Container(
+            content=ft.Column([
+                ft.Icon(ft.Icons.PLAY_CIRCLE_ROUNDED, size=44, color="white"),
+                ft.Text("Video", size=12, color=COLOR_TEXT_BODY),
+            ], alignment=ft.MainAxisAlignment.CENTER, horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=2),
+            width=196, height=120, bgcolor=COLOR_BG, border_radius=RADIUS_MD,
+            alignment=ft.Alignment.CENTER, on_click=lambda e, u=src: open_chat_video(u))
+
+    media_thumb = ft.Container(width=48, height=48, bgcolor=COLOR_BG, border_radius=RADIUS_SM,
+                               alignment=ft.Alignment.CENTER)
+    media_title = ft.Text("", size=13, color="white", weight=ft.FontWeight.BOLD)
+    media_sub = ft.Text("", size=11, color=COLOR_TEXT_MUTED)
+    media_spinner = ft.ProgressRing(width=16, height=16, stroke_width=2, visible=False)
+    media_cancel_btn = ft.IconButton(icon=ft.Icons.CLOSE_ROUNDED, icon_color=COLOR_TEXT_MUTED,
+                                     tooltip="Remove", on_click=cancel_chat_media)
+    media_send_btn = ft.IconButton(icon=ft.Icons.SEND_ROUNDED, icon_color=COLOR_SUCCESS,
+                                   tooltip="Send", on_click=send_chat_media_pending)
+    media_bar = ft.Container(
+        content=ft.Row([
+            media_thumb,
+            ft.Column([media_title, media_sub], spacing=0, expand=True),
+            media_spinner,
+            media_cancel_btn,
+            media_send_btn,
+        ], spacing=6),
+        padding=ft.Padding.symmetric(horizontal=8, vertical=6), bgcolor=COLOR_CARD,
+        border_radius=RADIUS_LG, width=300, visible=False
+    )
+
     composer_row = ft.Row([
         thread_input_box,
         ft.IconButton(icon=ft.Icons.EMOJI_EMOTIONS_ROUNDED, icon_color=COLOR_TEXT_MUTED,
                       tooltip="Emoji", on_click=lambda e: open_emoji_picker(thread_input_box)),
         voice_mic_btn,
+        ft.IconButton(icon=ft.Icons.IMAGE_ROUNDED, icon_color=COLOR_TEXT_MUTED,
+                      tooltip="Send a photo or video", on_click=open_chat_media_picker),
         ft.IconButton(icon=ft.Icons.SEND_ROUNDED, icon_color=COLOR_SUCCESS, on_click=handle_send_thread_message)
     ], alignment=ft.MainAxisAlignment.CENTER)
 
@@ -3818,6 +4207,7 @@ async def main(page: ft.Page):
         reply_bar,
         composer_row,
         recording_bar,
+        media_bar,
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
     panel_messages = ft.Column([panel_chats_inbox, panel_chats_thread], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
