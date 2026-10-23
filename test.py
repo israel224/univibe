@@ -269,8 +269,8 @@ async def main(page: ft.Page):
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
     page.title = "UniVas Social"
-    page.window_width = 400
-    page.window_height = 780
+    page.window_width = 1200
+    page.window_height = 820
     page.window_resizable = True
     # Page-level scrolling is intentionally off. With it on, the whole page
     # (including the dashboard's top header and bottom nav) scrolled as one
@@ -279,15 +279,15 @@ async def main(page: ft.Page):
     # their own scroll region below, while the header/bottom nav stay fixed.
     page.scroll = None
     page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
-    page.bgcolor = "#0f172a"
+    page.bgcolor = "#0b1220"
 
     # ============================================================
     # --- DESIGN SYSTEM ------------------------------------------
     # ============================================================
-    COLOR_BG        = "#0f172a"
-    COLOR_CARD      = "#1e293b"
-    COLOR_BORDER    = "#334155"
-    COLOR_PRIMARY   = "#6366f1"
+    COLOR_BG        = "#0b1220"
+    COLOR_CARD      = "#18243a"
+    COLOR_BORDER    = "#293750"
+    COLOR_PRIMARY   = "#818cf8"
     COLOR_SUCCESS   = "#10b981"
     COLOR_DANGER    = "#f43f5e"
     COLOR_WARNING   = "#eab308"
@@ -308,6 +308,10 @@ async def main(page: ft.Page):
     RADIUS_MD = 12
     RADIUS_LG = 16
     DIALOG_WIDTH = 300
+
+    def content_width():
+        available_width = page.width or page.window_width or 400
+        return max(320, min(760, available_width - 48))
 
     # ============================================================
     # --- SESSION-EXPIRY RESILIENCE LAYER -------------------------
@@ -1024,7 +1028,9 @@ async def main(page: ft.Page):
             media_url = p.get("media_url")
             if media_url and p.get("media_type") == "image":
                 post_body.append(
-                    ft.Image(src=media_url, width=300, height=180, fit=ft.BoxFit.COVER, border_radius=RADIUS_MD)
+                    ft.Image(src=media_url, width=content_width() - 40,
+                             height=(content_width() - 40) * 0.56,
+                             fit=ft.BoxFit.COVER, border_radius=RADIUS_MD)
                 )
             elif media_url and p.get("media_type") == "video":
                 feed_video_container = ft.Container(
@@ -1033,7 +1039,8 @@ async def main(page: ft.Page):
                     padding=SPACE_MD, bgcolor=COLOR_BORDER, border_radius=RADIUS_SM,
                 )
                 feed_video_container.on_click = make_play_video_handler(
-                    feed_video_container, media_url, 300, 180
+                    feed_video_container, media_url, content_width() - 40,
+                    (content_width() - 40) * 0.56
                 )
                 post_body.append(feed_video_container)
 
@@ -1102,7 +1109,8 @@ async def main(page: ft.Page):
             public_feed_layout.controls.append(
                 ft.Container(
                     content=ft.Column(post_body, spacing=6),
-                    padding=SPACE_LG, bgcolor=COLOR_CARD, border_radius=RADIUS_MD, width=340
+                    padding=SPACE_LG, bgcolor=COLOR_CARD, border_radius=RADIUS_LG,
+                    width=content_width()
                 )
             )
         page.update()
@@ -1203,7 +1211,8 @@ async def main(page: ft.Page):
                                           tooltip="Message", on_click=chat_this),
                         ], spacing=0)
                     ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-                    padding=SPACE_MD, bgcolor=COLOR_CARD, border_radius=RADIUS_MD, width=340
+                    padding=SPACE_MD, bgcolor=COLOR_CARD, border_radius=RADIUS_LG,
+                    width=content_width()
                 )
             )
         friends_layout.controls = new_controls
@@ -1273,9 +1282,10 @@ async def main(page: ft.Page):
         return [r for r in rows if r.get("user_id") not in blocked]
 
     search_page_state = {"token": 0, "scope": "all"}
-    search_page_input = ft.TextField(hint_text="Search people, posts, #topics...", width=270,
+    search_page_input = ft.TextField(hint_text="Search people, posts, #topics...",
+                                     width=content_width() - 120,
                                      dense=True, color="white")
-    search_results_layout = ft.Column(spacing=8, width=340)
+    search_results_layout = ft.Column(spacing=10, width=content_width())
     SEARCH_HINT_TEXT = "Search for people, news, topics or #hashtags that people have posted about."
 
     search_scope_labels = {"all": ft.Text("All", size=13), "people": ft.Text("People", size=13),
@@ -1291,7 +1301,7 @@ async def main(page: ft.Page):
         search_results_layout.controls = [
             ft.Container(content=ft.Text(SEARCH_HINT_TEXT, size=12, color=COLOR_TEXT_MUTED,
                                          text_align=ft.TextAlign.CENTER),
-                         padding=ft.Padding.symmetric(vertical=24), width=340)
+                         padding=ft.Padding.symmetric(vertical=24), width=content_width())
         ]
 
     def make_search_person_row(u):
@@ -1310,7 +1320,8 @@ async def main(page: ft.Page):
                           spacing=2, expand=True),
                 ft.Icon(ft.Icons.CHEVRON_RIGHT_ROUNDED, color=COLOR_TEXT_FAINT, size=18),
             ], spacing=10),
-            padding=SPACE_MD, bgcolor=COLOR_CARD, border_radius=RADIUS_MD, width=340, on_click=open_person
+            padding=SPACE_MD, bgcolor=COLOR_CARD, border_radius=RADIUS_LG,
+            width=content_width(), on_click=open_person
         )
 
     def make_search_post_row(post):
@@ -1329,15 +1340,18 @@ async def main(page: ft.Page):
         if text:
             rows.append(ft.Text(text, color=COLOR_TEXT_BODY, size=13, max_lines=3))
         if media_url and media_type == "image":
-            rows.append(ft.Image(src=media_url, width=300, height=160, fit=ft.BoxFit.COVER, border_radius=RADIUS_SM))
+            rows.append(ft.Image(src=media_url, width=content_width() - 40,
+                                 height=(content_width() - 40) * 0.56,
+                                 fit=ft.BoxFit.COVER, border_radius=RADIUS_MD))
         elif media_url and media_type == "video":
             rows.append(ft.Row([ft.Icon(ft.Icons.SMART_DISPLAY_OUTLINED, color=COLOR_TEXT_MUTED, size=18),
                                 ft.Text("Video", color=COLOR_TEXT_MUTED, size=12)], spacing=6))
 
         def open_post(e, pst=post):
             open_post_viewer(pst)
-        return ft.Container(content=ft.Column(rows, spacing=6), padding=SPACE_MD, bgcolor=COLOR_CARD,
-                            border_radius=RADIUS_MD, width=340, on_click=open_post)
+        return ft.Container(content=ft.Column(rows, spacing=8), padding=SPACE_LG,
+                            bgcolor=COLOR_CARD, border_radius=RADIUS_LG,
+                            width=content_width(), on_click=open_post)
 
     def render_search_results(query, scope, token):
         raw = " ".join((query or "").split())
@@ -1388,7 +1402,7 @@ async def main(page: ft.Page):
                 msg = f'No results found for "{raw}". As people publish posts about this, they will show up here.'
             controls.append(ft.Container(content=ft.Text(msg, size=12, color=COLOR_TEXT_MUTED,
                                                          text_align=ft.TextAlign.CENTER),
-                                         padding=ft.Padding.symmetric(vertical=24), width=340))
+                                         padding=ft.Padding.symmetric(vertical=24), width=content_width()))
         search_results_layout.controls = controls
         page.update()
 
@@ -1410,11 +1424,11 @@ async def main(page: ft.Page):
             render_search_results(search_page_input.value, scope, my_token)
         return handler
 
-    def clear_search_page(e):
+    def close_search_page(e):
         search_page_input.value = ""
         search_page_state["token"] += 1
         show_search_hint()
-        page.update()
+        return_from_search()
 
     search_page_input.on_change = on_search_page_change
     search_page_input.on_submit = lambda e: set_search_scope(search_page_state["scope"])(e)
@@ -1423,8 +1437,8 @@ async def main(page: ft.Page):
 
     panel_search = ft.Column([
         ft.Row([search_page_input,
-                ft.IconButton(icon=ft.Icons.CLOSE_ROUNDED, icon_color=COLOR_TEXT_MUTED,
-                              tooltip="Clear", on_click=clear_search_page)],
+                ft.IconButton(icon=ft.Icons.ARROW_BACK_ROUNDED, icon_color=COLOR_TEXT_MUTED,
+                              tooltip="Back", on_click=close_search_page)],
                alignment=ft.MainAxisAlignment.CENTER),
         ft.Row([
             ft.TextButton(content=search_scope_labels["all"], on_click=set_search_scope("all")),
@@ -1474,7 +1488,8 @@ async def main(page: ft.Page):
                     content=ft.Column([
                         ft.Row(header_controls),
                         ft.Text(w.get("content", ""), color=COLOR_TEXT_BODY)
-                    ]), padding=SPACE_LG, bgcolor=COLOR_WHISPER, border_radius=RADIUS_MD, width=340
+                    ]                    ), padding=SPACE_LG, bgcolor=COLOR_WHISPER,
+                        border_radius=RADIUS_LG, width=content_width()
                 )
             )
         page.update()
@@ -1650,7 +1665,7 @@ async def main(page: ft.Page):
                     ], spacing=10),
                     padding=SPACE_LG,
                     bgcolor=COLOR_UNREAD if is_unread else COLOR_CARD,
-                    border_radius=RADIUS_MD, width=340
+                    border_radius=RADIUS_LG, width=content_width()
                 )
             )
         page.update()
@@ -1666,11 +1681,11 @@ async def main(page: ft.Page):
             count = (resp.data if resp else 0) or 0
             if count and count > 0:
                 nav_buttons["notifications"].icon = ft.Icons.NOTIFICATIONS_ACTIVE_ROUNDED
-                nav_buttons["notifications"].icon_color = COLOR_DANGER
+                nav_buttons["notifications"].color = COLOR_DANGER
             else:
                 nav_buttons["notifications"].icon = ft.Icons.NOTIFICATIONS_NONE_ROUNDED
                 if active_nav_key["value"] != "notifications":
-                    nav_buttons["notifications"].icon_color = NAV_INACTIVE
+                    nav_buttons["notifications"].color = NAV_INACTIVE
             page.update()
         except Exception as ex:
             print(f"Badge refresh error: {ex}")
@@ -1683,14 +1698,23 @@ async def main(page: ft.Page):
     # --- CUSTOM NAVIGATION ACTIONS ---
     NAV_ACTIVE = COLOR_PRIMARY
     NAV_INACTIVE = COLOR_TEXT_MUTED
+    NAV_SELECTED_BG = "#26334c"
     active_nav_key = {"value": "feed"}
+    search_return_state = {
+        "panel": "feed",
+        "nav": "feed",
+        "chat_thread": False,
+        "conversation_id": None,
+        "other_username": None,
+    }
 
     def highlight_nav(active_key):
         active_nav_key["value"] = active_key
         for key, btn in nav_buttons.items():
-            if key == "notifications" and btn.icon == ft.Icons.NOTIFICATIONS_ACTIVE_ROUNDED:
-                continue
-            btn.icon_color = NAV_ACTIVE if key == active_key else NAV_INACTIVE
+            has_unread = key == "notifications" and btn.icon == ft.Icons.NOTIFICATIONS_ACTIVE_ROUNDED
+            btn.color = COLOR_DANGER if has_unread else (NAV_ACTIVE if key == active_key else NAV_INACTIVE)
+            nav_item_labels[key].color = NAV_ACTIVE if key == active_key else NAV_INACTIVE
+            nav_item_containers[key].bgcolor = NAV_SELECTED_BG if key == active_key else None
         page.update()
 
     def nav_to_feed(e):
@@ -1720,9 +1744,31 @@ async def main(page: ft.Page):
         highlight_nav("people")
 
     def nav_to_search(e):
-        # Its own screen. Never sends the user to Friends, Feed or anywhere else.
+        if not panel_search.visible:
+            panels = {
+                "feed": panel_home_feed,
+                "secrets": panel_whisper_wall,
+                "chats": panel_messages,
+                "people": panel_people,
+                "reels": panel_reels,
+                "notifications": panel_notifications,
+                "profile": panel_settings,
+                "admin": panel_admin,
+                "account_settings": panel_account_settings,
+                "profile_view": panel_view_profile,
+            }
+            search_return_state["panel"] = next(
+                (key for key, panel in panels.items() if panel.visible),
+                "feed"
+            )
+            search_return_state["nav"] = active_nav_key["value"]
+            search_return_state["chat_thread"] = (
+                search_return_state["panel"] == "chats" and panel_chats_thread.visible
+            )
+            search_return_state["conversation_id"] = chat_state.get("conversation_id")
+            search_return_state["other_username"] = chat_state.get("other_username")
         set_panel_visibility(search=True)
-        highlight_nav("search")   # no bottom-bar icon matches, so none is highlighted
+        highlight_nav("search")
 
     def nav_to_reels(e):
         set_panel_visibility(reels=True)
@@ -1734,7 +1780,7 @@ async def main(page: ft.Page):
         render_notifications_panel()
         highlight_nav("notifications")
         nav_buttons["notifications"].icon = ft.Icons.NOTIFICATIONS_NONE_ROUNDED
-        nav_buttons["notifications"].icon_color = NAV_ACTIVE
+        nav_buttons["notifications"].color = NAV_ACTIVE
         page.update()
         user_id = get_cached_user_id()
         if user_id:
@@ -1749,6 +1795,36 @@ async def main(page: ft.Page):
         set_panel_visibility(profile=True)
         load_own_profile()
         highlight_nav("profile")
+
+    def return_from_search():
+        panel = search_return_state["panel"]
+        nav = search_return_state["nav"]
+        return_actions = {
+            "feed": nav_to_feed,
+            "secrets": nav_to_secrets,
+            "chats": nav_to_chats,
+            "people": nav_to_people,
+            "reels": nav_to_reels,
+            "notifications": nav_to_notifications,
+            "profile": nav_to_profile,
+            "admin": nav_to_admin,
+            "account_settings": nav_to_account_settings,
+        }
+        if (panel == "chats" and search_return_state["chat_thread"]
+                and search_return_state["conversation_id"]
+                and search_return_state["other_username"]):
+            set_panel_visibility(chats=True)
+            open_thread(search_return_state["conversation_id"], search_return_state["other_username"])
+            highlight_nav(nav)
+        elif panel in return_actions:
+            return_actions[panel](None)
+        elif panel == "profile_view":
+            set_panel_visibility()
+            panel_view_profile.visible = True
+            highlight_nav(nav)
+            page.update()
+        else:
+            nav_to_feed(None)
 
     def close_menu_dialog(d):
         d.open = False
@@ -1972,22 +2048,49 @@ async def main(page: ft.Page):
         page.update()
 
     # --- NAVIGATION BAR (icon-based, Facebook-style) ---
-    NAV_BTN_STYLE = ft.ButtonStyle(padding=6)
     nav_buttons = {
-        "feed":    ft.IconButton(icon=ft.Icons.HOME_ROUNDED, icon_color=NAV_ACTIVE, tooltip="Feed", icon_size=20, style=NAV_BTN_STYLE),
-        "secrets": ft.IconButton(icon=ft.Icons.THEATER_COMEDY_ROUNDED, icon_color=NAV_INACTIVE, tooltip="Secrets", icon_size=20, style=NAV_BTN_STYLE),
-        "people":  ft.IconButton(icon=ft.Icons.GROUPS_ROUNDED, icon_color=NAV_INACTIVE, tooltip="Friends", icon_size=20, style=NAV_BTN_STYLE),
-        "chats":   ft.IconButton(icon=ft.Icons.CHAT_BUBBLE_ROUNDED, icon_color=NAV_INACTIVE, tooltip="Chats", icon_size=20, style=NAV_BTN_STYLE),
-        "reels":   ft.IconButton(icon=ft.Icons.VIDEO_LIBRARY_ROUNDED, icon_color=NAV_INACTIVE, tooltip="Reels", icon_size=20, style=NAV_BTN_STYLE),
-        "notifications": ft.IconButton(icon=ft.Icons.NOTIFICATIONS_NONE_ROUNDED, icon_color=NAV_INACTIVE, tooltip="Notifications", icon_size=20, style=NAV_BTN_STYLE),
+        "feed":    ft.Icon(ft.Icons.HOME_ROUNDED, color=NAV_ACTIVE, size=21),
+        "people":  ft.Icon(ft.Icons.GROUPS_ROUNDED, color=NAV_INACTIVE, size=21),
+        "secrets": ft.Icon(ft.Icons.THEATER_COMEDY_ROUNDED, color=NAV_INACTIVE, size=21),
+        "reels":   ft.Icon(ft.Icons.VIDEO_LIBRARY_ROUNDED, color=NAV_INACTIVE, size=21),
+        "notifications": ft.Icon(ft.Icons.NOTIFICATIONS_NONE_ROUNDED, color=NAV_INACTIVE, size=21),
     }
-    nav_buttons["feed"].on_click = nav_to_feed
-    nav_buttons["secrets"].on_click = nav_to_secrets
-    nav_buttons["people"].on_click = nav_to_people
-    nav_buttons["chats"].on_click = nav_to_chats
-    nav_buttons["reels"].on_click = nav_to_reels
-    nav_buttons["notifications"].on_click = nav_to_notifications
+    nav_item_labels = {
+        "feed": ft.Text("Home", size=10, color=NAV_ACTIVE, weight=ft.FontWeight.BOLD),
+        "people": ft.Text("Friends", size=10, color=NAV_INACTIVE),
+        "secrets": ft.Text("Secrets", size=10, color=NAV_INACTIVE),
+        "reels": ft.Text("Reels", size=10, color=NAV_INACTIVE),
+        "notifications": ft.Text("Alerts", size=10, color=NAV_INACTIVE),
+    }
+    nav_item_containers = {}
+    nav_actions = {
+        "feed": nav_to_feed,
+        "people": nav_to_people,
+        "secrets": nav_to_secrets,
+        "reels": nav_to_reels,
+        "notifications": nav_to_notifications,
+    }
+    nav_items = []
+    for key in ("feed", "people", "secrets", "reels", "notifications"):
+        item = ft.Container(
+            content=ft.Column(
+                [nav_buttons[key], nav_item_labels[key]],
+                spacing=3,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                tight=True
+            ),
+            alignment=ft.Alignment.CENTER,
+            padding=ft.Padding.symmetric(horizontal=8, vertical=8),
+            border_radius=RADIUS_MD,
+            bgcolor=NAV_SELECTED_BG if key == "feed" else None,
+            expand=True,
+            on_click=nav_actions[key],
+            tooltip="Notifications" if key == "notifications" else nav_item_labels[key].value
+        )
+        nav_item_containers[key] = item
+        nav_items.append(item)
 
+    NAV_BTN_STYLE = ft.ButtonStyle(padding=10)
     menu_button = ft.IconButton(icon=ft.Icons.MENU_ROUNDED, icon_color=NAV_INACTIVE, tooltip="Menu",
                                 icon_size=20, style=NAV_BTN_STYLE, on_click=open_main_menu)
 
@@ -2001,28 +2104,31 @@ async def main(page: ft.Page):
 
     top_header_bar = ft.Container(
         content=ft.Row([
-            ft.Text("UniVas", size=18, weight=ft.FontWeight.BOLD, color=COLOR_PRIMARY),
+            ft.Row([
+                ft.Container(
+                    content=ft.Icon(ft.Icons.AUTO_AWESOME_ROUNDED, color="white", size=17),
+                    width=34, height=34, alignment=ft.Alignment.CENTER,
+                    bgcolor=COLOR_PRIMARY, border_radius=RADIUS_MD
+                ),
+                ft.Text("UniVas", size=20, weight=ft.FontWeight.BOLD, color="white")
+            ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
             ft.Row([top_search_btn, top_chats_btn, menu_button], spacing=2)
         ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-        padding=ft.Padding.symmetric(horizontal=14, vertical=8),
-        bgcolor=COLOR_CARD
+        padding=ft.Padding.symmetric(horizontal=20, vertical=10),
+        bgcolor=COLOR_CARD,
+        border=ft.Border(bottom=ft.BorderSide(1, COLOR_BORDER))
     )
 
-    # --- BOTTOM NAVIGATION (Feed, Friends, Secret, Reels, Alerts) ---
-    # Reuses the exact same nav_buttons IconButtons (and their on_click
-    # handlers) already wired above -- Chats and Menu are deliberately left
-    # out of this bar since they now live in the top header.
     bottom_nav_bar = ft.Container(
-        content=ft.Row([
-            nav_buttons["feed"], nav_buttons["people"], nav_buttons["secrets"],
-            nav_buttons["reels"], nav_buttons["notifications"]
-        ], alignment=ft.MainAxisAlignment.SPACE_EVENLY),
-        padding=ft.Padding.symmetric(vertical=6),
-        bgcolor=COLOR_CARD
+        content=ft.Row(nav_items, alignment=ft.MainAxisAlignment.SPACE_EVENLY, spacing=4),
+        padding=ft.Padding.symmetric(horizontal=12, vertical=8),
+        bgcolor=COLOR_CARD,
+        border=ft.Border(top=ft.BorderSide(1, COLOR_BORDER))
     )
 
     # --- TAB 1: FEED & SEARCH ---
-    public_text_box = ft.TextField(hint_text="What's happening on campus?", width=220, dense=True, color="white")
+    public_text_box = ft.TextField(hint_text="What's happening on campus?",
+                                   width=content_width() - 160, dense=True, color="white")
     search_input = ft.TextField(hint_text="Search by username...", width=260, dense=True, color="white", on_change=on_search_change)
 
     media_status_text = ft.Text("", size=11)
@@ -2205,14 +2311,31 @@ async def main(page: ft.Page):
     photo_button = ft.IconButton(icon=ft.Icons.PHOTO_LIBRARY_ROUNDED, icon_color=COLOR_PRIMARY, tooltip="Add photo or video", on_click=open_media_picker)
 
     panel_home_feed = ft.Column([
-        ft.Row([
-            public_text_box,
-            photo_button,
-            send_button,
-            posting_spinner
-        ], alignment=ft.MainAxisAlignment.CENTER),
-        media_preview_container,
-        media_status_text,
+        ft.Container(
+            content=ft.Column([
+                ft.Text("Campus feed", size=22, weight=ft.FontWeight.BOLD, color="white"),
+                ft.Text("The latest conversations from your campus.",
+                        size=12, color=COLOR_TEXT_MUTED),
+            ], spacing=3),
+            width=content_width(),
+            padding=ft.Padding.only(top=18, bottom=8)
+        ),
+        ft.Container(
+            content=ft.Column([
+                ft.Row([
+                    public_text_box,
+                    photo_button,
+                    send_button,
+                    posting_spinner
+                ], alignment=ft.MainAxisAlignment.CENTER),
+                media_preview_container,
+                media_status_text,
+            ], spacing=8),
+            width=content_width(),
+            padding=SPACE_MD,
+            bgcolor=COLOR_CARD,
+            border_radius=RADIUS_LG
+        ),
         public_feed_layout
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
@@ -2223,7 +2346,8 @@ async def main(page: ft.Page):
             ft.Text("Connection Requests", size=13, weight=ft.FontWeight.BOLD, color=COLOR_WARNING),
             pending_requests_layout
         ], spacing=6),
-        padding=SPACE_LG, bgcolor=COLOR_WHISPER, border_radius=RADIUS_MD, width=340, visible=False
+        padding=SPACE_LG, bgcolor=COLOR_WHISPER, border_radius=RADIUS_LG,
+        width=content_width(), visible=False
     )
 
     def render_pending_requests_banner():
@@ -2262,7 +2386,8 @@ async def main(page: ft.Page):
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
     # --- TAB 2: SECRETS ---
-    whisper_text_box = ft.TextField(hint_text="Share a school secret anonymously...", width=260, dense=True, color="white")
+    whisper_text_box = ft.TextField(hint_text="Share a school secret anonymously...",
+                                    width=content_width() - 120, dense=True, color="white")
     whisper_status_text = ft.Text("", size=11)
 
     panel_whisper_wall = ft.Column([
