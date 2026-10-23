@@ -17,6 +17,11 @@ import wave
 import tempfile
 import array
 import math
+from notification_helpers import (
+    format_relative_time as format_notification_time,
+    notification_destination,
+    unread_badge_label,
+)
 try:
     import flet_audio as fta
     import flet_audio_recorder as ftr
@@ -1622,7 +1627,24 @@ async def main(page: ft.Page):
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
     # --- TAB: NOTIFICATIONS ---
-    notifications_layout = ft.Column(spacing=8)
+    notifications_layout = ft.Column(spacing=10)
+    notification_status = ft.Text("", size=12, color=COLOR_TEXT_MUTED)
+    notification_badge_text = ft.Text("", size=9, color="white", weight=ft.FontWeight.BOLD)
+    notification_badge = ft.Container(
+        content=notification_badge_text,
+        bgcolor=COLOR_DANGER,
+        padding=ft.Padding.symmetric(horizontal=5, vertical=2),
+        border_radius=20,
+        visible=False,
+        top=0,
+        right=0,
+    )
+    notification_count_state = {"count": None}
+    notification_poll_state = {"token": 0, "user_id": None}
+    mark_all_notifications_button = ft.TextButton(
+        "Mark all as read",
+        on_click=None,
+    )
 
     NOTIF_ICONS = {
         "like": (ft.Icons.FAVORITE_ROUNDED, COLOR_DANGER),
@@ -1635,63 +1657,372 @@ async def main(page: ft.Page):
         "report_no_violation": (ft.Icons.INFO_OUTLINE_ROUNDED, COLOR_TEXT_MUTED),
     }
 
+    def open_notification_destination(notification):
+        destination = notification_destination(notification)
+        if destination == "post":
+            post_id = notification.get("post_id")
+            try:
+                response = safe_supabase_call(
+                    lambda: supabase.rpc("get_visible_posts", {}).execute()
+                )
+                if response is None:
+                    notification_status.value = "Your session expired. Please log in again."
+                    notification_status.color = COLOR_DANGER
+                else:
+                    post = next(
+                        (item for item in (response.data or [])
+                         if item.get("id") == post_id),
+                        None,
+                    )
+                    if post:
+                        open_post_viewer(post)
+                    else:
+                        notification_status.value = "This post isn't available from your current feed."
+                        notification_status.color = COLOR_TEXT_MUTED
+            except Exception as ex:
+                print(f"Notification post navigation error: {type(ex).__name__}")
+                notification_status.value = "Couldn't open this post. Please try again."
+                notification_status.color = COLOR_DANGER
+        elif destination == "friends":
+            nav_to_people(None)
+        elif destination == "chats":
+            nav_to_chats(None)
+            chat_inbox_status.value = "Open the conversation from your chat list."
+            page.update()
+        else:
+            notification_status.value = "This notification has no available destination."
+            notification_status.color = COLOR_TEXT_MUTED
+        page.update()
+
+    def mark_notification_as_read(notification, button):
+        notification_id = notification.get("id")
+        if not notification_id:
+            notification_status.value = "This notification can't be marked as read individually."
+            notification_status.color = COLOR_TEXT_MUTED
+            page.update()
+            return
+
+        button.disabled = True
+        notification_status.value = "Marking notification as read..."
+        notification_status.color = COLOR_TEXT_MUTED
+        page.update()
+        try:
+            response = safe_supabase_call(
+                lambda: supabase.rpc(
+                    "mark_notification_read",
+                    {"p_notification_id": notification_id},
+                ).execute()
+            )
+            if response is None:
+                notification_status.value = "Your session expired. Please log in again."
+                notification_status.color = COLOR_DANGER
+                page.update()
+                return
+            if response.data is True:
+                notification["is_read"] = True
+                render_notifications_panel()
+                notification_count_state["count"] = None
+                badge_count = refresh_notification_badge()
+                if not notification_status.value and badge_count is None:
+                    notification_status.value = (
+                        "Notification marked as read, but the unread count couldn't be refreshed."
+                    )
+                    notification_status.color = COLOR_WARNING
+                elif not notification_status.value:
+                    notification_status.value = "Notification marked as read."
+                    notification_status.color = COLOR_SUCCESS
+            else:
+                render_notifications_panel()
+                notification_count_state["count"] = None
+                badge_count = refresh_notification_badge()
+                if not notification_status.value and badge_count is None:
+                    notification_status.value = (
+                        "This notification is already read or unavailable; "
+                        "the unread count couldn't be refreshed."
+                    )
+                    notification_status.color = COLOR_WARNING
+                elif not notification_status.value:
+                    notification_status.value = "This notification is already read or unavailable."
+                    notification_status.color = COLOR_TEXT_MUTED
+            page.update()
+        except Exception as ex:
+            print(f"Mark notification read error: {type(ex).__name__}")
+            notification_status.value = "Couldn't mark this notification as read. Please try again."
+            notification_status.color = COLOR_DANGER
+            button.disabled = False
+            page.update()
+
     def render_notifications_panel():
         notifications_layout.controls.clear()
+        notification_status.value = ""
+        mark_all_notifications_button.disabled = True
+        mark_all_notifications_button.visible = False
         user_id = get_cached_user_id()
         if not user_id:
+            notification_status.value = "Sign in to view notifications."
+            notification_status.color = COLOR_TEXT_MUTED
+            page.update()
             return
+        notifications_layout.controls.append(
+            ft.Row(
+                [
+                    ft.ProgressRing(width=18, height=18, stroke_width=2),
+                    ft.Text("Loading notifications...", color=COLOR_TEXT_MUTED, size=12),
+                ],
+                alignment=ft.MainAxisAlignment.CENTER,
+                spacing=8,
+            )
+        )
+        page.update()
         try:
             resp = safe_supabase_call(
                 lambda: supabase.rpc("get_notifications", {}).execute()
             )
-            notifs = resp.data if resp else []
-            notifs = notifs or []
+            if resp is None:
+                notifications_layout.controls.clear()
+                notification_status.value = "Your session expired. Please log in again."
+                notification_status.color = COLOR_DANGER
+                page.update()
+                return
+            notifs = resp.data or []
         except Exception as ex:
-            print(f"Notifications load error: {ex}")
-            notifs = []
+            print(f"Notifications load error: {type(ex).__name__}")
+            notifications_layout.controls.clear()
+            notification_status.value = "Couldn't load notifications. Check your connection and try again."
+            notification_status.color = COLOR_DANGER
+            notifications_layout.controls.append(
+                ft.TextButton(
+                    "Try again",
+                    on_click=lambda e: render_notifications_panel(),
+                )
+            )
+            page.update()
+            return
 
         if not notifs:
             notifications_layout.controls.append(
-                ft.Text("No notifications yet.", color=COLOR_TEXT_MUTED, size=13)
+                ft.Container(
+                    content=ft.Column(
+                        [
+                            ft.Icon(ft.Icons.NOTIFICATIONS_NONE_ROUNDED,
+                                    color=COLOR_TEXT_FAINT, size=34),
+                            ft.Text("You're all caught up",
+                                    color="white", size=15,
+                                    weight=ft.FontWeight.BOLD),
+                            ft.Text("New activity will show up here.",
+                                    color=COLOR_TEXT_MUTED, size=12),
+                        ],
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                        spacing=8,
+                    ),
+                    width=content_width(),
+                    padding=ft.Padding.symmetric(vertical=32),
+                    alignment=ft.Alignment.CENTER,
+                )
             )
         for n in notifs:
             icon, color = NOTIF_ICONS.get(n.get("type"), (ft.Icons.NOTIFICATIONS, COLOR_TEXT_MUTED))
             is_unread = not n.get("is_read", True)
-            notifications_layout.controls.append(
-                ft.Container(
-                    content=ft.Row([
-                        ft.Icon(icon, color=color, size=20),
-                        ft.Text(n.get("message", ""), color="white" if is_unread else COLOR_TEXT_MUTED, size=13, expand=True)
-                    ], spacing=10),
-                    padding=SPACE_LG,
-                    bgcolor=COLOR_UNREAD if is_unread else COLOR_CARD,
-                    border_radius=RADIUS_LG, width=content_width()
-                )
+            timestamp = format_notification_time(n.get("created_at"))
+            actor_username = (n.get("actor_username") or "").strip().lstrip("@")
+            actor_username = actor_username[:40]
+            notification_message = n.get("message") or "New activity"
+            card_content = ft.Row(
+                [
+                    ft.Container(
+                        content=ft.Icon(icon, color=color, size=19),
+                        width=42,
+                        height=42,
+                        bgcolor=COLOR_BG,
+                        border_radius=21,
+                        alignment=ft.Alignment.CENTER,
+                    ),
+                    ft.Column(
+                        [
+                            *(
+                                [ft.Text(
+                                    f"@{actor_username}",
+                                    color="white" if is_unread else COLOR_TEXT_MUTED,
+                                    size=12,
+                                    weight=ft.FontWeight.BOLD,
+                                )]
+                                if actor_username else []
+                            ),
+                            ft.Text(
+                                notification_message,
+                                color=COLOR_TEXT_BODY if is_unread else COLOR_TEXT_MUTED,
+                                size=13,
+                                weight=ft.FontWeight.W_600 if is_unread else ft.FontWeight.NORMAL,
+                                expand=True,
+                            ),
+                            *([ft.Text(timestamp, color=COLOR_TEXT_MUTED, size=11)]
+                              if timestamp else []),
+                        ],
+                        spacing=4,
+                        expand=True,
+                    ),
+                    ft.Container(
+                        content=ft.Text(
+                            "NEW",
+                            color="white",
+                            size=9,
+                            weight=ft.FontWeight.BOLD,
+                        ),
+                        bgcolor=COLOR_PRIMARY,
+                        padding=ft.Padding.symmetric(horizontal=7, vertical=4),
+                        border_radius=20,
+                        visible=is_unread,
+                    ),
+                ],
+                spacing=12,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
             )
+            destination = notification_destination(n)
+            card = ft.Container(
+                content=card_content,
+                padding=ft.Padding.symmetric(horizontal=14, vertical=12),
+                bgcolor=COLOR_UNREAD if is_unread else COLOR_CARD,
+                border_radius=RADIUS_LG,
+                width=content_width(),
+                on_click=(
+                    (lambda e, item=n: open_notification_destination(item))
+                    if destination else None
+                ),
+                ink=bool(destination),
+                tooltip="Open notification" if destination else None,
+            )
+            card_controls = [card]
+            if is_unread and n.get("id"):
+                mark_read_button = ft.TextButton(
+                    content=ft.Text("Mark as read", color=COLOR_PRIMARY, size=11),
+                    on_click=lambda e, item=n: mark_notification_as_read(item, e.control),
+                )
+                card_controls.append(
+                    ft.Container(
+                        content=ft.Row(
+                            [mark_read_button],
+                            alignment=ft.MainAxisAlignment.END,
+                        ),
+                        width=content_width(),
+                    )
+                )
+            notifications_layout.controls.append(
+                ft.Column(card_controls, spacing=0, width=content_width())
+            )
+        has_unread = any(not n.get("is_read", True) for n in notifs)
+        mark_all_notifications_button.disabled = not has_unread
+        mark_all_notifications_button.visible = has_unread
         page.update()
+
+    def mark_all_notifications_read(e):
+        mark_all_notifications_button.disabled = True
+        notification_status.value = "Marking notifications as read..."
+        notification_status.color = COLOR_TEXT_MUTED
+        page.update()
+        try:
+            response = safe_supabase_call(
+                lambda: supabase.rpc("mark_notifications_read", {}).execute()
+            )
+            if response is None:
+                notification_status.value = "Your session expired. Please log in again."
+                notification_status.color = COLOR_DANGER
+                mark_all_notifications_button.disabled = False
+                page.update()
+                return
+            notification_status.value = "All notifications marked as read."
+            notification_status.color = COLOR_SUCCESS
+            render_notifications_panel()
+            refresh_notification_badge()
+            notification_status.value = "All notifications marked as read."
+            notification_status.color = COLOR_SUCCESS
+            page.update()
+        except Exception as ex:
+            print(f"Mark all notifications read error: {type(ex).__name__}")
+            notification_status.value = "Couldn't mark notifications as read. Please try again."
+            notification_status.color = COLOR_DANGER
+            mark_all_notifications_button.disabled = False
+            page.update()
+
+    mark_all_notifications_button.on_click = mark_all_notifications_read
 
     def refresh_notification_badge():
         user_id = get_cached_user_id()
         if not user_id:
             return
+        previous_count = notification_count_state["count"]
         try:
             resp = safe_supabase_call(
                 lambda: supabase.rpc("get_unread_notification_count", {}).execute()
             )
-            count = (resp.data if resp else 0) or 0
-            if count and count > 0:
+            if resp is None:
+                return
+            count = max(0, int(resp.data or 0))
+            notification_count_state["count"] = count
+            notification_badge_text.value = unread_badge_label(count) or ""
+            notification_badge.visible = count > 0
+            if count > 0:
                 nav_buttons["notifications"].icon = ft.Icons.NOTIFICATIONS_ACTIVE_ROUNDED
                 nav_buttons["notifications"].color = COLOR_DANGER
             else:
                 nav_buttons["notifications"].icon = ft.Icons.NOTIFICATIONS_NONE_ROUNDED
-                if active_nav_key["value"] != "notifications":
-                    nav_buttons["notifications"].color = NAV_INACTIVE
+                nav_buttons["notifications"].color = (
+                    NAV_ACTIVE if active_nav_key["value"] == "notifications"
+                    else NAV_INACTIVE
+                )
             page.update()
+            if (
+                previous_count is not None
+                and count != previous_count
+                and panel_notifications.visible
+            ):
+                render_notifications_panel()
+            return count
         except Exception as ex:
-            print(f"Badge refresh error: {ex}")
+            print(f"Badge refresh error: {type(ex).__name__}")
+            return None
+
+    async def notification_badge_refresh_loop(user_id, token):
+        try:
+            while (
+                notification_poll_state["token"] == token
+                and get_cached_user_id() == user_id
+            ):
+                await asyncio.sleep(45)
+                if (
+                    notification_poll_state["token"] != token
+                    or get_cached_user_id() != user_id
+                ):
+                    break
+                await asyncio.to_thread(refresh_notification_badge)
+        finally:
+            if notification_poll_state["token"] == token:
+                notification_poll_state["user_id"] = None
+
+    def start_notification_badge_refresh():
+        user_id = get_cached_user_id()
+        if not user_id or notification_poll_state["user_id"] == user_id:
+            return
+        notification_poll_state["token"] += 1
+        token = notification_poll_state["token"]
+        notification_poll_state["user_id"] = user_id
+        page.run_task(notification_badge_refresh_loop, user_id, token)
+
+    def on_app_lifecycle_state_change(e):
+        if e.state in (ft.AppLifecycleState.RESUME, ft.AppLifecycleState.SHOW):
+            refresh_notification_badge()
 
     panel_notifications = ft.Column([
-        ft.Text("Notifications \U0001F514", size=18, weight=ft.FontWeight.BOLD, color="white"),
+        ft.Row(
+            [
+                ft.Text("Notifications", size=20,
+                        weight=ft.FontWeight.BOLD, color="white", expand=True),
+                mark_all_notifications_button,
+            ],
+            width=content_width(),
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        ),
+        notification_status,
         notifications_layout
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
@@ -1778,18 +2109,8 @@ async def main(page: ft.Page):
     def nav_to_notifications(e):
         set_panel_visibility(notifications=True)
         render_notifications_panel()
+        refresh_notification_badge()
         highlight_nav("notifications")
-        nav_buttons["notifications"].icon = ft.Icons.NOTIFICATIONS_NONE_ROUNDED
-        nav_buttons["notifications"].color = NAV_ACTIVE
-        page.update()
-        user_id = get_cached_user_id()
-        if user_id:
-            try:
-                safe_supabase_call(
-                    lambda: supabase.rpc("mark_notifications_read", {}).execute()
-                )
-            except Exception as ex:
-                print(f"Mark read error: {ex}")
 
     def nav_to_profile(e):
         set_panel_visibility(profile=True)
@@ -2074,7 +2395,14 @@ async def main(page: ft.Page):
     for key in ("feed", "people", "secrets", "reels", "notifications"):
         item = ft.Container(
             content=ft.Column(
-                [nav_buttons[key], nav_item_labels[key]],
+                [
+                    ft.Stack(
+                        [nav_buttons[key], notification_badge],
+                        width=34,
+                        height=30,
+                    ) if key == "notifications" else nav_buttons[key],
+                    nav_item_labels[key],
+                ],
                 spacing=3,
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                 tight=True
@@ -2471,7 +2799,7 @@ async def main(page: ft.Page):
                 }).execute()
             )
         except Exception as ex:
-            print(f"Notification create error: {ex}")
+            print(f"Notification create error: {type(ex).__name__}")
 
     # --- BLOCK / REPORT (safety) ---
     blocked_ids_cache = {"ids": set(), "loaded": False}
@@ -2983,7 +3311,7 @@ async def main(page: ft.Page):
                     if other_id and other_id != user_id:
                         create_notification(other_id, "message")
             except Exception as notif_ex:
-                print(f"Message notification error: {notif_ex}")
+                print(f"Message notification error: {type(notif_ex).__name__}")
             return True, None
         except Exception as e:
             msg = str(e)
@@ -4440,6 +4768,12 @@ async def main(page: ft.Page):
         except Exception as ex:
             print(f"Sign out error: {ex}")
         cache_user(None)
+        notification_poll_state["token"] += 1
+        notification_poll_state["user_id"] = None
+        notification_badge_text.value = ""
+        notification_badge.visible = False
+        nav_buttons["notifications"].icon = ft.Icons.NOTIFICATIONS_NONE_ROUNDED
+        nav_buttons["notifications"].color = NAV_INACTIVE
         await clear_session()
         show_auth()
 
@@ -7571,6 +7905,7 @@ async def main(page: ft.Page):
         render_public_feed()
         highlight_nav("feed")
         refresh_notification_badge()
+        start_notification_badge_refresh()
         page.update()
 
     def show_auth():
@@ -8646,6 +8981,7 @@ We may update these terms; continued use of the app means you accept the changes
             await clear_session()
         return False
 
+    page.on_app_lifecycle_state_change = on_app_lifecycle_state_change
     page.add(layout_auth_master, layout_dashboard_master)
 
     if not await try_restore_session():
