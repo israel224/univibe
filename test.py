@@ -10,6 +10,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 import json
+import threading
 from datetime import datetime, timezone
 import time
 import io
@@ -1629,6 +1630,24 @@ async def main(page: ft.Page):
     # --- TAB: NOTIFICATIONS ---
     notifications_layout = ft.Column(spacing=10)
     notification_status = ft.Text("", size=12, color=COLOR_TEXT_MUTED)
+    notification_loading_indicator = ft.Row(
+        [
+            ft.ProgressRing(width=18, height=18, stroke_width=2),
+            ft.Text("Loading notifications...", color=COLOR_TEXT_MUTED, size=12),
+        ],
+        alignment=ft.MainAxisAlignment.CENTER,
+        spacing=8,
+        visible=False,
+    )
+    notification_retry_button = ft.TextButton(
+        "Try again",
+        on_click=lambda e: render_notifications_panel(),
+        visible=False,
+    )
+    notification_load_state = {
+        "lock": threading.Lock(),
+        "has_loaded": False,
+    }
     notification_badge_text = ft.Text("", size=9, color="white", weight=ft.FontWeight.BOLD)
     notification_badge = ft.Container(
         content=notification_badge_text,
@@ -1644,6 +1663,8 @@ async def main(page: ft.Page):
     mark_all_notifications_button = ft.TextButton(
         "Mark all as read",
         on_click=None,
+        disabled=True,
+        visible=False,
     )
 
     NOTIF_ICONS = {
@@ -1753,52 +1774,58 @@ async def main(page: ft.Page):
             page.update()
 
     def render_notifications_panel():
-        notifications_layout.controls.clear()
+        if not notification_load_state["lock"].acquire(blocking=False):
+            return
+        try:
+            _render_notifications_panel_locked()
+        finally:
+            notification_loading_indicator.visible = False
+            notification_load_state["lock"].release()
+            page.update()
+
+    def _render_notifications_panel_locked():
         notification_status.value = ""
-        mark_all_notifications_button.disabled = True
-        mark_all_notifications_button.visible = False
+        notification_retry_button.visible = False
         user_id = get_cached_user_id()
         if not user_id:
+            notification_load_state["has_loaded"] = False
+            notifications_layout.controls.clear()
+            mark_all_notifications_button.disabled = True
+            mark_all_notifications_button.visible = False
             notification_status.value = "Sign in to view notifications."
             notification_status.color = COLOR_TEXT_MUTED
             page.update()
             return
-        notifications_layout.controls.append(
-            ft.Row(
-                [
-                    ft.ProgressRing(width=18, height=18, stroke_width=2),
-                    ft.Text("Loading notifications...", color=COLOR_TEXT_MUTED, size=12),
-                ],
-                alignment=ft.MainAxisAlignment.CENTER,
-                spacing=8,
-            )
-        )
-        page.update()
+        if not notification_load_state["has_loaded"]:
+            notification_loading_indicator.visible = True
+            page.update()
         try:
             resp = safe_supabase_call(
                 lambda: supabase.rpc("get_notifications", {}).execute()
             )
+            if get_cached_user_id() != user_id:
+                return
             if resp is None:
+                notification_load_state["has_loaded"] = False
                 notifications_layout.controls.clear()
+                mark_all_notifications_button.disabled = True
+                mark_all_notifications_button.visible = False
                 notification_status.value = "Your session expired. Please log in again."
                 notification_status.color = COLOR_DANGER
-                page.update()
                 return
             notifs = resp.data or []
         except Exception as ex:
             print(f"Notifications load error: {type(ex).__name__}")
-            notifications_layout.controls.clear()
             notification_status.value = "Couldn't load notifications. Check your connection and try again."
             notification_status.color = COLOR_DANGER
-            notifications_layout.controls.append(
-                ft.TextButton(
-                    "Try again",
-                    on_click=lambda e: render_notifications_panel(),
-                )
-            )
-            page.update()
+            notification_retry_button.visible = True
+            if not notification_load_state["has_loaded"]:
+                notifications_layout.controls.clear()
             return
 
+        notifications_layout.controls.clear()
+        mark_all_notifications_button.disabled = True
+        mark_all_notifications_button.visible = False
         if not notifs:
             notifications_layout.controls.append(
                 ft.Container(
@@ -1912,7 +1939,7 @@ async def main(page: ft.Page):
         has_unread = any(not n.get("is_read", True) for n in notifs)
         mark_all_notifications_button.disabled = not has_unread
         mark_all_notifications_button.visible = has_unread
-        page.update()
+        notification_load_state["has_loaded"] = True
 
     def mark_all_notifications_read(e):
         mark_all_notifications_button.disabled = True
@@ -2023,6 +2050,8 @@ async def main(page: ft.Page):
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         ),
         notification_status,
+        notification_loading_indicator,
+        notification_retry_button,
         notifications_layout
     ], visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
@@ -2381,7 +2410,7 @@ async def main(page: ft.Page):
         "people": ft.Text("Friends", size=10, color=NAV_INACTIVE),
         "secrets": ft.Text("Secrets", size=10, color=NAV_INACTIVE),
         "reels": ft.Text("Reels", size=10, color=NAV_INACTIVE),
-        "notifications": ft.Text("Alerts", size=10, color=NAV_INACTIVE),
+        "notifications": ft.Text("Notifications", size=10, color=NAV_INACTIVE),
     }
     nav_item_containers = {}
     nav_actions = {
@@ -2718,6 +2747,15 @@ async def main(page: ft.Page):
     def cache_user(user_obj, access_token=None):
         """Store the user's info and force the PostgREST client to use
         their JWT token — without this, RLS sees all requests as anonymous."""
+        new_user_id = getattr(user_obj, "id", None) if user_obj else None
+        if user_cache.get("id") != new_user_id:
+            notification_load_state["has_loaded"] = False
+            notifications_layout.controls.clear()
+            notification_loading_indicator.visible = False
+            notification_retry_button.visible = False
+            notification_count_state["count"] = None
+            notification_badge_text.value = ""
+            notification_badge.visible = False
         # Revealed Whisper identities belong to the admin session that asked
         # for them: forget them on logout and whenever a different user signs in.
         if (not user_obj) or user_cache.get("id") != getattr(user_obj, "id", None):
