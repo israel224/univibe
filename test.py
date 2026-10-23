@@ -2104,14 +2104,8 @@ async def main(page: ft.Page):
 
     top_header_bar = ft.Container(
         content=ft.Row([
-            ft.Row([
-                ft.Container(
-                    content=ft.Icon(ft.Icons.AUTO_AWESOME_ROUNDED, color="white", size=17),
-                    width=34, height=34, alignment=ft.Alignment.CENTER,
-                    bgcolor=COLOR_PRIMARY, border_radius=RADIUS_MD
-                ),
-                ft.Text("UniVas", size=20, weight=ft.FontWeight.BOLD, color="white")
-            ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ft.Text("UNIVAS", size=20, weight=ft.FontWeight.BOLD,
+                    color="white", italic=True),
             ft.Row([top_search_btn, top_chats_btn, menu_button], spacing=2)
         ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN, vertical_alignment=ft.CrossAxisAlignment.CENTER),
         padding=ft.Padding.symmetric(horizontal=20, vertical=10),
@@ -2127,7 +2121,7 @@ async def main(page: ft.Page):
     )
 
     # --- TAB 1: FEED & SEARCH ---
-    public_text_box = ft.TextField(hint_text="What's happening on campus?",
+    public_text_box = ft.TextField(hint_text="What's happening in your area?",
                                    width=content_width() - 160, dense=True, color="white")
     search_input = ft.TextField(hint_text="Search by username...", width=260, dense=True, color="white", on_change=on_search_change)
 
@@ -2311,15 +2305,6 @@ async def main(page: ft.Page):
     photo_button = ft.IconButton(icon=ft.Icons.PHOTO_LIBRARY_ROUNDED, icon_color=COLOR_PRIMARY, tooltip="Add photo or video", on_click=open_media_picker)
 
     panel_home_feed = ft.Column([
-        ft.Container(
-            content=ft.Column([
-                ft.Text("Campus feed", size=22, weight=ft.FontWeight.BOLD, color="white"),
-                ft.Text("The latest conversations from your campus.",
-                        size=12, color=COLOR_TEXT_MUTED),
-            ], spacing=3),
-            width=content_width(),
-            padding=ft.Padding.only(top=18, bottom=8)
-        ),
         ft.Container(
             content=ft.Column([
                 ft.Row([
