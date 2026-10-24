@@ -2483,13 +2483,150 @@ async def main(page: ft.Page):
     search_input = ft.TextField(hint_text="Search by username...", width=260, dense=True, color="white", on_change=on_search_change)
 
     media_status_text = ft.Text("", size=11)
-    selected_media = {"bytes": None, "name": None, "type": None}
+    selected_media = {
+        "bytes": None,
+        "name": None,
+        "type": None,
+        "storage_path": None,
+        "uploaded_bytes": None,
+        "media_url": None,
+        "final_bytes": None,
+        "final_settings": None,
+    }
     media_preview_container = ft.Container(visible=False)
+    image_editor_dialog = None
+    image_editor_status_text = None
+    image_edit_settings = {}
+
+    def default_image_edit_settings():
+        return {
+            "rotation": 0,
+            "crop": "original",
+            "brightness": 1.0,
+            "contrast": 1.0,
+            "sharpness": 1.0,
+            "filter": "none",
+            "text": "",
+            "text_position": "bottom",
+        }
+
+    def render_edited_post_image(raw_bytes, settings, preview=False):
+        """Render every preview/export from the original selected image bytes."""
+        from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageOps
+
+        with Image.open(io.BytesIO(raw_bytes)) as source:
+            image = ImageOps.exif_transpose(source).convert("RGB")
+
+        rotation = int(settings.get("rotation", 0)) % 360
+        if rotation:
+            image = image.rotate(-rotation, expand=True, resample=Image.Resampling.BICUBIC)
+
+        crop_ratios = {
+            "square": 1.0,
+            "portrait": 4 / 5,
+            "landscape": 16 / 9,
+        }
+        crop_ratio = crop_ratios.get(settings.get("crop"))
+        if crop_ratio:
+            width, height = image.size
+            if width / height > crop_ratio:
+                crop_width = max(1, round(height * crop_ratio))
+                left = (width - crop_width) // 2
+                image = image.crop((left, 0, left + crop_width, height))
+            else:
+                crop_height = max(1, round(width / crop_ratio))
+                top = (height - crop_height) // 2
+                image = image.crop((0, top, width, top + crop_height))
+
+        if preview:
+            image.thumbnail((1000, 760), Image.Resampling.LANCZOS)
+
+        image = ImageEnhance.Brightness(image).enhance(float(settings.get("brightness", 1.0)))
+        image = ImageEnhance.Contrast(image).enhance(float(settings.get("contrast", 1.0)))
+        image = ImageEnhance.Sharpness(image).enhance(float(settings.get("sharpness", 1.0)))
+
+        filter_name = settings.get("filter", "none")
+        if filter_name == "black_and_white":
+            image = ImageOps.grayscale(image).convert("RGB")
+        elif filter_name == "sepia":
+            image = ImageOps.colorize(
+                ImageOps.grayscale(image),
+                black="#21170f",
+                white="#f4dfb5",
+            )
+        elif filter_name in ("warm", "cool"):
+            tint = Image.new("RGB", image.size, "#f2a65a" if filter_name == "warm" else "#729acb")
+            image = Image.blend(image, tint, 0.14)
+
+        overlay_text = (settings.get("text") or "").strip()
+        if overlay_text:
+            draw = ImageDraw.Draw(image)
+            font_size = max(18, min(48, image.width // 16))
+            try:
+                font = ImageFont.truetype("arial.ttf", font_size)
+            except OSError:
+                try:
+                    font = ImageFont.load_default(size=font_size)
+                except TypeError:
+                    font = ImageFont.load_default()
+
+            max_text_width = max(80, int(image.width * 0.88))
+            lines = []
+            for paragraph in overlay_text.splitlines() or [overlay_text]:
+                line = ""
+                for word in paragraph.split():
+                    candidate = f"{line} {word}".strip()
+                    if line and draw.textlength(candidate, font=font) > max_text_width:
+                        lines.append(line)
+                        line = word
+                    else:
+                        line = candidate
+                lines.append(line)
+            wrapped_text = "\n".join(lines)
+            bounds = draw.multiline_textbbox(
+                (0, 0),
+                wrapped_text,
+                font=font,
+                align="center",
+                spacing=6,
+                stroke_width=2,
+            )
+            text_width = bounds[2] - bounds[0]
+            text_height = bounds[3] - bounds[1]
+            position = settings.get("text_position", "bottom")
+            if position == "top":
+                y = int(image.height * 0.08)
+            elif position == "center":
+                y = (image.height - text_height) // 2
+            else:
+                y = image.height - text_height - int(image.height * 0.08)
+            x = (image.width - text_width) // 2
+            draw.multiline_text(
+                (x, y),
+                wrapped_text,
+                font=font,
+                fill="white",
+                align="center",
+                spacing=6,
+                stroke_width=2,
+                stroke_fill="black",
+            )
+
+        if not preview:
+            image.thumbnail((1920, 1920), Image.Resampling.LANCZOS)
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=88, optimize=True)
+        return output.getvalue(), "image/jpeg"
 
     def clear_media_preview(e=None):
         selected_media["bytes"] = None
         selected_media["name"] = None
         selected_media["type"] = None
+        selected_media["storage_path"] = None
+        selected_media["uploaded_bytes"] = None
+        selected_media["media_url"] = None
+        selected_media["final_bytes"] = None
+        selected_media["final_settings"] = None
         media_preview_container.content = None
         media_preview_container.visible = False
         media_status_text.value = ""
@@ -2528,6 +2665,230 @@ async def main(page: ft.Page):
         ], width=160, height=160)
         media_preview_container.visible = True
         page.update()
+
+    def open_image_editor():
+        nonlocal image_editor_dialog, image_editor_status_text
+        image_edit_settings.clear()
+        image_edit_settings.update(default_image_edit_settings())
+        media_preview_container.content = None
+        media_preview_container.visible = False
+
+        editor_width = max(300, min(620, content_width() - 24))
+        preview_image = ft.Image(
+            src="",
+            width=editor_width - 32,
+            height=300,
+            fit=ft.BoxFit.CONTAIN,
+            border_radius=RADIUS_MD,
+        )
+        image_editor_status_text = ft.Text("", size=11, color=COLOR_TEXT_MUTED)
+        slider_controls = {}
+        slider_values = {}
+        crop_dropdown = ft.Dropdown(
+            label="Crop",
+            value="original",
+            width=editor_width - 32,
+            options=[
+                ft.DropdownOption(key="original", text="Original"),
+                ft.DropdownOption(key="square", text="Square"),
+                ft.DropdownOption(key="portrait", text="Portrait 4:5"),
+                ft.DropdownOption(key="landscape", text="Landscape 16:9"),
+            ],
+        )
+        filter_dropdown = ft.Dropdown(
+            label="Filter",
+            value="none",
+            width=editor_width - 32,
+            options=[
+                ft.DropdownOption(key="none", text="Original"),
+                ft.DropdownOption(key="black_and_white", text="Black and white"),
+                ft.DropdownOption(key="sepia", text="Sepia"),
+                ft.DropdownOption(key="warm", text="Warm"),
+                ft.DropdownOption(key="cool", text="Cool"),
+            ],
+        )
+        overlay_text_field = ft.TextField(
+            label="Text on photo",
+            hint_text="Add a short message",
+            max_length=120,
+            multiline=True,
+            min_lines=1,
+            max_lines=3,
+            width=editor_width - 32,
+        )
+        text_position_dropdown = ft.Dropdown(
+            label="Text placement",
+            value="bottom",
+            width=editor_width - 32,
+            options=[
+                ft.DropdownOption(key="top", text="Top"),
+                ft.DropdownOption(key="center", text="Center"),
+                ft.DropdownOption(key="bottom", text="Bottom"),
+            ],
+        )
+
+        def refresh_image_editor_preview():
+            try:
+                preview_bytes, _ = render_edited_post_image(
+                    selected_media["bytes"],
+                    image_edit_settings,
+                    preview=True,
+                )
+                import base64
+                preview_image.src = base64.b64encode(preview_bytes).decode("ascii")
+                image_editor_status_text.value = ""
+                image_editor_status_text.color = COLOR_TEXT_MUTED
+            except Exception as ex:
+                image_editor_status_text.value = friendly_error(
+                    ex, "Couldn't preview this photo. Try another image."
+                )
+                image_editor_status_text.color = COLOR_DANGER
+            page.update()
+
+        def change_editor_setting(e, key):
+            image_edit_settings[key] = e.control.value
+            selected_media["final_bytes"] = None
+            selected_media["final_settings"] = None
+            refresh_image_editor_preview()
+
+        def rotate_photo(degrees):
+            image_edit_settings["rotation"] = (
+                int(image_edit_settings["rotation"]) + degrees
+            ) % 360
+            selected_media["final_bytes"] = None
+            selected_media["final_settings"] = None
+            refresh_image_editor_preview()
+
+        def make_adjustment_row(label, key):
+            value_text = ft.Text("1.00", size=11, color=COLOR_TEXT_MUTED, width=34)
+
+            def on_slider_change(e):
+                value = float(e.control.value)
+                image_edit_settings[key] = value
+                value_text.value = f"{value:.2f}"
+                selected_media["final_bytes"] = None
+                selected_media["final_settings"] = None
+                refresh_image_editor_preview()
+
+            slider = ft.Slider(
+                value=1.0,
+                min=0.0,
+                max=2.0,
+                divisions=40,
+                active_color=COLOR_PRIMARY,
+                on_change=on_slider_change,
+            )
+            slider_controls[key] = slider
+            slider_values[key] = value_text
+            return ft.Row(
+                [ft.Text(label, size=12, width=76), slider, value_text],
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                spacing=6,
+            )
+
+        def reset_editor(e):
+            image_edit_settings.clear()
+            image_edit_settings.update(default_image_edit_settings())
+            crop_dropdown.value = "original"
+            filter_dropdown.value = "none"
+            caption_field.value = public_text_box.value or ""
+            overlay_text_field.value = ""
+            text_position_dropdown.value = "bottom"
+            for key, slider in slider_controls.items():
+                slider.value = 1.0
+                slider_values[key].value = "1.00"
+            selected_media["final_bytes"] = None
+            selected_media["final_settings"] = None
+            refresh_image_editor_preview()
+
+        def on_caption_change(e):
+            public_text_box.value = e.control.value
+
+        def cancel_editor(e):
+            nonlocal image_editor_dialog
+            image_editor_dialog.open = False
+            if image_editor_dialog in page.overlay:
+                page.overlay.remove(image_editor_dialog)
+            image_editor_dialog = None
+            selected_media.update({
+                "bytes": None,
+                "name": None,
+                "type": None,
+                "storage_path": None,
+                "uploaded_bytes": None,
+                "media_url": None,
+                "final_bytes": None,
+                "final_settings": None,
+            })
+            media_status_text.value = ""
+            page.update()
+
+        crop_dropdown.on_select = lambda e: change_editor_setting(e, "crop")
+        filter_dropdown.on_select = lambda e: change_editor_setting(e, "filter")
+        overlay_text_field.on_change = lambda e: change_editor_setting(e, "text")
+        text_position_dropdown.on_select = lambda e: change_editor_setting(
+            e, "text_position"
+        )
+        caption_field = ft.TextField(
+            label="Caption",
+            value=public_text_box.value or "",
+            hint_text="What's happening in your area?",
+            max_length=1000,
+            multiline=True,
+            min_lines=1,
+            max_lines=3,
+            width=editor_width - 32,
+            on_change=on_caption_change,
+        )
+
+        editor_content = ft.Column(
+            [
+                preview_image,
+                ft.Row(
+                    [
+                        ft.OutlinedButton(
+                            "Rotate left",
+                            icon=ft.Icons.ROTATE_LEFT,
+                            on_click=lambda e: rotate_photo(-90),
+                        ),
+                        ft.OutlinedButton(
+                            "Rotate right",
+                            icon=ft.Icons.ROTATE_RIGHT,
+                            on_click=lambda e: rotate_photo(90),
+                        ),
+                    ],
+                    alignment=ft.MainAxisAlignment.CENTER,
+                    wrap=True,
+                ),
+                crop_dropdown,
+                make_adjustment_row("Brightness", "brightness"),
+                make_adjustment_row("Contrast", "contrast"),
+                make_adjustment_row("Sharpness", "sharpness"),
+                filter_dropdown,
+                caption_field,
+                overlay_text_field,
+                text_position_dropdown,
+                image_editor_status_text,
+            ],
+            width=editor_width - 16,
+            height=560,
+            spacing=8,
+            scroll=ft.ScrollMode.AUTO,
+        )
+        image_editor_dialog = ft.AlertDialog(
+            title=ft.Text("Edit photo", color="white", size=16),
+            bgcolor=COLOR_CARD,
+            content=editor_content,
+            actions=[
+                ft.TextButton("Reset", on_click=reset_editor),
+                ft.TextButton("Cancel", on_click=cancel_editor),
+                ft.TextButton("Publish", on_click=handle_create_post),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        page.overlay.append(image_editor_dialog)
+        image_editor_dialog.open = True
+        refresh_image_editor_preview()
 
     async def open_media_picker(e):
         files = await ft.FilePicker().pick_files(
@@ -2572,17 +2933,36 @@ async def main(page: ft.Page):
         selected_media["type"] = new_type
         selected_media["bytes"] = f.bytes
         selected_media["name"] = f.name
+        selected_media["storage_path"] = None
+        selected_media["uploaded_bytes"] = None
+        selected_media["media_url"] = None
+        selected_media["final_bytes"] = None
+        selected_media["final_settings"] = None
         media_status_text.value = ""
-        show_media_preview()
+        if new_type == "image":
+            open_image_editor()
+        else:
+            show_media_preview()
 
     def reset_post_composer():
+        nonlocal image_editor_dialog
         public_text_box.value = ""
         selected_media["bytes"] = None
         selected_media["name"] = None
         selected_media["type"] = None
+        selected_media["storage_path"] = None
+        selected_media["uploaded_bytes"] = None
+        selected_media["media_url"] = None
+        selected_media["final_bytes"] = None
+        selected_media["final_settings"] = None
         media_status_text.value = ""
         media_preview_container.content = None
         media_preview_container.visible = False
+        if image_editor_dialog is not None:
+            image_editor_dialog.open = False
+            if image_editor_dialog in page.overlay:
+                page.overlay.remove(image_editor_dialog)
+            image_editor_dialog = None
 
     posting_spinner = ft.ProgressRing(width=16, height=16, stroke_width=2, visible=False)
 
@@ -2603,10 +2983,14 @@ async def main(page: ft.Page):
         set_composer_busy(True)
         media_status_text.value = "Posting..."
         media_status_text.color = COLOR_TEXT_MUTED
+        if selected_media.get("type") == "image" and image_editor_status_text:
+            image_editor_status_text.value = "Preparing and publishing your photo..."
+            image_editor_status_text.color = COLOR_TEXT_MUTED
         page.update()
 
         media_url = None
         media_type = None
+        publish_stage = "preparing post"
         try:
             user_id = get_cached_user_id()
             username = user_cache.get("username") or "Anonymous"
@@ -2617,25 +3001,55 @@ async def main(page: ft.Page):
                 owner_id = user_id if user_id else "anonymous"
 
                 if selected_media["type"] == "image":
-                    file_bytes, content_type = compress_image_for_upload(raw_bytes)
-                    if content_type != "image/jpeg":
-                        set_composer_busy(False)
-                        media_status_text.value = "Couldn't process that photo. Please try a different one."
-                        media_status_text.color = COLOR_DANGER
-                        page.update()
-                        return
-                    storage_path = f"{owner_id}/{uuid.uuid4()}.jpg"
+                    current_settings = dict(image_edit_settings)
+                    if (
+                        selected_media["final_bytes"] is None
+                        or selected_media["final_settings"] != current_settings
+                    ):
+                        publish_stage = "processing photo"
+                        file_bytes, content_type = render_edited_post_image(
+                            raw_bytes, current_settings
+                        )
+                        selected_media["final_bytes"] = file_bytes
+                        selected_media["final_settings"] = current_settings
+                    else:
+                        file_bytes = selected_media["final_bytes"]
+                    content_type = "image/jpeg"
+                    if selected_media["storage_path"] is None:
+                        selected_media["storage_path"] = (
+                            f"{owner_id}/{uuid.uuid4()}.jpg"
+                        )
+                    storage_path = selected_media["storage_path"]
                 else:
                     file_bytes = raw_bytes
                     content_type = VIDEO_CONTENT_TYPES.get(file_ext.lower(), "application/octet-stream")
                     storage_path = f"{owner_id}/{uuid.uuid4()}{file_ext}"
 
-                upload_with_retry(MEDIA_BUCKET, storage_path, file_bytes, content_type)
-                media_url = safe_supabase_call(
-                    lambda: supabase.storage.from_(MEDIA_BUCKET).get_public_url(storage_path)
-                )
+                if (
+                    selected_media["type"] != "image"
+                    or selected_media["uploaded_bytes"] != file_bytes
+                ):
+                    publish_stage = "uploading photo" if selected_media["type"] == "image" else "uploading video"
+                    upload_with_retry(
+                        MEDIA_BUCKET,
+                        storage_path,
+                        file_bytes,
+                        content_type,
+                    )
+                    if selected_media["type"] == "image":
+                        selected_media["uploaded_bytes"] = file_bytes
+
+                media_url = selected_media.get("media_url")
+                if not media_url or selected_media["type"] != "image":
+                    publish_stage = "creating media URL"
+                    media_url = safe_supabase_call(
+                        lambda: supabase.storage.from_(MEDIA_BUCKET).get_public_url(storage_path)
+                    )
+                    if selected_media["type"] == "image":
+                        selected_media["media_url"] = media_url
                 media_type = selected_media["type"]
 
+            publish_stage = "inserting post row"
             result = safe_supabase_call(
                 lambda: supabase.table("posts").insert({
                     "user_id": user_id,
@@ -2647,6 +3061,12 @@ async def main(page: ft.Page):
             )
             if result is None:
                 set_composer_busy(False)
+                if selected_media.get("type") == "image" and image_editor_status_text:
+                    image_editor_status_text.value = (
+                        "Your photo draft is still here. Please sign in again and retry."
+                    )
+                    image_editor_status_text.color = COLOR_DANGER
+                    page.update()
                 return  # session died — force_reauth() already fired
 
             reset_post_composer()
@@ -2654,8 +3074,22 @@ async def main(page: ft.Page):
             render_public_feed()
         except Exception as ex:
             set_composer_busy(False)
-            media_status_text.value = friendly_error(ex, "Post failed. Please try again.")
+            error_code, error_message = supabase_error_details(ex)
+            print(
+                f"Post publish failed during {publish_stage} "
+                f"(code: {error_code or 'unavailable'}): {error_message}"
+            )
+            error_detail = (
+                f"{publish_stage.capitalize()} failed "
+                f"(code: {error_code or 'unavailable'}): {error_message}"
+            )
+            media_status_text.value = error_detail
             media_status_text.color = COLOR_DANGER
+            if selected_media.get("type") == "image" and image_editor_status_text:
+                image_editor_status_text.value = (
+                    f"Your photo draft is still here. {error_detail}"
+                )
+                image_editor_status_text.color = COLOR_DANGER
             page.update()
 
     send_button = ft.IconButton(icon=ft.Icons.SEND_ROUNDED, icon_color=COLOR_PRIMARY, on_click=handle_create_post)
@@ -5701,6 +6135,34 @@ async def main(page: ft.Page):
             print(f"Compression failed, using original file: {ex}")
             return file_bytes, "application/octet-stream"
 
+    def supabase_error_details(ex):
+        """Return the Supabase error code and a credential-redacted message."""
+        code = str(getattr(ex, "code", "") or "").strip()
+        message = getattr(ex, "message", "") or str(ex)
+        message = re.sub(
+            r"(?i)\b(?:sb_publishable|sb_secret)_[A-Za-z0-9_-]+\b",
+            "[REDACTED_KEY]",
+            str(message),
+        )
+        message = re.sub(
+            r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
+            "[REDACTED_TOKEN]",
+            message,
+        )
+        message = re.sub(
+            r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/-]+=*",
+            r"\1[REDACTED]",
+            message,
+        )
+        message = re.sub(
+            r"(?i)\b(password|passwd|access_token|refresh_token|api[_-]?key|secret)"
+            r"(\s*[:=]\s*)[^\s,;]+",
+            r"\1\2[REDACTED]",
+            message,
+        )
+        message = " ".join(message.split())[:400]
+        return code or None, message or "No error message was returned."
+
     def upload_with_retry(bucket, storage_path, file_bytes, content_type, max_retries=2, upsert=False):
         """Retries an upload up to 2 extra times if the connection drops mid-transfer.
         Session-expiry is handled through safe_supabase_call so a dead token during
@@ -5719,7 +6181,11 @@ async def main(page: ft.Page):
                 return
             except Exception as ex:
                 last_error = ex
-                print(f"Upload attempt {attempt + 1} failed: {ex}")
+                error_code, error_message = supabase_error_details(ex)
+                print(
+                    f"Upload attempt {attempt + 1} failed "
+                    f"(code: {error_code or 'unavailable'}): {error_message}"
+                )
         raise last_error
 
     async def handle_upload_avatar(e):
